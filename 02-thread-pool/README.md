@@ -63,33 +63,95 @@
 ## 编译与运行
 
 ```bash
-gcc threadpool.c -o bin/threadpool -lpthread
+mkdir -p bin
+gcc -pthread threadpool.c -o bin/threadpool
 ./bin/threadpool
 ```
 
 程序会创建 20 个工作线程，提交 1000 个任务，然后等待回车退出。
 
-## 已知问题
+## 缺陷修复记录
 
-原始实现里有几处缺陷，留作后续修正：
+首次实现里有 4 处缺陷，现已全部修正。
 
-1. **`nThreadPoolDestory` 里 `worker->terminate;` 是无效语句** ——
-   它只读取了成员变量，没有赋值，本意应该是 `worker->terminate = 1;`。
-   因此工作线程的终止标志从未被设置，销毁流程实际不生效。
+### 1. 销毁流程中的无效语句
 
-2. **`nThreadPoolPushTask` 声明返回 `int`，但函数体没有 `return` 语句** ——
-   调用方读到的返回值是未定义的。
+```c
+for (worker = pool->workers;worker != NULL;worker = worker->next) {
+    worker->terminate;      // 只读取成员变量，什么也没改变
+}
+```
 
-3. **用 `memcpy` 复制 `PTHREAD_COND_INITIALIZER` / `PTHREAD_MUTEX_INITIALIZER`** ——
-   POSIX 只保证这两个宏可用于静态初始化。运行期初始化应当调用
-   `pthread_cond_init()` 和 `pthread_mutex_init()`（源码注释里原本就是这两个调用）。
+`worker->terminate;` 是一条**没有副作用的表达式语句**：它把成员变量的值读出来就丢弃了。
+因此终止标志从未被置为 1，被唤醒的线程重新检查标志、发现它不是 1，又回到等待状态，
+销毁流程实际上完全不生效。
 
-4. **销毁流程没有 `pthread_join`，也没有释放 `nWorker` 结构体的完整逻辑** ——
-   存在资源泄漏。`nThreadPoolCallback` 里的 `free(worker)` 只在线程自身退出时执行，
-   而销毁路径并未等待线程结束。
+修正：`worker->terminate = 1;`
+
+### 2. 有返回类型的函数缺少 return
+
+`nThreadPoolPushTask` 声明返回 `int`，函数体却没有 `return` 语句。C 语言规定：
+在要求返回值的函数中执行到末尾而未 return，若调用方使用了这个返回值，行为是未定义的。
+
+修正：补 `return 0;`
+
+### 3. 用 memcpy 复制初始化宏
+
+```c
+pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+memcpy(&pool->cond, &blank_cond, sizeof(pthread_cond_t));
+```
+
+POSIX 只保证 `PTHREAD_MUTEX_INITIALIZER` 与 `PTHREAD_COND_INITIALIZER`
+可用于**静态初始化**。这两个宏展开成什么完全由实现决定，标准既不保证其内部表示
+可以被逐字节复制，也不保证复制出来的对象有效。运行期初始化必须调用对应的 init 函数。
+
+修正：改用 `pthread_mutex_init()` 与 `pthread_cond_init()`，并检查返回值。
+
+### 4. 销毁流程未回收线程（牵连出双重释放风险）
+
+原代码只把 `pool->workers = NULL;` 一赋了事，既没等待工作线程结束，
+也没释放 `nWorker` 结构体，属于资源泄漏。
+
+但这里有个陷阱：原 `nThreadPoolCallback` 结尾有 `free(worker);`，即线程退出时释放自己。
+若销毁流程也去释放，同一个指针会被释放两次，构成**双重释放（double free）**——
+这是未定义行为，通常导致堆结构损坏或程序崩溃。
+
+因此修复前必须先确定 **worker 结构体的所有权归谁**。本项目选择归线程池管理器：
+
+- 回调函数不再自释放，改为 `return NULL;`
+- 销毁流程按固定顺序执行：
+  置终止标志 → `pthread_cond_broadcast` 唤醒 → 逐个 `pthread_join` →
+  `free(worker)` → 释放残留任务 → 销毁同步原语
+
+顺序不可调换：`join` 必须在 `free` 之前，否则线程可能仍在使用自己的结构体。
+同理，`terminate` 的写入必须在持锁状态下进行，否则与工作线程的读取构成数据竞争。
+
+### 附带修正
+
+- `nThreadPoolCallback` 声明返回 `void *` 但缺 return，补 `return NULL;`
+- `nThreadPoolPushTask` / `nThreadPoolDestory` 增加空指针检查
+- `nThreadPoolDestory` 的 `nWorker` 参数未使用，加 `(void)nWorker;` 抑制警告，
+  保留参数以兼容原接口
+- `main` 原本没有调用 `nThreadPoolDestory`，补上，让销毁路径真正被执行
+
+## 验证结果
+
+在 Ubuntu 22.04 / gcc 11.4.0 上完成以下验证：
+
+| 检查项 | 方法 | 结果 |
+|---|---|---|
+| 编译 | `gcc -Wall -Wextra -pthread` | 零警告 |
+| 运行 | 20 线程、1000 任务 | 1000 条任务输出，退出码 0 |
+| 内存安全 | `gcc -fsanitize=address` | 无任何报告（无越界、无双重释放、无泄漏） |
+| 数据竞争 | `gcc -fsanitize=thread` | 无任何报告 |
+
+ThreadSanitizer 在默认配置下可能因系统 ASLR 报 `unexpected memory mapping`，
+这是工具与内核内存布局的兼容问题，用 `setarch $(uname -m) -R` 关闭 ASLR 后即可正常运行。
 
 ## 待办
 
-- [ ] 修正上述 4 个缺陷
+- [x] 修正上述 4 个缺陷
+- [x] 通过消毒剂检查内存安全与数据竞争
 - [ ] 补充任务队列为空/非空两种状态下的时序验证
 - [ ] 对比固定线程数与动态扩缩的吞吐差异
