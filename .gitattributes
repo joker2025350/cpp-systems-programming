@@ -1,0 +1,11 @@
+# 测试数据一律按字节原样存取，不做换行符转换。
+#
+# b.txt 本身就是 CRLF 文件（1762 个 CR + 1762 个 LF，共 617637 字节）。
+# 在 core.autocrlf=true 的机器上，如果不声明这一点，git add 会把它
+# 规范化成纯 LF（615875 字节），checkout 时又转回 CRLF——看似往返无损，
+# 但换到 Linux 上 clone 出来的是 615875 字节，README 与交叉验证里
+# 引用的 617637 就对不上了。
+#
+# 源码文件不需要这条规则：它们在 Linux 上用 LF、在 Windows 上被转换成 CRLF，
+# 都是各自平台上的正常形式，转换不会改变任何语义。
+05-word-count/testdata/* -text
