@@ -9,3 +9,8 @@
 # 源码文件不需要这条规则：它们在 Linux 上用 LF、在 Windows 上被转换成 CRLF，
 # 都是各自平台上的正常形式，转换不会改变任何语义。
 05-word-count/testdata/* -text
+
+# 04 的三份样例同理：158 / 160 / 58 字节这几个数字写进了 README，
+# 换行符一转换就全对不上。而且 c.txt 的用途就是"逗号后有空格"这个写法，
+# 文件内容本身就是测试语义，不能被 git 改写。
+04-contact-list/testdata/* -text

@@ -1,0 +1,684 @@
+/*
+ * test_contacts.c —— contacts 模块的单元测试
+ *
+ * 绝大多数用例只用内存中的数据；涉及文件的用例需要写一个临时文件，
+ * 默认写在工作目录下的 bin/ 里（make 之后必然存在），跑完删除。
+ *
+ * 用法：
+ *   make test
+ *   ./bin/test_contacts [testdata 目录]      默认 testdata
+ */
+
+#include "contacts.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TMP_FILE   "bin/tmp_test_contacts.txt"
+#define TMP_FILE2  "bin/tmp_test_contacts2.txt"
+#define TMP_LONG   "bin/tmp_test_longline.txt"
+
+static int g_checks   = 0;
+static int g_failures = 0;
+
+static const char *g_testdata = "testdata";
+
+/* ---------------------------------------------------------------- */
+
+static void expect_int(const char *name, long got, long want) {
+	g_checks++;
+
+	if (got != want) {
+		g_failures++;
+		(void)printf("FAIL  %-46s 实际 %ld，期望 %ld\n", name, got, want);
+		return;
+	}
+	(void)printf("ok    %s\n", name);
+}
+
+static void expect_str(const char *name, const char *got, const char *want) {
+	g_checks++;
+
+	if (got == NULL || want == NULL || strcmp(got, want) != 0) {
+		g_failures++;
+		(void)printf("FAIL  %-46s 实际 \"%s\"，期望 \"%s\"\n",
+		             name, (got != NULL) ? got : "(null)",
+		             (want != NULL) ? want : "(null)");
+		return;
+	}
+	(void)printf("ok    %s\n", name);
+}
+
+static void expect_status(const char *name, contacts_status got, contacts_status want) {
+	g_checks++;
+
+	if (got != want) {
+		g_failures++;
+		(void)printf("FAIL  %-46s 实际 %d，期望 %d\n",
+		             name, (int)got, (int)want);
+		return;
+	}
+	(void)printf("ok    %s\n", name);
+}
+
+/* 把 testdata 下的文件名拼成完整路径 */
+static const char *data_path(char *buf, size_t size, const char *name) {
+	(void)snprintf(buf, size, "%s/%s", g_testdata, name);
+	return buf;
+}
+
+/* ---------------------------------------------------------------- */
+
+static void test_init_and_empty(void) {
+	contact_book book;
+
+	contacts_init(&book);
+
+	expect_int("空通讯录数量为 0", (long)contacts_count(&book), 0);
+	expect_int("空通讯录 first 为 NULL", contacts_first(&book) == NULL, 1);
+	expect_int("空通讯录 find 为 NULL",
+	           contacts_find(&book, "nobody") == NULL, 1);
+
+	contacts_destroy(&book);
+
+	/* NULL 参数不能崩 */
+	contacts_init(NULL);
+	contacts_clear(NULL);
+	contacts_destroy(NULL);
+	expect_int("contacts_count(NULL) 返回 0", (long)contacts_count(NULL), 0);
+	expect_int("contacts_first(NULL) 返回 NULL", contacts_first(NULL) == NULL, 1);
+	expect_int("contacts_next(NULL) 返回 NULL", contacts_next(NULL) == NULL, 1);
+	expect_int("contacts_find(NULL) 返回 NULL",
+	           contacts_find(NULL, "x") == NULL, 1);
+	expect_status("contacts_add(NULL) 返回 PARAM",
+	              contacts_add(NULL, "a", "1"), CONTACTS_ERR_PARAM);
+	expect_status("contacts_remove(NULL) 返回 PARAM",
+	              contacts_remove(NULL, "a"), CONTACTS_ERR_PARAM);
+}
+
+static void test_add_and_find(void) {
+	contact_book  book;
+	const contact *found;
+
+	contacts_init(&book);
+
+	expect_status("添加 alice",
+	              contacts_add(&book, "alice", "13900001111"), CONTACTS_OK);
+	expect_int("数量为 1", (long)contacts_count(&book), 1);
+
+	found = contacts_find(&book, "alice");
+	expect_int("能找到 alice", found != NULL, 1);
+	if (found != NULL) {
+		expect_str("alice 的电话", found->phone, "13900001111");
+	}
+
+	expect_int("找不到 bob", contacts_find(&book, "bob") == NULL, 1);
+
+	contacts_destroy(&book);
+}
+
+static void test_add_validation(void) {
+	contact_book book;
+
+	contacts_init(&book);
+
+	expect_status("name 为 NULL", contacts_add(&book, NULL, "1"),
+	              CONTACTS_ERR_PARAM);
+	expect_status("phone 为 NULL", contacts_add(&book, "a", NULL),
+	              CONTACTS_ERR_PARAM);
+	expect_status("name 为空串", contacts_add(&book, "", "1"),
+	              CONTACTS_ERR_FORMAT);
+	expect_status("phone 为空串", contacts_add(&book, "a", ""),
+	              CONTACTS_ERR_FORMAT);
+
+	/* 逗号是保存格式的字段分隔符，进不来 */
+	expect_status("name 含逗号", contacts_add(&book, "a,b", "1"),
+	              CONTACTS_ERR_FORMAT);
+	expect_status("phone 含逗号", contacts_add(&book, "a", "1,2"),
+	              CONTACTS_ERR_FORMAT);
+
+	/* 换行是记录分隔符，同样进不来 */
+	expect_status("name 含换行", contacts_add(&book, "a\nb", "1"),
+	              CONTACTS_ERR_FORMAT);
+
+	/* 长度恰好等于容量时没有位置放 '\0'，必须拒绝 */
+	{
+		char name[CONTACT_NAME_MAX + 8];
+
+		memset(name, 'x', sizeof name - 1);
+		name[sizeof name - 1] = '\0';
+
+		expect_status("name 长度 = 容量", contacts_add(&book, name, "1"),
+		              CONTACTS_ERR_TOOLONG);
+
+		name[CONTACT_NAME_MAX - 1] = '\0';
+		expect_status("name 长度 = 容量 - 1",
+		              contacts_add(&book, name, "1"), CONTACTS_OK);
+		name[CONTACT_NAME_MAX - 1] = 'x';
+	}
+
+	/* 只有那一次合法添加成功，失败的都不能留下节点 */
+	expect_int("只有一次添加成功，数量为 1", (long)contacts_count(&book), 1);
+
+	contacts_destroy(&book);
+}
+
+static void test_duplicate(void) {
+	contact_book book;
+
+	contacts_init(&book);
+
+	expect_status("首次添加", contacts_add(&book, "alice", "111"), CONTACTS_OK);
+	expect_status("重名被拒绝",
+	              contacts_add(&book, "alice", "222"), CONTACTS_ERR_DUPLICATE);
+	expect_int("重名不增加数量", (long)contacts_count(&book), 1);
+
+	/* 原来的号码不能被第二次添加覆盖 */
+	expect_str("重名时保留原号码",
+	           contacts_find(&book, "alice")->phone, "111");
+
+	contacts_destroy(&book);
+}
+
+/*
+ * 顺序必须是插入顺序。
+ * 旧实现用头插法，打印出来是倒序，且 save 写出的文件也是倒序——
+ * 存到文件再读回来，顺序又反一次。这里盯住的就是这一点。
+ */
+static void test_insert_order(void) {
+	contact_book  book;
+	const contact *item;
+	const char   *want[] = {"c", "a", "b"};
+
+	contacts_init(&book);
+
+	(void)contacts_add(&book, "c", "3");
+	(void)contacts_add(&book, "a", "1");
+	(void)contacts_add(&book, "b", "2");
+
+	item = contacts_first(&book);
+	for (int i = 0; i < 3; i++) {
+		char label[64];
+
+		(void)snprintf(label, sizeof label, "第 %d 个节点存在", i);
+		expect_int(label, item != NULL, 1);
+		if (item != NULL) {
+			(void)snprintf(label, sizeof label, "第 %d 个是 %s", i, want[i]);
+			expect_str(label, item->name, want[i]);
+			item = contacts_next(item);
+		}
+	}
+	expect_int("遍历到末尾", item == NULL, 1);
+
+	contacts_destroy(&book);
+}
+
+static void test_remove_positions(void) {
+	contact_book book;
+
+	/* 表头 */
+	contacts_init(&book);
+	(void)contacts_add(&book, "a", "1");
+	(void)contacts_add(&book, "b", "2");
+	(void)contacts_add(&book, "c", "3");
+	expect_status("删除表头 a", contacts_remove(&book, "a"), CONTACTS_OK);
+	expect_int("删表头后数量为 2", (long)contacts_count(&book), 2);
+	expect_str("删表头后第一个是 b", contacts_first(&book)->name, "b");
+	expect_int("表头 prev 仍为 NULL", contacts_first(&book)->prev == NULL, 1);
+	contacts_destroy(&book);
+
+	/* 表中 */
+	contacts_init(&book);
+	(void)contacts_add(&book, "a", "1");
+	(void)contacts_add(&book, "b", "2");
+	(void)contacts_add(&book, "c", "3");
+	expect_status("删除表中 b", contacts_remove(&book, "b"), CONTACTS_OK);
+	expect_int("删表中后数量为 2", (long)contacts_count(&book), 2);
+	expect_str("a 的 next 指向 c", contacts_next(contacts_first(&book))->name, "c");
+	contacts_destroy(&book);
+
+	/* 表尾：删完之后必须能从头遍历到 a，且不再出现 c */
+	contacts_init(&book);
+	(void)contacts_add(&book, "a", "1");
+	(void)contacts_add(&book, "b", "2");
+	(void)contacts_add(&book, "c", "3");
+	expect_status("删除表尾 c", contacts_remove(&book, "c"), CONTACTS_OK);
+	expect_int("删表尾后数量为 2", (long)contacts_count(&book), 2);
+	expect_int("遍历只有 a 与 b", contacts_next(contacts_next(contacts_first(&book))) == NULL, 1);
+	contacts_destroy(&book);
+
+	/* 唯一节点：删完 head 与 tail 都必须回到 NULL */
+	contacts_init(&book);
+	(void)contacts_add(&book, "only", "1");
+	expect_status("删除唯一节点", contacts_remove(&book, "only"), CONTACTS_OK);
+	expect_int("删唯一节点后数量为 0", (long)contacts_count(&book), 0);
+	expect_int("删唯一节点后 first 为 NULL", contacts_first(&book) == NULL, 1);
+	/* 再删一次必须报 NOTFOUND，而不是崩在野指针上 */
+	expect_status("空表再删返回 NOTFOUND",
+	              contacts_remove(&book, "only"), CONTACTS_ERR_NOTFOUND);
+	contacts_destroy(&book);
+
+	/* 删除后仍可继续添加，tail 没有悬空 */
+	contacts_init(&book);
+	(void)contacts_add(&book, "a", "1");
+	(void)contacts_remove(&book, "a");
+	expect_status("清空后还能添加", contacts_add(&book, "z", "9"), CONTACTS_OK);
+	expect_str("新添加的节点是表头", contacts_first(&book)->name, "z");
+	contacts_destroy(&book);
+}
+
+static void test_remove_notfound(void) {
+	contact_book book;
+
+	contacts_init(&book);
+	(void)contacts_add(&book, "a", "1");
+
+	expect_status("删除不存在的名字",
+	              contacts_remove(&book, "ghost"), CONTACTS_ERR_NOTFOUND);
+	expect_int("失败不改变数量", (long)contacts_count(&book), 1);
+	expect_status("name 为 NULL 删除", contacts_remove(&book, NULL),
+	              CONTACTS_ERR_PARAM);
+
+	contacts_destroy(&book);
+}
+
+static void test_clear_and_reuse(void) {
+	contact_book book;
+
+	contacts_init(&book);
+	(void)contacts_add(&book, "a", "1");
+	(void)contacts_add(&book, "b", "2");
+
+	contacts_clear(&book);
+	expect_int("clear 后数量为 0", (long)contacts_count(&book), 0);
+	expect_int("clear 后 first 为 NULL", contacts_first(&book) == NULL, 1);
+
+	/* 清空后必须能继续用，且新插入的节点能正常遍历 */
+	expect_status("clear 后添加", contacts_add(&book, "z", "9"), CONTACTS_OK);
+	expect_int("clear 后数量为 1", (long)contacts_count(&book), 1);
+	expect_str("clear 后第一个是 z", contacts_first(&book)->name, "z");
+	expect_int("clear 后只有一个节点",
+	           contacts_next(contacts_first(&book)) == NULL, 1);
+
+	contacts_destroy(&book);
+
+	/* 重复 destroy 不应崩溃 */
+	contacts_destroy(&book);
+	expect_int("重复 destroy 后数量为 0", (long)contacts_count(&book), 0);
+}
+
+static void test_check_field(void) {
+	expect_status("check_field 正常值",
+	              contacts_check_field("alice", 16), CONTACTS_OK);
+	expect_status("check_field NULL",
+	              contacts_check_field(NULL, 16), CONTACTS_ERR_PARAM);
+	expect_status("check_field 空串",
+	              contacts_check_field("", 16), CONTACTS_ERR_FORMAT);
+	expect_status("check_field 含逗号",
+	              contacts_check_field("a,b", 16), CONTACTS_ERR_FORMAT);
+	expect_status("check_field 含回车",
+	              contacts_check_field("a\rb", 16), CONTACTS_ERR_FORMAT);
+	expect_status("check_field 恰好等于容量",
+	              contacts_check_field("1234567890123456", 16), CONTACTS_ERR_TOOLONG);
+	expect_status("check_field 容量减一",
+	              contacts_check_field("123456789012345", 16), CONTACTS_OK);
+	expect_status("check_field 容量为 0",
+	              contacts_check_field("a", 0), CONTACTS_ERR_TOOLONG);
+}
+
+/* ---------------------------------------------------------------- */
+/* 文件相关                                                          */
+/* ---------------------------------------------------------------- */
+
+static int make_library(contact_book *book) {
+	contacts_init(book);
+	if (contacts_add(book, "alice", "13900001111") != CONTACTS_OK) return -1;
+	if (contacts_add(book, "Zhang San", "+8613800002222") != CONTACTS_OK) return -1;
+	if (contacts_add(book, "bob", "010-12345678") != CONTACTS_OK) return -1;
+	return 0;
+}
+
+/*
+ * 存取互逆：保存再读回来，每一条的每个字段都必须与原来完全相同。
+ * 这是旧实现最严重的一处缺陷——它写出的格式自己读不回来，
+ * 每往返一次，电话号码前面就多一个 "phone:"。
+ */
+static void test_roundtrip(void) {
+	contact_book src;
+	contact_book dst;
+	const contact *a;
+	const contact *b;
+	int i = 0;
+
+	if (make_library(&src) != 0) {
+		g_checks++;
+		g_failures++;
+		(void)printf("FAIL  构造测试数据失败\n");
+		return;
+	}
+
+	expect_status("保存到文件", contacts_save(&src, TMP_FILE), CONTACTS_OK);
+
+	contacts_init(&dst);
+	expect_status("读回文件",
+	              contacts_load(&dst, TMP_FILE, CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_OK);
+
+	expect_int("往返后数量一致",
+	           (long)contacts_count(&dst), (long)contacts_count(&src));
+
+	for (a = contacts_first(&src), b = contacts_first(&dst);
+	     a != NULL && b != NULL;
+	     a = contacts_next(a), b = contacts_next(b)) {
+		char label[64];
+
+		(void)snprintf(label, sizeof label, "第 %d 条姓名一致", i);
+		expect_str(label, b->name, a->name);
+		(void)snprintf(label, sizeof label, "第 %d 条电话一致", i);
+		expect_str(label, b->phone, a->phone);
+		i++;
+	}
+
+	contacts_destroy(&src);
+	contacts_destroy(&dst);
+	(void)remove(TMP_FILE);
+}
+
+/* 写出的文件内容必须就是约定的那一行格式 */
+static void test_saved_format(void) {
+	contact_book src;
+	FILE        *fp;
+	char         buf[256];
+
+	contacts_init(&src);
+	(void)contacts_add(&src, "alice", "13900001111");
+	(void)contacts_add(&src, "bob", "222");
+
+	expect_status("保存两条", contacts_save(&src, TMP_FILE), CONTACTS_OK);
+
+	fp = fopen(TMP_FILE, "r");
+	g_checks++;
+	if (fp == NULL) {
+		g_failures++;
+		(void)printf("FAIL  %-46s 打不开刚写出的文件\n", "保存格式");
+	} else {
+		int ok = 1;
+
+		if (fgets(buf, (int)sizeof buf, fp) == NULL
+		    || strcmp(buf, "name: alice, phone: 13900001111\n") != 0) {
+			ok = 0;
+		}
+		if (fgets(buf, (int)sizeof buf, fp) == NULL
+		    || strcmp(buf, "name: bob, phone: 222\n") != 0) {
+			ok = 0;
+		}
+		if (fgets(buf, (int)sizeof buf, fp) != NULL) {
+			ok = 0;       /* 不该有多余的行 */
+		}
+		(void)fclose(fp);
+
+		if (ok) {
+			(void)printf("ok    %s\n", "保存格式为 name: X, phone: Y");
+		} else {
+			g_failures++;
+			(void)printf("FAIL  %-46s 写出的内容与约定不符\n", "保存格式");
+		}
+	}
+
+	contacts_destroy(&src);
+	(void)remove(TMP_FILE);
+}
+
+/*
+ * 三份历史样例文件：a.txt 与 b.txt 是逗号后无空格的紧凑写法，
+ * c.txt 是逗号后有空格、且字段标签不叫 telephone 的写法。
+ * 三种都必须被正确解析——"按标签冒号取值"的设计不看空格位置。
+ */
+static void test_legacy_files(void) {
+	char          path[512];
+	contact_book  book;
+	const contact *item;
+
+	/* a.txt：4 条 */
+	data_path(path, sizeof path, "a.txt");
+	contacts_init(&book);
+	expect_status("载入 a.txt",
+	              contacts_load(&book, path, CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_OK);
+	expect_int("a.txt 条数", (long)contacts_count(&book), 4);
+
+	item = contacts_first(&book);
+	expect_str("a.txt 第 1 条姓名", item->name, "liaoqf");
+	expect_str("a.txt 第 1 条电话", item->phone, "23456543789");
+
+	item = contacts_next(item);
+	expect_str("a.txt 第 2 条姓名", item->name, "zhaomeiping");
+	expect_str("a.txt 第 2 条电话", item->phone, "14583943453");
+
+	item = contacts_next(item);
+	expect_str("a.txt 第 3 条姓名", item->name, "wangbojing");
+	expect_str("a.txt 第 3 条电话", item->phone, "15889650380");
+
+	item = contacts_next(item);
+	expect_str("a.txt 第 4 条姓名", item->name, "qiuxiang");
+	expect_str("a.txt 第 4 条电话", item->phone, "43563456123");
+
+	expect_int("a.txt 恰好 4 条",
+	           contacts_next(item) == NULL, 1);
+	contacts_destroy(&book);
+
+	/* b.txt：4 条 */
+	data_path(path, sizeof path, "b.txt");
+	contacts_init(&book);
+	expect_status("载入 b.txt",
+	              contacts_load(&book, path, CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_OK);
+	expect_int("b.txt 条数", (long)contacts_count(&book), 4);
+	item = contacts_first(&book);
+	expect_str("b.txt 第 1 条电话", item->phone, "98765678123");
+	contacts_destroy(&book);
+
+	/*
+	 * c.txt：2 条。旧实现会解析成 "phone:344567754"，
+	 * 因为它把逗号后的空格当成了字段名与值的分隔符。
+	 */
+	data_path(path, sizeof path, "c.txt");
+	contacts_init(&book);
+	expect_status("载入 c.txt",
+	              contacts_load(&book, path, CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_OK);
+	expect_int("c.txt 条数", (long)contacts_count(&book), 2);
+
+	item = contacts_first(&book);
+	expect_str("c.txt 第 1 条姓名", item->name, "king");
+	expect_str("c.txt 第 1 条电话", item->phone, "344567754");
+
+	item = contacts_next(item);
+	expect_str("c.txt 第 2 条姓名", item->name, "wbj");
+	expect_str("c.txt 第 2 条电话", item->phone, "1234567865");
+	contacts_destroy(&book);
+}
+
+static void test_load_append_vs_replace(void) {
+	char         path[512];
+	contact_book book;
+
+	data_path(path, sizeof path, "c.txt");
+
+	contacts_init(&book);
+	(void)contacts_add(&book, "keep", "1");
+
+	expect_status("追加载入",
+	              contacts_load(&book, path, CONTACTS_LOAD_APPEND, NULL),
+	              CONTACTS_OK);
+	expect_int("追加后条数 1+2=3", (long)contacts_count(&book), 3);
+	expect_str("已有的记录还在", contacts_first(&book)->name, "keep");
+
+	expect_status("替换载入",
+	              contacts_load(&book, path, CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_OK);
+	expect_int("替换后条数 2", (long)contacts_count(&book), 2);
+	expect_int("原有记录被清掉", contacts_find(&book, "keep") == NULL, 1);
+
+	/* 同一个文件追加两次会全部撞重名，只计入 skipped，不算失败 */
+	contacts_load_result result = {0, 0, 0};
+
+	expect_status("重复追加同一文件",
+	              contacts_load(&book, path, CONTACTS_LOAD_APPEND, &result),
+	              CONTACTS_OK);
+	expect_int("重复追加 loaded 为 0", (long)result.loaded, 0);
+	expect_int("重复追加 skipped 为 2", (long)result.skipped, 2);
+	expect_int("重复追加不增加条数", (long)contacts_count(&book), 2);
+
+	contacts_destroy(&book);
+}
+
+/* 坏行只跳过，不中断整个载入 */
+static void test_load_bad_lines(void) {
+	contact_book         book;
+	contacts_load_result result = {0, 0, 0};
+	FILE                *fp;
+
+	fp = fopen(TMP_FILE2, "w");
+	if (fp == NULL) {
+		g_checks++;
+		g_failures++;
+		(void)printf("FAIL  无法创建临时文件\n");
+		return;
+	}
+	(void)fputs("name: good, phone: 111\n", fp);        /* 1 正常 */
+	(void)fputs("\n", fp);                              /* 2 空行，静默忽略 */
+	(void)fputs("this line has no colon\n", fp);        /* 3 无标签 */
+	(void)fputs("name: good2, phone: 222\n", fp);       /* 4 正常 */
+	(void)fputs("name: , phone: 333\n", fp);            /* 5 空姓名 */
+	(void)fputs("name: x, phone: y, z\n", fp);          /* 6 电话含逗号 */
+	(void)fclose(fp);
+
+	contacts_init(&book);
+	expect_status("载入含坏行的文件",
+	              contacts_load(&book, TMP_FILE2, CONTACTS_LOAD_REPLACE, &result),
+	              CONTACTS_OK);
+
+	expect_int("好行载入 2 条", (long)result.loaded, 2);
+	expect_int("坏行跳过 3 条", (long)result.skipped, 3);
+	expect_int("第一个坏行是第 3 行", (long)result.first_bad_line, 3);
+	expect_int("书里确实只有 2 条", (long)contacts_count(&book), 2);
+
+	contacts_destroy(&book);
+	(void)remove(TMP_FILE2);
+}
+
+/* 超长的一行必须整行作废，不能截成两条记录 */
+static void test_load_long_line(void) {
+	contact_book         book;
+	contacts_load_result result = {0, 0, 0};
+	FILE                *fp;
+
+	fp = fopen(TMP_LONG, "w");
+	if (fp == NULL) {
+		g_checks++;
+		g_failures++;
+		(void)printf("FAIL  无法创建临时文件\n");
+		return;
+	}
+	(void)fputs("name: first, phone: 111\n", fp);
+	/* 一行 900 个字符：里面有逗号和冒号，截断后看起来会像合法记录 */
+	(void)fputs("name: ", fp);
+	for (int i = 0; i < 900; i++) {
+		(void)fputc('a', fp);
+	}
+	(void)fputs(", phone: 999\n", fp);
+	(void)fputs("name: last, phone: 222\n", fp);
+	(void)fclose(fp);
+
+	contacts_init(&book);
+	expect_status("载入含超长行的文件",
+	              contacts_load(&book, TMP_LONG, CONTACTS_LOAD_REPLACE, &result),
+	              CONTACTS_OK);
+
+	expect_int("超长行整行作废，只载入 2 条", (long)result.loaded, 2);
+	expect_int("超长行计为 1 条跳过", (long)result.skipped, 1);
+	expect_int("超长行是第 2 行", (long)result.first_bad_line, 2);
+
+	/* 关键：不能出现一条名字是一长串 a 的记录 */
+	expect_int("没有产生截断出的记录",
+	           contacts_find(&book, "last") != NULL, 1);
+	contacts_destroy(&book);
+	(void)remove(TMP_LONG);
+}
+
+static void test_load_missing(void) {
+	contact_book book;
+
+	contacts_init(&book);
+	expect_status("载入不存在的文件",
+	              contacts_load(&book, "bin/definitely_not_here.txt",
+	                            CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_ERR_OPEN);
+	expect_int("打开失败不改变内容", (long)contacts_count(&book), 0);
+
+	expect_status("path 为 NULL",
+	              contacts_load(&book, NULL, CONTACTS_LOAD_REPLACE, NULL),
+	              CONTACTS_ERR_PARAM);
+	expect_status("保存到不可写的目录",
+	              contacts_save(&book, "bin/no_such_dir/x.txt"),
+	              CONTACTS_ERR_OPEN);
+
+	contacts_destroy(&book);
+}
+
+static void test_status_string(void) {
+	const char *s;
+
+	for (int i = 0; i <= 10; i++) {
+		g_checks++;
+		s = contacts_status_string((contacts_status)i);
+		if (s == NULL || s[0] == '\0') {
+			g_failures++;
+			(void)printf("FAIL  %-46s 返回空描述\n", "状态码描述非空");
+		}
+	}
+	(void)printf("ok    %s\n", "状态码描述非空");
+
+	g_checks++;
+	s = contacts_status_string((contacts_status)999);
+	if (s == NULL || strcmp(s, "unknown status") != 0) {
+		g_failures++;
+		(void)printf("FAIL  %-46s 期望 \"unknown status\"\n", "未知状态码");
+	} else {
+		(void)printf("ok    %s\n", "未知状态码");
+	}
+}
+
+/* ---------------------------------------------------------------- */
+
+int main(int argc, char *argv[]) {
+	if (argc > 1) {
+		g_testdata = argv[1];
+	}
+
+	(void)printf("contacts %s 单元测试（testdata = %s）\n\n",
+	             CONTACTS_VERSION_STRING, g_testdata);
+
+	test_init_and_empty();
+	test_add_and_find();
+	test_add_validation();
+	test_duplicate();
+	test_insert_order();
+	test_remove_positions();
+	test_remove_notfound();
+	test_clear_and_reuse();
+	test_check_field();
+	test_roundtrip();
+	test_saved_format();
+	test_legacy_files();
+	test_load_append_vs_replace();
+	test_load_bad_lines();
+	test_load_long_line();
+	test_load_missing();
+	test_status_string();
+
+	(void)printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);
+	return (g_failures == 0) ? 0 : 1;
+}
