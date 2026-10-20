@@ -13,7 +13,7 @@ TLS 块等一整套资源分配，实测在这台机器上"创建 + join"一个�
 ```
 thread-pool/
 ├── include/
-│   └── threadpool.h          公开接口：不透明句柄 + 8 个函数 + 6 个状态码
+│   └── threadpool.h          公开接口：不透明句柄 + 10 个函数 + 6 个状态码
 ├── src/
 │   ├── threadpool.c          实现：FIFO 队列、工作线程主循环、停机流程
 │   └── main.c                命令行驱动，只链接 libthreadpool.a
