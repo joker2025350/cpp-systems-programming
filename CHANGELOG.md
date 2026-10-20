@@ -69,6 +69,54 @@
   正是根 `Makefile` 把各模块串起来之后才被发现的。
   验证：`make tsan` → `make` → `make bench` 全序列通过（该序列在修复前失败）。
 
+### thread-pool
+
+- 从单文件程序改造为模块：`include/threadpool.h` + `src/threadpool.c` + `src/main.c` +
+  `tests/test_threadpool.c`（54 项）+ `tests/check_cli.sh`（19 项）+
+  `tests/bench_threadpool.c` + `Makefile` + 重写的 README（九节）。
+  根 `Makefile` 的 `wildcard` 自动发现，`make list` 里已出现 `thread-pool`，
+  根 Makefile 本身没有改动。**原因**：模块化之前它不在任何构建目标里，
+  连"能不能编译"都没人验证。
+- 接口重设，四处改变都有具体理由：
+  - `nThreadPoolCreate(ThreadPool *pool, int n)` → `threadpool_create(int n, threadpool **out)`。
+    旧接口要求调用方在栈上放一个含 `pthread_mutex_t` 的 `ThreadPool`，池内部再
+    `memset` 清零；若该对象已被初始化过，`memset` 会抹掉同步原语的内部状态。
+    改为池自己分配、不透明句柄对外。
+  - 调用方不再 `malloc` 任务节点。旧设计要求任务函数自己 `free(task)`，
+    漏一处就是泄漏；现在节点归池，任务返回后由池释放，`arg` 仍归调用方。
+  - 新增 `threadpool_wait`。旧实现只能靠 `getchar()` 等任务做完，没有可编程的完成信号。
+  - 队列从 LIFO 改 FIFO（尾插头取）。头插头取是栈，先提交的任务会被后来的不断压到队尾，
+    在提交快于消费的负载下可能长期得不到执行——这是饥饿，不是"顺序不同"。
+    现在"提交顺序 = 执行顺序"成为可以断言的保证。
+- `destroy` 由"丢弃队列"改为"优雅停机"：置 closed → 等 `queued`/`running` 归零 →
+  置 stop → join。旧实现直接 `free` 掉未执行的任务节点，调用方既不知道丢了哪些任务，
+  也没有返回值可查。实测：200 个 1 ms 任务提交后不 wait 直接 destroy，
+  200 个全部执行完，destroy 耗时 211 ms。
+- 修 `create` 的失败路径：`pthread_create` 中途失败时旧代码直接返回，已创建的工作线程
+  既没被置停机标志也没被 join，继续在一个即将被释放的池上等任务（线程泄漏 + 悬空指针）。
+  现在按"置 stop → broadcast → join → 析构同步原语"的顺序回滚。
+- `threadpool_wait` 检测工作线程自调用（`pthread_equal` 与 `tids[]` 逐个比较）并返回
+  `TPOOL_ERR_BLOCKING`。不检测就是永久阻塞：它等 `running == 0`，而调用者自己
+  就是一个 running 的任务。用 `pthread_equal` 而非 `==`，因为 POSIX 只规定
+  `pthread_t` 是不透明类型，没有规定可比较大小。
+- 旧目录里三个讲解版文件（`threadpool_annotated.c`、`threadpool_bug_demo.c`、
+  `threadpool_win32.c`）移入 `notes/`，旧的 `threadpool.c` 删除（被 `src/threadpool.c` 取代）。
+  三者都是模块化之前的形态（任务节点自释放、每个 worker 一份 terminate 标志），
+  留在模块根目录会让人误以为它们是当前接口的实现。
+- 验证：三种构建（默认 / ASan+UBSan / TSan）均 0 条警告；
+  `make test` 54 项、`make check` 19 项、`make sanitize` 54 项、`make tsan` 54 项，
+  全部 0 失败，无 sanitizer 报告。全仓 `make test` 合计 68 + 136 + 54 + 40 = 298 项。
+- TSan 首次运行报告了一处 data race，位置在测试代码：压力测试第二轮让 100 个任务
+  共用同一个 `slot`，多个工作线程并发写同一块内存。池无问题，是测试把
+  "每个任务独占参数"这条约定用错了。改为每任务一个 `slot` 后 TSan 干净。
+- 性能（Ryzen 7 5700X，8 核 16 线程，5 轮取最小值，两轮独立测量）：
+  20 万个空任务的调度成本 1 线程 121~131 ns/任务、2 线程 146~154、
+  4 线程 290~305、8 线程 637~654；对照"每任务新建线程再 join"约 16700~17130 ns/任务，
+  单线程池约为它的 1/140。
+  **空任务吞吐随线程数单调下降**：所有工作线程争同一把锁和同一条队列的
+  `head`/`tail`（同一缓存行），空任务时缓存行 ping-pong 就是全部成本。
+  任务粒度 100 µs 时 8 线程加速比 7.98（效率 100%），说明竞争在 100 µs 尺度上可忽略。
+
 ### 其他
 
 - `.gitignore` 里 `01-concurrent-lock/lock`、`03-mysql/config.h` 两条路径随目录重命名更新为

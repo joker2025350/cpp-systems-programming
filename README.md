@@ -11,15 +11,14 @@ as such in the table below.
 | Module | What it covers | Public interface | Verification |
 |---|---|---|---|
 | [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly | `counter.h` | 68 checks · ASan/UBSan · TSan |
-| [`thread-pool`](src/thread-pool) | Fixed-size thread pool, task queue, condition-variable handoff | — (single file) | ASan |
+| [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, and a drain-on-destroy shutdown | `threadpool.h` | 54 checks · 19 end-to-end · ASan/UBSan · TSan |
 | [`mysql-client`](src/mysql-client) | MySQL C API: result-set iteration, prepared statements, BLOB transfer | — (single file) | ASan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list; text format that round-trips byte for byte | `contacts.h` | 136 checks · 21 end-to-end · ASan/UBSan |
 | [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes | `wordcount.h` | 40 checks · cross-checked against `wc` · ASan/UBSan |
 
-The `concurrent-lock`, `contact-list`, and `word-count` modules are libraries: the CLI
-links against `lib*.a` and never recompiles the module sources, so "this module can be
-linked independently" is re-verified on every build. `thread-pool` and `mysql-client` are
-single-file programs for now.
+Four of the five modules are libraries: the CLI links against `lib*.a` and never
+recompiles the module sources, so "this module can be linked independently" is
+re-verified on every build. `mysql-client` is still a single-file program.
 
 ## Layout
 
@@ -71,7 +70,7 @@ Per-module targets:
 | `make test` | unit tests |
 | `make check` | end-to-end checks (where present) |
 | `make sanitize` | rebuild with AddressSanitizer + UndefinedBehaviorSanitizer and run the tests |
-| `make tsan` | rebuild with ThreadSanitizer (concurrent-lock only) |
+| `make tsan` | rebuild with ThreadSanitizer (`concurrent-lock`, `thread-pool`) |
 | `make bench` | throughput measurements |
 | `make clean` | remove `bin/` |
 
