@@ -82,3 +82,12 @@
   规则改为 `**/testdata/** -text`（`**` 跨目录，结构调整时不用再改），
   并注明 `*/testdata/*` 也不行——gitattributes 的 `*` 与 `.gitignore` 一样不跨 `/`。
   验证：修复后 `git archive HEAD` 导出的归档，五个数据文件字节数与 blob 完全一致。
+- 同时发现换行符策略缺失：仓库里没有任何 `text` 属性，所有文本文件的检出形态
+  由各人本地的 `core.autocrlf` 决定。在 `core.autocrlf=true` 的机器上导出，
+  `tests/*.sh` 会变成 CRLF，在 Linux 上 `sh tests/check_cli.sh` 直接报
+  `set: Illegal option -`（`-e` 后面跟了一个 CR）。这看起来像脚本写错，
+  实际与脚本无关。**一个只能在 Linux 上构建的仓库，不该让构建结果取决于
+  谁在哪台机器上 clone。**
+  加 `* text=auto eol=lf`：文本文件在仓库里与检出后都是 LF，二进制仍走二进制判定；
+  它与 `-text` 的顺序有意义，`-text` 写在后面才能覆盖全局规则。
+  `git add --renormalize .` 确认仓库里原本就是 LF，blob 无一变更。
