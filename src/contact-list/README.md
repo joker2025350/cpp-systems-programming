@@ -24,7 +24,7 @@ name: bob, phone: 13800002222
 ## 1 目录结构
 
 ```
-04-contact-list/
+src/contact-list/
 ├── include/
 │   └── contacts.h           对外接口：数据结构、状态码、增删查、遍历、存取
 ├── src/
@@ -383,10 +383,14 @@ make lib        # 只构建静态库
 make cli        # 只构建命令行工具
 make test       # 构建并运行单元测试
 make check      # 命令行端到端验证
-make sanitize   # 用 ASan + UBSan 重新构建并跑测试
+make sanitize   # 用 ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
 make bench      # 不同规模下的耗时
-make clean      # 删除 bin/
+make clean      # 删除 bin/（含全部变体）
 ```
+
+变体构建使用独立输出目录，是因为 make 判断是否重建只比较时间戳、不比较编译选项：
+共用 `bin/` 时先跑 `make sanitize` 再跑 `make`，普通构建会认为目标已是最新，
+留下一个插桩过的可执行文件，运行时报链接期符号错误。
 
 默认编译参数：
 

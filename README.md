@@ -1,66 +1,111 @@
 # cpp-systems-programming
 
-Linux 系统编程练习合集。每个主题一个编号目录，包含源码、说明文档和实测结论。
+Systems-programming modules in C, built and verified on Linux.
 
-## 目录
+Each module is a self-contained library with a public header, a test suite, and its own
+build target — not a single-file exercise. A module that is still a single file is marked
+as such in the table below.
 
-| 编号 | 主题 | 关键概念 | 状态 |
+## Modules
+
+| Module | What it covers | Public interface | Verification |
 |---|---|---|---|
-| 01 | 并发计数 | 竞态条件、互斥锁、自旋锁、CPU 原子指令 | 待补耗时数据 |
-| 02 | 线程池 | 任务队列、条件变量、生产者-消费者模型 | 缺陷已修复，消毒剂验证通过 |
-| 03 | MySQL C API | 结果集遍历、预处理语句、BLOB 分块传输 | 缺陷已修复，零警告编译 + 单测通过 |
-| 04 | 通讯录（可复用模块） | 双向链表、主键约束、文本格式的存取互逆、原子写入 | 已模块化，零警告构建 + 136 项单测 + 21 项端到端 + 消毒剂通过 |
-| 05 | 单词统计（可复用模块） | 字节流扫描、状态机计数、状态外置、接口与实现分离 | 已模块化，零警告构建 + 40 项单测 + 交叉验证 + 消毒剂通过 |
+| [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly | `counter.h` | 68 checks · ASan/UBSan · TSan |
+| [`thread-pool`](src/thread-pool) | Fixed-size thread pool, task queue, condition-variable handoff | — (single file) | ASan |
+| [`mysql-client`](src/mysql-client) | MySQL C API: result-set iteration, prepared statements, BLOB transfer | — (single file) | ASan |
+| [`contact-list`](src/contact-list) | Contact book on a doubly linked list; text format that round-trips byte for byte | `contacts.h` | 136 checks · 21 end-to-end · ASan/UBSan |
+| [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes | `wordcount.h` | 40 checks · cross-checked against `wc` · ASan/UBSan |
 
-后续主题按编号顺序追加。
+The `concurrent-lock`, `contact-list`, and `word-count` modules are libraries: the CLI
+links against `lib*.a` and never recompiles the module sources, so "this module can be
+linked independently" is re-verified on every build. `thread-pool` and `mysql-client` are
+single-file programs for now.
 
-## 环境要求
+## Layout
 
-所有代码面向 Linux，依赖以下特性：
-
-- POSIX 线程库（`pthread.h`）
-- GCC 内联汇编语法（`__asm__ volatile`）
-- Linux 系统调用
-- MySQL 客户端开发库（仅 03 需要）
-
-在 Windows 上无法直接编译。可选方案：WSL、虚拟机、或任意 Linux 服务器。
-
-编译命令示例：
-
-```bash
-gcc 01-concurrent-lock/lock.c -o 01-concurrent-lock/bin/lock -lpthread
+```
+.
+├── src/                  one directory per module
+│   ├── concurrent-lock/
+│   ├── thread-pool/
+│   ├── mysql-client/
+│   ├── contact-list/
+│   └── word-count/
+├── docs/                 design notes and diagrams
+├── CHANGELOG.md          day-by-day work log
+├── Makefile              builds every module that has one
+├── LICENSE
+└── README.md
 ```
 
-> 各主题的依赖与编译方式见该目录下的 `README.md`。
-> 03 需要先安装 `libmysqlclient-dev`。
+A module that has been made into a library follows this layout:
 
-## 仓库约定
-
-1. 每个主题一个目录，命名格式为 `NN-主题名`，`NN` 是两位编号（01、02 …）。
-   两位编号能让目录在文件管理器中始终按顺序排列。
-2. 编译产物统一输出到各目录下的 `bin/`，`bin/` 已被 `.gitignore` 忽略。
-3. 每个主题目录内必须有一份 `README.md`，写清背景、结论和运行方式。
-4. 每次提交只描述一件事，提交说明用中文写清"做了什么"。
-
-## 日常提交流程
-
-```bash
-git status                      # 1. 看有哪些改动
-git add .                       # 2. 把改动放进暂存区
-git commit -m "描述这次改动"     # 3. 打包成一次提交
-git push                        # 4. 推送到 GitHub
+```
+src/<module>/
+├── include/<module>.h    public interface
+├── src/                  implementation + CLI driver
+├── tests/                unit tests and end-to-end checks
+├── Makefile              all / lib / cli / test / check / sanitize / bench / clean
+└── README.md             deep technical notes (in Chinese)
 ```
 
-## 进度
+## Quick start
 
-- [x] 01 并发计数
-- [x] 02 线程池
-- [x] 03 MySQL C API
-- [x] 04 通讯录（双向链表）
-- [x] 05 单词统计
+```bash
+git clone https://github.com/joker2025350/cpp-systems-programming.git
+cd cpp-systems-programming
 
-## 注意
+make                    # build every module that has a Makefile
+make test               # run every test suite
 
-源码中可能包含硬编码的测试环境凭据（如 03 的数据库地址与密码），
-仅适用于本地实验环境。正式项目应改用配置文件或环境变量，
-并把承载凭据的文件写进 `.gitignore`。
+# or work on one module
+cd src/word-count
+make && make test && make check
+```
+
+Per-module targets:
+
+| Target | Purpose |
+|---|---|
+| `make` | build the static library and the CLI |
+| `make test` | unit tests |
+| `make check` | end-to-end checks (where present) |
+| `make sanitize` | rebuild with AddressSanitizer + UndefinedBehaviorSanitizer and run the tests |
+| `make tsan` | rebuild with ThreadSanitizer (concurrent-lock only) |
+| `make bench` | throughput measurements |
+| `make clean` | remove `bin/` |
+
+## Requirements
+
+- Linux (the code targets POSIX; `concurrent-lock/asm` additionally requires x86)
+- gcc or clang with C11 support
+- pthread
+- `libmysqlclient-dev` — `mysql-client` only
+
+Nothing here builds on Windows without a POSIX layer. Copy `src/mysql-client/config.h.example`
+to `config.h` and fill in your own credentials before building `mysql-client`; `config.h`
+is git-ignored.
+
+## Conventions
+
+- C11 only. Every module compiles clean under `-Wall -Wextra -Wconversion`; a warning is
+  treated as a defect, not as noise.
+- Public interface in `include/`, implementation in `src/`. Tests link against the built
+  library rather than including the sources.
+- Behaviour claims in a module README are backed by a command the reader can run. Numbers
+  are measured, not estimated, and the environment is stated.
+- Text formats must round-trip: whatever the writer produces, the reader must return
+  byte for byte.
+- Test data whose byte count is part of the documented behaviour is marked `-text` in
+  `.gitattributes`, so line-ending conversion cannot quietly change it.
+
+## Notes
+
+- Module READMEs are written in Chinese and contain the full reasoning, defect history,
+  and measurements. This top-level README stays in English so the repository is
+  readable at a glance.
+- `CHANGELOG.md` records what changed and why, one entry per working day.
+
+## License
+
+[MIT](LICENSE)

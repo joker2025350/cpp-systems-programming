@@ -58,7 +58,7 @@
 | `threadpool_annotated.c` | 逐行注释版 |
 | `threadpool_bug_demo.c` | 故障演示版，用于观察并发缺陷 |
 | `threadpool_win32.c` | Windows 平台移植版 |
-| `线程池.png` | 结构笔记图 |
+| `docs/images/thread-pool.png` | 结构笔记图（在仓库根的 `docs/` 下） |
 
 ## 编译与运行
 

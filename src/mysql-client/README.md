@@ -51,7 +51,7 @@
 |---|---|
 | `mysql.c` | 完整源码 |
 | `config.h.example` | 连接配置模板，使用前需复制为 `config.h` |
-| `mysql.png` | 流程笔记图 |
+| `docs/images/mysql-client.png` | 流程笔记图（在仓库根的 `docs/` 下） |
 
 ## 配置连接参数
 

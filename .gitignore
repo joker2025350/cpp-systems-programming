@@ -18,9 +18,8 @@ obj/
 *.pdb
 a.out
 
-# Linux 下的可执行文件通常不带扩展名，无法用通配符匹配，
-# 因此只能按路径逐个列出。新增主题目录后在这里补一行。
-/01-concurrent-lock/lock
+# 各模块的编译产物统一落在模块目录下的 bin/，由上面的 bin/ 规则覆盖，
+# 不需要为每个模块单独列可执行文件名。
 
 # ---------- CMake ----------
 CMakeFiles/
@@ -40,9 +39,9 @@ venv/
 .venv/
 
 # ---------- 本地凭据（绝不能提交）----------
-# 03 主题的数据库连接参数。仓库里只保留 config.h.example 模板，
+# mysql-client 的数据库连接参数。仓库里只保留 config.h.example 模板，
 # 真实的 config.h 由使用者自己复制生成，不进版本库。
-/03-mysql/config.h
+/src/mysql-client/config.h
 
 # ---------- 编辑器与系统文件 ----------
 .vscode/

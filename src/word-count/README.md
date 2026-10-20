@@ -19,7 +19,7 @@ $ ./bin/wordcount testdata/a.txt testdata/b.txt
 ## 1 目录结构
 
 ```
-05-word-count/
+src/word-count/
 ├── include/
 │   └── wordcount.h          对外接口：类型、状态码、函数原型
 ├── src/
@@ -226,10 +226,14 @@ make lib        # 只构建静态库
 make cli        # 只构建命令行工具
 make test       # 构建并运行单元测试
 make check      # 用 testdata 下的文件与 wc 做交叉验证
-make sanitize   # 用 ASan + UBSan 重新构建并跑测试
+make sanitize   # 用 ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
 make bench      # 测量不同缓冲区大小下的吞吐
-make clean      # 删除 bin/
+make clean      # 删除 bin/（含全部变体）
 ```
+
+变体构建使用独立输出目录，是因为 make 判断是否重建只比较时间戳、不比较编译选项：
+共用 `bin/` 时先跑 `make sanitize` 再跑 `make`，普通构建会认为目标已是最新，
+留下一个插桩过的可执行文件。
 
 默认编译参数：
 
@@ -360,9 +364,11 @@ return (g_failures == 0) ? 0 : 1;
 wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
 ```
 
-没有任何 ASan 或 UBSan 报告。注意这里必须**先 `make clean` 再构建**，否则可能拿到上一次的
-非消毒剂产物——`Makefile` 里 `sanitize` 目标已经把它写成前置依赖，所以直接 `make sanitize`
-就是对的。
+没有任何 ASan 或 UBSan 报告。`sanitize` 目标的产物落在 `bin/sanitize/`，
+与普通构建的 `bin/` 分开存放，所以不需要先 `make clean`，也不会误拿到上一次的
+非消毒剂产物。这样分开是因为 **make 只比较时间戳、不比较编译选项**：
+共用同一个目录时，先跑 `make sanitize` 再跑 `make`，普通构建会认为目标已是最新，
+于是留下一个插桩过的可执行文件。
 
 ### 5.5 端到端
 

@@ -1,5 +1,5 @@
 # ============================================================
-# 04 通讯录模块
+# 通讯录模块
 #
 # 目标：
 #   make            构建静态库与命令行工具（默认）
@@ -7,9 +7,9 @@
 #   make cli        只构建命令行工具 bin/contacts
 #   make test       构建并运行单元测试
 #   make check      用命令行做端到端验证
-#   make sanitize   用 ASan + UBSan 重新构建并跑测试
+#   make sanitize   用 ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make bench      测量不同规模下的构建 / 查找 / 存取耗时
-#   make clean      删除 bin/
+#   make clean      删除 bin/（含全部变体）
 # ============================================================
 
 CC       ?= cc
@@ -22,16 +22,20 @@ CPPFLAGS += -Iinclude
 
 TESTDATA ?= testdata
 
-BIN      := bin
-LIB      := $(BIN)/libcontacts.a
-CLI      := $(BIN)/contacts
-TESTBIN  := $(BIN)/test_contacts
-BENCHBIN := $(BIN)/bench_contacts
+# 输出目录。变体构建（sanitize）通过命令行覆盖它，与普通构建分开存放：
+# make 只比较时间戳，不比较编译选项，共用目录会让普通构建把插桩过的
+# 可执行文件当成"已是最新"，于是运行时报 ASan/UBSan 的链接期符号错误。
+OUT      ?= bin
 
-LIB_OBJ  := $(BIN)/contacts.o
-CLI_OBJ  := $(BIN)/main.o
+LIB      := $(OUT)/libcontacts.a
+CLI      := $(OUT)/contacts
+TESTBIN  := $(OUT)/test_contacts
+BENCHBIN := $(OUT)/bench_contacts
 
-.PHONY: all lib cli test check sanitize bench clean
+LIB_OBJ  := $(OUT)/contacts.o
+CLI_OBJ  := $(OUT)/main.o
+
+.PHONY: all lib cli test check sanitize sanitize-run bench clean
 
 all: lib cli
 
@@ -39,11 +43,11 @@ lib: $(LIB)
 
 cli: $(CLI)
 
-$(BIN):
-	@mkdir -p $(BIN)
+$(OUT):
+	@mkdir -p $(OUT)
 
-# 模式规则：src/*.c -> bin/*.o
-$(BIN)/%.o: src/%.c | $(BIN)
+# 模式规则：src/*.c -> $(OUT)/*.o
+$(OUT)/%.o: src/%.c | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJ)
@@ -54,10 +58,10 @@ $(LIB): $(LIB_OBJ)
 $(CLI): $(CLI_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(TESTBIN): tests/test_contacts.c $(LIB) | $(BIN)
+$(TESTBIN): tests/test_contacts.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
-$(BENCHBIN): tests/bench_contacts.c $(LIB) | $(BIN)
+$(BENCHBIN): tests/bench_contacts.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
 test: $(TESTBIN)
@@ -67,24 +71,29 @@ test: $(TESTBIN)
 check: $(CLI)
 	@sh tests/check_cli.sh $(CLI) $(TESTDATA)
 
-sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
-sanitize: clean all $(TESTBIN)
+SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1
+
+sanitize:
+	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
+		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' sanitize-run
+
+sanitize-run: all $(TESTBIN)
 	@echo "\n--- 单元测试（ASan + UBSan）---"
 	@$(TESTBIN) $(TESTDATA)
 	@echo "\n--- 命令行（ASan + UBSan）---"
-	@$(CLI) -f $(BIN)/asan_book.txt add alice 13900001111
-	@$(CLI) -f $(BIN)/asan_book.txt add bob 13800002222
-	@$(CLI) -f $(BIN)/asan_book.txt list
-	@$(CLI) -f $(BIN)/asan_book.txt del alice
-	@$(CLI) -f $(BIN)/asan_book.txt load $(TESTDATA)/c.txt -r
-	@$(CLI) -f $(BIN)/asan_book.txt list
+	@$(CLI) -f $(OUT)/asan_book.txt add alice 13900001111
+	@$(CLI) -f $(OUT)/asan_book.txt add bob 13800002222
+	@$(CLI) -f $(OUT)/asan_book.txt list
+	@$(CLI) -f $(OUT)/asan_book.txt del alice
+	@$(CLI) -f $(OUT)/asan_book.txt load $(TESTDATA)/c.txt -r
+	@$(CLI) -f $(OUT)/asan_book.txt list
 	@echo "\n--- 错误路径 ---"
-	@$(CLI) -f $(BIN)/asan_book.txt load $(BIN)/nonexistent.txt || true
-	@rm -f $(BIN)/asan_book.txt
+	@$(CLI) -f $(OUT)/asan_book.txt load $(OUT)/nonexistent.txt || true
+	@rm -f $(OUT)/asan_book.txt
 
 bench: $(BENCHBIN)
 	@echo
 	@$(BENCHBIN)
 
 clean:
-	rm -rf $(BIN)
+	rm -rf $(OUT)
