@@ -73,4 +73,12 @@
 
 - `.gitignore` 里 `01-concurrent-lock/lock`、`03-mysql/config.h` 两条路径随目录重命名更新为
   `src/...`，否则 `config.h` 会重新变成被追踪状态——它含真实数据库凭据。
-- 根 `.gitattributes` 的两条 `-text` 规则同步更新为 `src/*/testdata/*`。
+- 发现并修复：`.gitattributes` 的两条 `-text` 规则在目录重命名后**静默失效**。
+  规则原本写的是 `04-contact-list/testdata/*` 与 `05-word-count/testdata/*` 两条具体路径，
+  搬到 `src/<模块>/testdata/` 之后不再匹配任何文件，而 git 对不匹配的规则
+  不会有任何提示。后果不是仓库里的 blob 被改写（blob 仍是 158/160/58/118/617637），
+  而是**检出与导出时按 `core.autocrlf=true` 加上 CR**：`git archive HEAD` 导出后
+  同一份数据变成 165/165/60/120。只在"从远程重新取一份"时暴露，本机工作区看不出来。
+  规则改为 `**/testdata/** -text`（`**` 跨目录，结构调整时不用再改），
+  并注明 `*/testdata/*` 也不行——gitattributes 的 `*` 与 `.gitignore` 一样不跨 `/`。
+  验证：修复后 `git archive HEAD` 导出的归档，五个数据文件字节数与 blob 完全一致。
