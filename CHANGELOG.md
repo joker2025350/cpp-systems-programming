@@ -12,6 +12,77 @@
 
 ---
 
+## 2026-10-21
+
+### word-count
+
+- 驱动层新增 `-j N`：处理多个文件时，每个文件作为一个任务提交给 `src/thread-pool`
+  的线程池，由至多 N 个工作线程并行统计；工作线程数取 `min(JOBS, 文件数)`。
+  这是两个模块第一次真正接起来——之前它们只是放在同一个仓库里。
+  **依赖方向是刻意的单向**：只有 `src/main.c` 引用 `threadpool.h`，
+  `libwordcount.a` 对 `threadpool_*` 零引用，`wordcount.h` 里也没有任何线程类型。
+  只想数一个文件的调用方因此既不需要 pthread，也不需要 worker 池。
+- 并行输出与顺序输出**逐字节相同**：每个任务只写自己那个 `file_slot`
+  （槽位数 = 文件数），主线程在 `threadpool_wait` 之后按 argv 顺序统一打印。
+  若让任务自己 `printf`，行序就取决于谁先读完——6 个大小不同的文件跑两遍，
+  行序都可能不同，而数字全对，肉眼极难发现。
+- `errno` 在任务线程内取值后存进槽位。POSIX.1-2008 规定 `errno` 是 thread-local，
+  工作线程里的 `ENOENT` 不会出现在主线程那一份里；等到打印时再读，
+  拿到的是主线程自己的残留值，错误信息会指向一个不相干的原因。
+- `threadpool_wait` 的返回点构成 happens-before：工作线程在持锁状态下把 `running`
+  减一并广播，主线程在同一个互斥量上等它归零，因此 `wait` 之后读槽位不需要额外同步。
+- 建池失败直接报错退出，不静默退回串行：`-j 8` 悄悄变成单线程之后输出完全正常、
+  只有耗时对不上，这种状态比一条明确的错误信息难查得多。
+- 修掉一个只有加了选项才会暴露的缺陷：`total` 行的判定原本是 `argc > 2`，
+  引入 `-j` 之后这个条件不再等于"有多个文件"，改为按 `optind` 之后的实际文件数判断。
+- 加入 `getopt` 解析（`-j` / `-h`），`CPPFLAGS` 补 `-D_POSIX_C_SOURCE=200809L`：
+  `-std=c11` 定义 `__STRICT_ANSI__` 会关掉 glibc 的默认扩展，不定义时 `getopt`
+  退化成隐式声明。
+
+### 构建系统
+
+- `src/word-count/Makefile` 新增一条把 thread-pool 建到本模块 `bin/thread-pool/`
+  下的规则（子 make 传绝对 `OUT`，`CFLAGS` 原样透传）。不直接链接
+  `../thread-pool/bin/libthreadpool.a`：那样 `make -C src/word-count` 从干净工作树
+  就会失败，而且 sanitize / tsan 变体会拿到未插桩的那份池——
+  "测试跑过了，但池里发生的错误从没被检查过"。代价是根 `make` 编译 thread-pool 两遍。
+- `make bench` 里原本有五行直接编译 `src/wordcount.c src/main.c` 生成不同块大小的变体。
+  `main.c` 引用线程池之后这五行会链接失败，改为同时传 `-I../thread-pool/include`
+  并链接 `$(POOLLIB)`。
+- word-count 新增 `make tsan`（此前是纯单线程模块，没有这个目标）。
+- 根 `Makefile` 顶部注释仍写着"thread-pool 与 mysql-client 没有 Makefile"，
+  与 10-20 的模块化不符，改为只剩 mysql-client。
+
+### 测试
+
+- 新增 `tests/check_parallel.sh`：6 个长度递增的文件（118 B ~ 3.1 MB，短任务先结束，
+  完成顺序必然与 argv 不同），用 `-j 1/2/3/4/8/16` 与顺序基线比对 **stdout、stderr、
+  退出码**三个产物；另加单文件、中间夹不存在文件、全部不存在、`-j 0` / `-j abc`
+  四组边界，共 28 项比对。`make check` 现在跑两段。
+- 验证（Ubuntu 22.04 / gcc 11.4.0 / Ryzen 7 5700X）：
+  默认、`-funsigned-char`、ASan+UBSan、TSan 四种构建各 **0 条警告**；
+  `make test` 40 项、`make check` 6 + 28 项、`make sanitize` 40 项、`make tsan` 40 项
+  全部 0 失败，无 sanitizer 报告（TSan 下并行驱动跑了 4 worker 与"含错误文件"两组）。
+  全仓 `make test` 68 + 136 + 54 + 40 = 298 项。
+- 性能（8 个文件合计 39 528 768 字节，5 轮合计，三次独立测量）：
+  顺序 378~379 ms、`-j 1` 380 ms、`-j 2` 194~195 ms、`-j 4` 100 ms、`-j 8` 66~70 ms。
+  `-j 8` 加速比 **5.4~5.7×**，吞吐从 ~523 MB/s 提到 ~2820~2990 MB/s。
+  不足 8 倍的原因有三处：主线程的提交与汇总本身串行、文件长度不等造成尾部等待、
+  8 条流共享内存带宽。`-j 1` 与顺序相差 1% 以内，那是每轮建池与停机的固定开销。
+- 小文件对照：500 个 118 字节文件各跑 20 轮，顺序 67 ms、`-j 4` 41 ms、`-j 8` 36 ms，
+  约 1.6~1.9×。此时时间几乎全在 500 次 `open` / `read` / `close` 上，
+  并行的是系统调用而不是计算。
+- `testdata` 字节数未变：118 / 617637 / 158 / 160 / 58。
+
+### 文档
+
+- `src/word-count/README.md` 补 2.7（跨模块依赖方向）、3.6（并行驱动的任务划分与顺序保证）、
+  5.7（并行一致性验证）、5.8（TSan）、6.3（并行度实测）、7.4（第三轮改动的落点）、
+  9.5 / 9.6（单文件不能并行、标准输入不并行），待办勾掉 `-h`。
+- 根 `README.md` 更新模块表与 `make tsan` 一行，并注明 word-count 是唯一一处模块间接线。
+
+---
+
 ## 2026-10-20
 
 ### 仓库结构

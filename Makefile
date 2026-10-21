@@ -12,8 +12,8 @@
 #   make clean      清理全部模块
 #   make list       列出被识别的模块
 #
-# 没有 Makefile 的模块（目前是 thread-pool 与 mysql-client）会被跳过，
-# 它们还是单文件程序，等各自模块化之后再纳入这里。
+# 没有 Makefile 的模块（目前只剩 mysql-client）会被跳过，
+# 它还是单文件程序，等模块化之后再纳入这里。
 # ============================================================
 
 MODULES := $(patsubst src/%/Makefile,%,$(wildcard src/*/Makefile))

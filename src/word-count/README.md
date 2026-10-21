@@ -7,11 +7,17 @@
 `include/` 与 `src/` 分离，`main.c` 只通过 `libwordcount.a` 链接，不重复编译模块源码——
 "这个模块能被独立链接使用"这件事在每次构建时都会被动验证一遍。
 
+驱动层还多走了一步：处理多个文件时用 `-j N` 把每个文件作为一个任务提交给
+`src/thread-pool` 的线程池，由至多 N 个工作线程并行统计。**库本身不引用线程池**，
+依赖方向只有一条：驱动 → `libthreadpool.a`；`libwordcount.a` 的使用者不必链接 pthread。
+
 ```bash
 $ ./bin/wordcount testdata/a.txt testdata/b.txt
        2       14      118 testdata/a.txt
     1762   114588   617637 testdata/b.txt
     1764   114602   617755 total
+
+$ ./bin/wordcount -j 4 logs/*.log     # 四个线程并行，输出与不加 -j 时逐字节相同
 ```
 
 ---
@@ -24,10 +30,11 @@ src/word-count/
 │   └── wordcount.h          对外接口：类型、状态码、函数原型
 ├── src/
 │   ├── wordcount.c          模块实现
-│   └── main.c               命令行驱动（参数解析、输出排版、退出码）
+│   └── main.c               命令行驱动（参数解析、任务分发、输出排版、退出码）
 ├── tests/
 │   ├── test_wordcount.c     单元测试，纯内存数据，40 项检查
-│   └── check_against_wc.sh  与 wc / 独立方法交叉验证
+│   ├── check_against_wc.sh  与 wc / 独立方法交叉验证
+│   └── check_parallel.sh    并行与顺序的输出逐字节比对，28 项比对
 ├── testdata/
 │   ├── a.txt                118 字节，人工构造，含易漏标点
 │   └── b.txt                617637 字节，英文文本 1762 行
@@ -131,6 +138,27 @@ typedef struct {
 这条约束直接来自"状态外置"这个设计决定：状态如果在函数里用 `static` 变量保存，
 这个模块就只能有一个实例，也没法在多线程里用。
 
+### 2.7 跨模块依赖：只有驱动层用 thread-pool
+
+`src/main.c` 的 `-j` 选项要并发处理多个文件，用的是 `src/thread-pool` 的
+`include/threadpool.h`；而 `libwordcount.a` 里没有任何对 `threadpool_*` 的引用。
+
+方向是刻意单向的：
+
+```
+src/main.c  ──►  libwordcount.a      （统计逻辑）
+    └─────────►  libthreadpool.a     （任务调度）
+libwordcount.a ──► （无外部依赖，不需要 pthread）
+```
+
+理由：并发是"怎么调度 I/O 与 CPU"，不是"怎么数词"。把线程池塞进库里，
+等于要求每个使用者都接受 pthread、都能接受库在后台建线程；而只想数一个文件的调用方，
+本来只需要 `fopen` + `fread`。头文件 `wordcount.h` 因此连 `<pthread.h>` 都不出现。
+
+代价是驱动层必须同时链接两个静态库，`Makefile` 里多了一条把 thread-pool 建到
+本模块 `bin/` 下的规则（见第 4 节）。这属于把耦合点收到一处，而不是消灭它——
+能看见的耦合比藏起来的耦合好处理。
+
 ---
 
 ## 3 设计要点
@@ -216,6 +244,56 @@ return status;
 如果把它定义成"文本行数"，`a\nb\nc` 到底算 2 行还是 3 行就会成为接口层面的争议，
 而实现方无论选哪个都要在文档里解释半天。跟随已有的、有明确定义的工具，是最省事的选择。
 
+### 3.6 并行驱动：任务划分与顺序保证
+
+`-j N` 的划分单位是**文件**：一个文件一个任务，任务函数只调用一次 `wc_count_file`。
+
+**为什么不是"一个线程读、多个线程算"。** 后者要求把字节流按块切开再分发给工作线程，
+而单词可能横跨块边界（3.2 节），每个线程拿到的是任意切分的片段，必须知道
+"我这一段开头是不是接着上一段的半个词"。这需要前缀/后缀拼接或者两遍扫描，
+判断条件比"按文件切"复杂得多。按文件切分时，每个文件的扫描从 `wc_counter_reset`
+开始，状态机天然独立，一行同步代码都不需要。
+
+**输出顺序为什么必须由主线程决定。** 如果任务函数自己 `printf`，行序取决于
+哪个文件先读完：6 个大小不一的文件跑两遍，行序可能都不一样。这类差异肉眼很难发现
+（数字全对），却会让任何基于 `diff` 的脚本失效。本实现让每个任务只往自己那个
+`file_slot` 里写结果，主线程在 `threadpool_wait` 之后按 argv 顺序统一打印：
+
+```c
+typedef struct {
+    const char *path;
+    wc_status   status;
+    int         saved_errno;   /* 在任务线程内部取，不能回到主线程再读 */
+    wc_stat     stat;
+} file_slot;
+```
+
+槽位数 = 文件数，第 i 个槽位只由第 i 个任务写。**并发代码最省事的写法是不让它共享
+可写状态**：没有共享，就没有数据竞争，也没有锁。
+
+**`errno` 必须当场取值。** POSIX.1-2008 规定 `errno` 是 thread-local 的宏展开
+（`*__errno_location()` 一类），每个线程各有一份。工作线程里发生的 `ENOENT`
+不会出现在主线程的 `errno` 里；主线程读到的是自己上一次调用留下的残留值。
+所以 `count_one` 在返回前把 `errno` 存进槽位，主线程只用 `strerror(slot->saved_errno)`。
+
+**跨线程读槽位为什么不需要额外同步。** 工作线程执行完任务函数后，
+要在持有池内部互斥量的状态下把 `running` 计数减一并 `broadcast`；
+主线程的 `threadpool_wait` 在同一个互斥量上等待 `running == 0`。
+这条"解锁 → 加锁"的链路构成 happens-before 关系，因此 `wait` 返回之后，
+主线程看到的槽位内容一定是任务写完的。这不是巧合，而是用互斥量做屏障的必然结果——
+先 `wait` 再读，顺序不能颠倒。
+
+**工作线程数取 `min(JOBS, 文件数)`。** 任务数少于线程数时，多出来的工作线程
+一个任务都取不到，只是白占一块线程栈和一份调度实体。`-j 1` 仍然走并行路径
+（建一个单 worker 的池），这样"单 worker"这条代码路径也在测试覆盖内。
+
+**创建池失败直接报错，不静默退回串行。** 使用者写了 `-j 8` 就是期望并行，
+悄悄改成单线程之后输出完全正常、只是耗时对不上，这种"能跑但不符合预期"的状态
+比一条明确的错误信息难查得多。
+
+**标准输入不并行。** 管道与终端不可 seek，只能顺序读一遍；`-j` 对无文件名的调用没有意义，
+此时仍走顺序路径。
+
 ---
 
 ## 4 构建
@@ -225,9 +303,10 @@ make            # 构建静态库 bin/libwordcount.a 与命令行工具 bin/word
 make lib        # 只构建静态库
 make cli        # 只构建命令行工具
 make test       # 构建并运行单元测试
-make check      # 用 testdata 下的文件与 wc 做交叉验证
+make check      # 与 wc 交叉验证 + 并行/顺序输出一致性检查
 make sanitize   # 用 ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
-make bench      # 测量不同缓冲区大小下的吞吐
+make tsan       # 用 TSan 重新构建并跑测试，产物在 bin/tsan/
+make bench      # 缓冲区大小与并行度的吞吐测量
 make clean      # 删除 bin/（含全部变体）
 ```
 
@@ -235,11 +314,33 @@ make clean      # 删除 bin/（含全部变体）
 共用 `bin/` 时先跑 `make sanitize` 再跑 `make`，普通构建会认为目标已是最新，
 留下一个插桩过的可执行文件。
 
+链接 `bin/wordcount` 时除了 `libwordcount.a`，还要链接一份 thread-pool 的静态库。
+它不由使用者从 `../thread-pool/bin/` 里取，而是由本模块的 Makefile 现场建到
+`bin/thread-pool/` 下：
+
+```make
+POOLDIR  := ../thread-pool
+POOLOUT  := $(OUT)/thread-pool
+POOLLIB  := $(POOLOUT)/libthreadpool.a
+
+$(POOLLIB):
+	@$(MAKE) --no-print-directory -C $(POOLDIR) lib \
+		OUT=$(abspath $(POOLOUT)) CFLAGS='$(CFLAGS)'
+```
+
+三个理由：`make -C src/word-count` 从干净工作树就能构建，不必先去 thread-pool 里
+`make` 一次；`sanitize` / `tsan` 变体拿到的是**同样插桩过**的池，否则"测试跑过了，
+但池里发生的错误从没被 ASan 检查过"；`make clean` 一次能清干净本模块的全部产物。
+代价是根 `make` 会把 thread-pool 编译两遍（各自一份 `bin/`），编译它只要几百毫秒。
+
+`OUT` 传给子 make 时必须转成绝对路径：子 make 的工作目录是 `$(POOLDIR)`，
+相对路径会落到 `../thread-pool/` 之下而不是本模块的输出目录里。
+
 默认编译参数：
 
 ```make
-CFLAGS   ?= -std=c11 -Wall -Wextra -Wconversion -O2 -g
-CPPFLAGS += -Iinclude
+CFLAGS   ?= -std=c11 -Wall -Wextra -Wconversion -O2 -g -pthread
+CPPFLAGS += -Iinclude -I$(POOLINC) -D_POSIX_C_SOURCE=200809L
 ```
 
 | 参数 | 作用 |
@@ -249,6 +350,8 @@ CPPFLAGS += -Iinclude
 | `-Wconversion` | 检查隐式窄化转换。本主题最关键的一处缺陷只有它能发现（见第 7 节） |
 | `-O2` | 优化；模块不依赖任何未定义行为，优化不会改变结果 |
 | `-g` | 保留调试信息，配合 `make sanitize` 时能定位到具体行 |
+| `-pthread` | 驱动层链接线程池需要；库本身不引用 pthread，但编译选项全模块共用 |
+| `-D_POSIX_C_SOURCE=200809L` | `-std=c11` 会定义 `__STRICT_ANSI__`，关掉 glibc 的默认扩展，`getopt` 的声明就看不到了；不定义它时 `getopt` 退化成隐式声明 |
 
 `CFLAGS ?=` 用的是条件赋值，因此可以在命令行上覆盖，例如
 `make CFLAGS="-std=c11 -Wall -Wextra -Wconversion -O0 -g -funsigned-char"`
@@ -263,6 +366,10 @@ cc -std=c11 -Wall -Wextra -Wconversion -O2 -Iinclude your_app.c bin/libwordcount
 只需要 `-Iinclude` 指向头文件，`libwordcount.a` 指向静态库。链接顺序上库要放在
 引用它的目标文件之后——`ar` 生成的静态库按需抽取成员，顺序反了会报未定义符号。
 
+不需要 `-pthread`，也不需要 thread-pool 的头文件与库：线程池只被本模块的驱动层
+（`src/main.c`）使用，`libwordcount.a` 对它是零引用。这条性质不是靠约定维持的，
+而是每次构建 `bin/wordcount` 之外还会单独链接 `libwordcount.a` 验证出来的。
+
 ---
 
 ## 5 测试与验证
@@ -273,8 +380,10 @@ cc -std=c11 -Wall -Wextra -Wconversion -O2 -Iinclude your_app.c bin/libwordcount
 
 | 编译参数 | 结果 |
 |---|---|
-| `-std=c11 -Wall -Wextra -Wconversion -O2 -g` | **0 条** |
-| 追加 `-funsigned-char`（模拟 `char` 无符号的平台） | 0 条 |
+| `-std=c11 -Wall -Wextra -Wconversion -O2 -g -pthread` | **0 条** |
+| 追加 `-funsigned-char`（模拟 `char` 无符号的平台） | 0 条（并行输出与顺序输出仍一致） |
+| `make sanitize`（ASan + UBSan，含 thread-pool） | 0 条 |
+| `make tsan`（TSan，含 thread-pool） | 0 条 |
 
 ### 5.2 单元测试
 
@@ -360,11 +469,23 @@ return (g_failures == 0) ? 0 : 1;
     1762   114588   617637 testdata/b.txt
     1764   114602   617755 total
 
+--- 并行路径（ASan + UBSan）---
+       2       14      118 testdata/a.txt
+    1762   114588   617637 testdata/b.txt
+       2       14      118 testdata/a.txt
+    1766   114616   617873 total
+
 --- 错误路径 ---
 wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
 ```
 
-没有任何 ASan 或 UBSan 报告。`sanitize` 目标的产物落在 `bin/sanitize/`，
+没有任何 ASan 或 UBSan 报告。**thread-pool 也被同一组编译选项重新编译**，
+因此池内部的越界与释放后使用同样在检查范围内——如果只链接 `../thread-pool/bin/`
+里那份普通构建的库，这段路径就变成"看起来跑通了，实际没被检查过"。
+ASan 的泄漏检测在进程退出时执行，并行路径里的槽位数组（`calloc` / `free`）
+与池对象（`destroy`）都在覆盖范围内。
+
+`sanitize` 目标的产物落在 `bin/sanitize/`，
 与普通构建的 `bin/` 分开存放，所以不需要先 `make clean`，也不会误拿到上一次的
 非消毒剂产物。这样分开是因为 **make 只比较时间戳、不比较编译选项**：
 共用同一个目录时，先跑 `make sanitize` 再跑 `make`，普通构建会认为目标已是最新，
@@ -377,6 +498,8 @@ wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
 | 标准输入 | `printf "hello world\nfoo\n" \| ./bin/wordcount` | `2 3 16`，退出码 0 |
 | 单文件 | `./bin/wordcount testdata/a.txt` | 行 2、词 14、字节 118 |
 | 多文件 | `./bin/wordcount testdata/a.txt testdata/b.txt` | 逐行输出，末尾补 `total` 行 |
+| 并行多文件 | `./bin/wordcount -j 4 testdata/a.txt testdata/b.txt testdata/a.txt` | 输出与不带 `-j` 时逐字节相同 |
+| `-j` 越界 | `./bin/wordcount -j 0 testdata/a.txt` | 报错到 stderr，退出码 2 |
 | 空输入 | `: \| ./bin/wordcount` | `0 0 0`，退出码 0 |
 | 文件不存在 | `./bin/wordcount testdata/nonexistent.txt` | 报错到 stderr，退出码 1 |
 
@@ -389,6 +512,7 @@ wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
 | 验证项 | 结果 |
 |---|---|
 | ASan（越界、泄漏） | 无报告 |
+| 并行路径的槽位数组与池对象 | ASan 退出检查无泄漏 |
 | 文件描述符泄漏 | 连续 500 次 `wc_count_file`，`/proc/self/fd` 计数 6 → 6，**净增 0** |
 | 非法参数（各接口传 NULL） | 全部返回 `WC_ERR_PARAM`，不崩溃 |
 | `wc_counter_reset(NULL)` / `wc_counter_get(NULL, &st)` | 直接返回，不崩溃 |
@@ -398,12 +522,82 @@ wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
 `main` 调用完就退出，进程结束时内核统一回收；但只要把它放进长期运行的循环，
 泄漏立刻变成硬故障。这也是"资源所有权必须跟着作用域走"最实际的理由。
 
+### 5.7 并行与顺序的一致性
+
+`make check` 的第二段运行 `tests/check_parallel.sh`：构造 6 个长度递增的文件
+（118 B ~ 3.1 MB），先把顺序模式的输出存成基线，再用 `-j 1/2/3/4/8/16` 各跑一遍，
+逐字节比对 **stdout、stderr、退出码**三个产物。
+
+文件长度递增是有意的：短任务先完成、长任务后完成，完成顺序与 argv 顺序必然不同。
+如果输出顺序跟着完成顺序走，这里立刻就会 diff 出差异。
+
+```
+并行与顺序的输出一致性
+---------------------------------------------------------------
+  顺序基线：6 个文件（118 B ~ 3.1 MB），输出 7 行（含 total）
+  stdout / stderr / 退出码  一致    -j 1
+  stdout / stderr / 退出码  一致    -j 2
+  stdout / stderr / 退出码  一致    -j 3
+  stdout / stderr / 退出码  一致    -j 4
+  stdout / stderr / 退出码  一致    -j 8
+  stdout / stderr / 退出码  一致    -j 16
+  stdout / stderr / 退出码  一致    -j 8 单文件
+  stdout / stderr / 退出码  一致    -j 4 含不存在的文件
+  stdout / stderr / 退出码  一致    -j 2 全部不存在
+  退出码 2，有错误提示            -j 0 / -j abc 被拒绝
+
+全部一致（28 项比对）
+```
+
+只比 stdout 是不够的。并行版本最容易丢的两件事恰好不在 stdout 里：
+错误信息落到 stderr 的**次序**，以及"有一个文件失败时退出码是否仍是 1"。
+三组边界用例各自盯着一个方向：
+
+| 用例 | 盯的是什么 |
+|---|---|
+| `-j 8` + 单文件 | 工作线程数取 `min(JOBS, 文件数)`，必须退回顺序路径，连"没有 total 行"都一样 |
+| `-j 4` + 中间夹一个不存在的文件 | 错误必须落在 argv 顺序的那一位，同批其它文件的结果不能消失 |
+| `-j 2` + 全部不存在 | `total` 行不该出现，退出码必须非 0 |
+
+最后一项验证参数校验：`-j 0` 与 `-j abc` 都要以退出码 2 结束并给出提示。
+
+### 5.8 ThreadSanitizer
+
+本模块在引入并行驱动之前是纯单线程的，没有 `make tsan`；现在有了必须补上——
+TSan 是唯一能在运行期发现"槽位被两个任务同时写"这类问题的工具。
+
+`make tsan` 用 `-fsanitize=thread -O1 -g` 重建（连 thread-pool 一起插桩），
+在 `setarch $(uname -m) -R` 关闭 ASLR 的前提下运行：
+
+```
+40 项检查，0 项失败
+
+--- 并行驱动（ThreadSanitizer）---
+       2       14      118 testdata/a.txt
+    1762   114588   617637 testdata/b.txt
+       2       14      118 testdata/a.txt
+    1762   114588   617637 testdata/b.txt
+    3528   229204  1235510 total
+
+--- 并行驱动 + 不存在的文件（ThreadSanitizer）---
+wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
+       2       14      118 testdata/a.txt
+    1762   114588   617637 testdata/b.txt
+    1764   114602   617755 total
+```
+
+无任何 data race 报告。能做到这一点的原因不是"运气好"，而是这一层没有任何共享可写状态：
+槽位按文件索引、各写各的，唯一的跨线程同步是 `threadpool_wait`。
+
 ---
 
 ## 6 性能
 
 测试数据：`testdata/b.txt` 拼接 20 份，共 **12 352 740 字节**（11.78 MiB）、35 240 行、
 2 291 760 词。各跑 20 轮取总时间，`-O2` 编译。
+
+机器：AMD Ryzen 7 5700X（8 核 16 线程）/ Linux 6.8 / gcc 11.4.0。
+第 6.3 节的并行度数据同样在这台机器上测。
 
 ### 6.1 与单文件实现、GNU `wc` 的对比
 
@@ -459,6 +653,44 @@ wordcount: testdata/nonexistent.txt: cannot open file: No such file or directory
 
 顺带一个反面结论：模块早期版本试过 `getc_unlocked`，实测只快约 2%，落在测量噪声里。
 它是 POSIX 扩展，去掉它等于去掉一个平台依赖，代价是那 2%——不值得。**先测量，再决定要不要换。**
+
+### 6.3 并行度
+
+输入：8 个文件，每个由 8 份 `b.txt` 拼成，合计 **39 528 768 字节**（37.7 MiB）。
+输入全在页缓存里，因此测的是扫描 + 系统调用的成本，不含磁盘等待。
+每个配置跑 5 轮取合计，`make bench` 连续跑三次：
+
+| 配置 | 第一次 | 第二次 | 第三次 | 相对顺序 |
+|---|---|---|---|---|
+| 顺序（无 `-j`） | 379 ms | 378 ms | 378 ms | 1.00× |
+| `-j 1` | 380 ms | 380 ms | 380 ms | 1.00× |
+| `-j 2` | 194 ms | 195 ms | 194 ms | 1.95× |
+| `-j 4` | 100 ms | 100 ms | 100 ms | 3.79× |
+| `-j 8` | 68 ms | 70 ms | 66 ms | 5.4~5.7× |
+
+换算成单轮与吞吐（顺序取 378/5 ≈ 75.6 ms，`-j 8` 取 66~70 ms）：
+
+| 配置 | 单轮 | 吞吐 |
+|---|---|---|
+| 顺序 | ~75.6 ms | ~523 MB/s |
+| `-j 2` | ~38.8 ms | ~1019 MB/s |
+| `-j 4` | ~20.0 ms | ~1976 MB/s |
+| `-j 8` | ~13.2~14.0 ms | ~2820~2990 MB/s |
+
+几点值得记下来：
+
+1. **`-j 1` 与顺序的差别在 1% 以内**（380 vs 378 ms）。多出来的是每轮建池与停机的开销：
+   创建一个工作线程 + 一次 `threadpool_wait` + `destroy` 的 join。相对 39 MB 的扫描量
+   可以忽略，但这也说明"并行一定更快"不成立——收益必须由工作量摊掉固定成本。
+2. **加速比在 8 线程时是 5.4~5.7，不是 8。** 机器是 8 核 16 线程（Ryzen 7 5700X），
+   `-j 8` 正好占满 8 个物理核。剩下的差额来自三处：主线程提交与汇总本身是串行的、
+   文件长度不完全相等（`-j 8` 时最短的任务先结束，尾部有等待）、以及 8 条流同时读
+   页缓存时共享内存带宽与预取器。
+3. **小文件也有收益，但收益来源不同。** 500 个 118 字节的文件，各跑 20 轮：
+   顺序 67 ms（每轮 3.35 ms）、`-j 4` 41 ms、`-j 8` 36 ms，约 1.6~1.9×。
+   此时扫描量可以忽略，时间几乎全在 500 次 `open`/`read`/`close` 系统调用上——
+   并行的是系统调用，不是计算。这也解释了为什么它远不到 5 倍：系统调用在
+   内核侧仍有共享的目录项缓存与文件表锁。
 
 ---
 
@@ -562,6 +794,24 @@ int main(int argc, char *argv[]) {
 函数才能处理任意分段的流。后面所有的接口设计（`wc_counter_update` 的分块语义、
 可重入性、多实例并存）都是从这一个决定推出来的。
 
+### 7.4 第三轮：把并发接到驱动层
+
+第三轮的目标不是"让模块支持多线程"，而是"让命令行在多个文件上有并行度"。
+两者的差别决定了改动落点：
+
+| 做法 | 后果 |
+|---|---|
+| 在 `wc_count_file` 内部加线程池 | 库被迫链接 pthread，单文件调用也要建池；接口语义从"数一个文件"变成"数一个文件，顺便管线程" |
+| 在驱动层为每个文件提交任务 | 库一行不改，`wordcount.h` 不出现任何线程类型，并发策略完全属于调用方 |
+
+选后者。改动集中在 `src/main.c`（任务与槽位的划分、顺序输出、错误顺序）与
+`Makefile`（一条把 thread-pool 建到本模块 `bin/` 下的规则、`-pthread`、
+`-D_POSIX_C_SOURCE=200809L` 给 `getopt`），`wordcount.c` 与 `wordcount.h` 没有任何改动。
+
+这也顺带解释了为什么"模块之间协作"不等于"把两个模块的源码放进同一个仓库"：
+真正接起来的那一刻，一定会出现接口方向、链接方式、构建依赖这三个具体决定，
+而它们只能靠一个实际的使用场景来定。
+
 ---
 
 ## 8 词的定义与口径
@@ -621,17 +871,39 @@ int main(int argc, char *argv[]) {
 即单个文件超过 4 GiB 时 `bytes` 会回绕。需要跨平台一致的行为时应改用 `uintmax_t`。
 `lines` / `words` 在 32 位平台上的上限同样是 42.9 亿，对绝大多数文本足够。
 
+### 9.5 并行的粒度是文件，单个大文件仍然单线程
+
+`-j N` 只能在文件之间并行。一个 40 GB 的单文件用 `-j 16` 处理时，实际只有一个线程在跑——
+第 6.3 节的加速比只在"文件数远大于 1"时成立。
+
+要在单文件内部并行，必须把字节流按块切开分给多个线程，而单词可能跨块（3.2 节），
+每块的首尾都要和相邻块的边界对齐：块首若落在词中间，这块的首个"词"是上一块的尾巴；
+块尾若落在词中间，这个词只能算一次。标准做法是每块额外多读一个后缀、
+由调用方把相邻块的边界状态拼起来（类似 MapReduce 里按行切分文本的处理），
+或者第一遍只记录块边界偏移、第二遍再修正。这套机制比"按文件切"复杂一个量级，
+而且块大小、线程数、边界修正三者互相影响，收益也不再是线性的。
+
+### 9.6 并行不覆盖标准输入
+
+管道和终端不可 `lseek`，只能顺序读一遍，因此 `-j` 在读标准输入时无效（仍走顺序路径）。
+这也意味着 `cat *.log | wordcount -j 8` 不会变快——想并行就得让程序自己 `open` 文件。
+
 ---
 
 ## 10 待办
 
 - [ ] 增加词频统计模式（哈希表 + 大小写归一）
-- [ ] 增加 `-h` / `--help` 与短选项解析，支持 `-` 作为"读标准输入"的显式文件名
+- [x] 增加 `-h` 与短选项解析（第三轮：`-j` / `-h` 已就位；`--help` 长选项与
+      `-` 表示标准输入尚未做）
 - [ ] 若要正确处理 UTF-8，改用 `mbrtowc` + `iswalpha` 做宽字符扫描（见 9.1）
 - [ ] 跨平台一致的计数宽度：改用 `uintmax_t` 或在头文件里做编译期检查（见 9.4）
 - [ ] 用 `perf` 对比 `fread` 路径与 `mmap` + `wc_count_buffer` 路径的差异，
       确认块读取在大文件上是否仍是瓶颈
 - [ ] 为 `wc_count_stream` 补一个 `EINTR` 重试用例（当前假设 stdio 已处理中断）
+- [ ] 单文件内部按块并行（见 9.5）：先做边界对齐的正确性原型，
+      再谈收益，不要先写线程池调用
+- [ ] `-j` 支持"不带数字时取 CPU 核数"（`sysconf(_SC_NPROCESSORS_ONLN)`），
+      但要先确认"用满核数"在超线程机器上不是负收益
 
 ---
 
