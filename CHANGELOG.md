@@ -12,6 +12,73 @@
 
 ---
 
+## 2026-10-22
+
+### mysql-client
+
+- 单文件 `mysql.c`（355 行，`main` 写死六步流程）改造为模块：
+  `include/mysqlclient.h` + `src/{mysqlclient,options,file,status,main}.c` +
+  `tests/{test_pure.c,test_db.c,check_cli.sh,check_live.sh,bench_file.c}` +
+  `Makefile` + 十节 README。它是仓库里最后一个单文件模块，至此五个模块
+  都进入根 `Makefile` 的自动发现范围。
+- 接口重设，三处是为了"调用方能被独立使用"：
+  - `mc_conn` 不透明。`MYSQL_BIND::is_null` 的类型在 8.0.1 从 `my_bool *`
+    改成 `bool *`，`<mysql.h>` 一旦进头文件，调用方就被绑到具体库版本。
+    现在版本差异只影响 `src/mysqlclient.c` 一个编译单元。
+  - `mc_rows` 按行优先展开成 `cell[row * cols + col]`，另带 `length[]`。
+    `length` 不能用 `strlen` 代替：BLOB 字节里可以含 `'\0'`。
+    SQL NULL 用空指针表示，与空串区分开。
+  - 十一个状态码，文件类与数据库类分开；容量不足是 `MC_ERR_TOOBIG` 而不是
+    "返回前 N 字节"，截断后返回成功是 BLOB 代码里最难发现的错误。
+- 修掉 14 处缺陷（README 7.2 有完整表）。三条值得单独记：
+  - `mysql_stmt_fetch` 的返回值判断把 `MYSQL_NO_DATA`、`MYSQL_DATA_TRUNCATED`
+    与真正的错误码混在一个 `break` 里，网络中断时函数会返回 0 字节并"成功"；
+  - 多行结果的读回每轮都从头写同一块缓冲区，最后只剩最后一行的内容，
+    返回值却完全正常；现在改成单行单列契约，多行返回 `MC_ERR_RESULT`；
+  - `main` 的每条失败路径都 `return 0`，脚本无法感知失败。
+- 写入改成"临时文件 + `rename`"：`fopen(path, "wb")` 先 truncate，
+  此后的失败（`ENOSPC`/`EDQUOT`）会丢掉目标文件的原有内容。与 `contact-list`
+  在同一个问题上给了同一个答案。
+- 读文件不再用 `fseek`/`ftell` 取长度：`/proc` 伪文件报告长度为 0，
+  FIFO 上 `fseek` 直接失败（`ESPIPE`）。改为读到 EOF，填满缓冲区后多读一字节判断越界。
+- 取数从"每次 1 字节"改为"一次请求整段剩余长度"：64 KiB 从 65536 次
+  `mysql_stmt_fetch_column` 降到 1 次。
+- 驱动层从写死的流程改为 5 个子命令（`ping` / `sql` / `exec` / `blob-put` /
+  `blob-get`），退出码 0/1/2 分层，`stdout` 只放数据、摘要走 `stderr`。
+- `config.h` 不再是编译的必需条件：存在时才编进去，否则用内置的
+  "本机、无密码"默认值。原实现无条件 `#include "config.h"`，
+  新克隆的仓库编译必然失败。
+
+### 构建系统
+
+- 根 `Makefile` 新增 `SKIP`（空格分隔的模块名），`list` 目标给被跳过的模块标 `(SKIP)`。
+  `mysql-client` 是唯一有外部依赖的模块（`libmysqlclient`），无头文件的机器上
+  用 `make SKIP=mysql-client` 跳过其余照常构建。选显式跳过而不是"探测失败就不编"：
+  静默少构建一个模块，最后看到的是"全部成功"，少掉的东西没有任何提示。
+- `src/mysql-client/Makefile` 按 `mysql_config` → `pkg-config` →
+  命令行变量三处定位客户端库，`sanitize` 递归调用时把 `MYSQL_CFLAGS`/`MYSQL_LIBS`
+  一起透传（否则子 make 重新探测一遍，在"用命令行指定解包目录"时探测不到）。
+- 库的四个实现文件按依赖分层：`file.c` / `options.c` / `status.c` 不引用任何
+  `mysql_*`，因此 `test_pure` 链接后 `ldd` 里没有 libmysqlclient
+  （实测 `ldd bin/test_pure | grep mysql` 无输出），可以在没装客户端库的机器上跑。
+
+### 验证
+
+- 环境：Ubuntu 22.04 / Linux 6.8.0-138 / gcc 11.4.0 / x86_64；
+  MySQL 8.0.46（客户端库与服务端从 deb 解包到 `/tmp` 运行，无需 root 安装）。
+- 三种构建各 **0 条警告**：默认、ASan+UBSan、追加
+  `-Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wcast-qual -Wundef`。
+- `make test` 62（纯逻辑，不链接 libmysqlclient）+ 17（接口层，含真实建连失败）= 79 项，
+  0 失败；`make check` 33 项，0 失败。
+- 新增 `tests/check_live.sh`（`make check-live`），对真实服务器 38 项 0 失败：
+  64 KiB / 5 MiB / 0 字节三种长度的 BLOB 往返都 `cmp` 逐字节相同；
+  容量不足报出 `5242880 bytes` 且不产生输出文件；多行/NULL/无行分别报
+  `more than one row` / `SQL NULL` / `no row`；UTF-8 与含单引号的文本原样取回。
+- ASan 版本跑同一套 38 项实测：0 失败，无 ASan/UBSan/LeakSanitizer 报告。
+- 全仓 `make test`：68 + 136 + 79 + 54 + 40 = 377 项，0 失败。
+- 性能（`make bench`，5 轮取最小值，页缓存内）：1 MiB 写 1702 MB/s、读 3498 MB/s；
+  8 MiB 580 / 3547 MB/s；64 MiB 406 / 3376 MB/s。本地搬运不是瓶颈。
+
 ## 2026-10-21
 
 ### word-count

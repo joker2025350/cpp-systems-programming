@@ -12,11 +12,14 @@
 #   make clean      清理全部模块
 #   make list       列出被识别的模块
 #
-# 没有 Makefile 的模块（目前只剩 mysql-client）会被跳过，
-# 它还是单文件程序，等模块化之后再纳入这里。
+# 唯一的例外是 src/mysql-client：它依赖系统里的 libmysqlclient，
+# 找不到头文件时就无法编译。这类机器上用
+#   make SKIP=mysql-client
+# 跳过它，其余模块照常构建。SKIP 接受空格分隔的多个模块名。
 # ============================================================
 
-MODULES := $(patsubst src/%/Makefile,%,$(wildcard src/*/Makefile))
+ALL_MODULES := $(patsubst src/%/Makefile,%,$(wildcard src/*/Makefile))
+MODULES     := $(filter-out $(SKIP),$(ALL_MODULES))
 
 .PHONY: all test check sanitize bench clean list
 
@@ -63,4 +66,9 @@ clean:
 
 list:
 	@printf '识别的模块：\n'
-	@for m in $(MODULES); do printf '  %s\n' "$$m"; done
+	@for m in $(ALL_MODULES); do \
+		case " $(SKIP) " in \
+		*" $$m "*) printf '  %-16s (SKIP)\n' "$$m" ;; \
+		*)         printf '  %s\n' "$$m" ;; \
+		esac; \
+	done

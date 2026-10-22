@@ -3,8 +3,7 @@
 Systems-programming modules in C, built and verified on Linux.
 
 Each module is a self-contained library with a public header, a test suite, and its own
-build target — not a single-file exercise. A module that is still a single file is marked
-as such in the table below.
+build target — not a single-file exercise.
 
 ## Modules
 
@@ -12,13 +11,16 @@ as such in the table below.
 |---|---|---|---|
 | [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly | `counter.h` | 68 checks · ASan/UBSan · TSan |
 | [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, and a drain-on-destroy shutdown | `threadpool.h` | 54 checks · 19 end-to-end · ASan/UBSan · TSan |
-| [`mysql-client`](src/mysql-client) | MySQL C API: result-set iteration, prepared statements, BLOB transfer | — (single file) | ASan |
+| [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 79 checks · 33 end-to-end · 38 live checks against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list; text format that round-trips byte for byte | `contacts.h` | 136 checks · 21 end-to-end · ASan/UBSan |
 | [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` | `wordcount.h` | 40 checks · 28 parallel-vs-sequential comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
 
-Four of the five modules are libraries: the CLI links against `lib*.a` and never
+All five modules are libraries: the CLI links against `lib*.a` and never
 recompiles the module sources, so "this module can be linked independently" is
-re-verified on every build. `mysql-client` is still a single-file program.
+re-verified on every build. `mysql-client` goes one step further and keeps
+`<mysql.h>` out of its public header, so callers are not tied to a client-library
+version; `mysql-client/tests/test_pure` links with no MySQL dependency at all and
+runs on machines that have no client library installed.
 
 `word-count` is also the one case where two modules are wired together: its CLI driver
 submits one task per file to `thread-pool`, while `libwordcount.a` itself keeps zero
@@ -49,6 +51,7 @@ src/<module>/
 ├── include/<module>.h    public interface
 ├── src/                  implementation + CLI driver
 ├── tests/                unit tests and end-to-end checks
+├── testdata/             input data whose byte count is documented behaviour
 ├── Makefile              all / lib / cli / test / check / sanitize / bench / clean
 └── README.md             deep technical notes (in Chinese)
 ```
@@ -67,6 +70,14 @@ cd src/word-count
 make && make test && make check
 ```
 
+`mysql-client` needs `libmysqlclient-dev`. Without it, either point the build at an
+unpacked copy of the packages (no root required — see
+[its README](src/mysql-client/README.md#41-外部依赖libmysqlclient)) or skip it:
+
+```bash
+make SKIP=mysql-client
+```
+
 Per-module targets:
 
 | Target | Purpose |
@@ -74,6 +85,7 @@ Per-module targets:
 | `make` | build the static library and the CLI |
 | `make test` | unit tests |
 | `make check` | end-to-end checks (where present) |
+| `make check-live` | checks that need a running MySQL server (`mysql-client` only) |
 | `make sanitize` | rebuild with AddressSanitizer + UndefinedBehaviorSanitizer and run the tests |
 | `make tsan` | rebuild with ThreadSanitizer (`concurrent-lock`, `thread-pool`, `word-count`) |
 | `make bench` | throughput measurements |
@@ -86,9 +98,10 @@ Per-module targets:
 - pthread
 - `libmysqlclient-dev` — `mysql-client` only
 
-Nothing here builds on Windows without a POSIX layer. Copy `src/mysql-client/config.h.example`
-to `config.h` and fill in your own credentials before building `mysql-client`; `config.h`
-is git-ignored.
+Nothing here builds on Windows without a POSIX layer. `src/mysql-client` reads
+credentials from `config.h` when present (copy `config.h.example`, it is git-ignored),
+then from `MC_*` environment variables, then from command-line flags; without
+`config.h` it still builds and defaults to a password-less connection on localhost.
 
 ## Conventions
 
