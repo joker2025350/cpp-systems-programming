@@ -73,6 +73,7 @@ OUT=$("$CLI" -h 2>&1)
 check_exit "帮助退出码 0" 0 $?
 check_contains "帮助列出 ping" "ping" "$OUT"
 check_contains "帮助列出 sql" "sql" "$OUT"
+check_contains "帮助列出 each" "each" "$OUT"
 check_contains "帮助列出 exec" "exec" "$OUT"
 check_contains "帮助列出 blob-put" "blob-put" "$OUT"
 check_contains "帮助列出 blob-get" "blob-get" "$OUT"
@@ -121,6 +122,29 @@ check_exit "blob-get 缺 -o 退出码 2" 2 $?
 
 "$CLI" ping -q 'SELECT 1' >/dev/null 2>&1
 check_exit "ping 拒绝 -q 退出码 2" 2 $?
+
+"$CLI" each >/dev/null 2>&1
+check_exit "each 缺 -q 退出码 2" 2 $?
+
+"$CLI" each -q '' >/dev/null 2>&1
+check_exit "each 空 SQL 退出码 2" 2 $?
+
+"$CLI" each -q 'SELECT 1' -f "$TMPD/x.bin" >/dev/null 2>&1
+check_exit "each 拒绝 -f 退出码 2" 2 $?
+
+"$CLI" each -q 'SELECT 1' -o "$TMPD/x.out" >/dev/null 2>&1
+check_exit "each 拒绝 -o 退出码 2" 2 $?
+
+"$CLI" each -q 'SELECT 1' -n abc >/dev/null 2>&1
+check_exit "each -n 非数字退出码 2" 2 $?
+
+"$CLI" each -q 'SELECT 1' -n -3 >/dev/null 2>&1
+check_exit "each -n 负数退出码 2" 2 $?
+
+# -n 只对 each 有意义。静默忽略会让 "sql -n 10" 看起来限制了行数，
+# 实际一行也没少——那是最难查的一类问题：输出"看起来没问题"。
+"$CLI" sql -q 'SELECT 1' -n 1 >/dev/null 2>&1
+check_exit "sql 用 -n 退出码 2" 2 $?
 
 "$CLI" sql -q 'SELECT 1' -Z >/dev/null 2>&1
 check_exit "子命令未知选项退出码 2" 2 $?

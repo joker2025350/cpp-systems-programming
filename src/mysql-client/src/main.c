@@ -61,6 +61,7 @@ static void usage(FILE *out, const char *prog) {
 	    "Commands:\n"
 	    "  ping                      与服务器握一次手（COM_PING）\n"
 	    "  sql   -q SQL              执行查询，把结果按制表符分隔打印到 stdout\n"
+	    "  each  -q SQL [-n N]       逐行取数并打印，内存占用与行数无关\n"
 	    "  exec  -q SQL              执行不返回结果集的语句，打印受影响行数\n"
 	    "  blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的第一个 ? 参数\n"
 	    "  blob-get -q SQL -o FILE   把单行单列的查询结果写成 FILE\n"
@@ -75,6 +76,8 @@ static void usage(FILE *out, const char *prog) {
 	    "  -h         显示本说明\n"
 	    "\n"
 	    "stdout 只输出数据，行数等摘要在 stderr，因此可以安全地接管道。\n"
+	    "each 不打印表头——游标接口回调的是行内容，不含列名；\n"
+	    "需要表头时用 sql（或对结果自行拼一行）。\n"
 	    "\n"
 	    "Example:\n"
 	    "  %s -H 127.0.0.1 -u root sql -q 'SELECT 1'\n"
@@ -133,8 +136,29 @@ static int parse_size(const char *text, size_t *out) {
 	return 0;
 }
 
-/* 环境变量为空或未定义时保持 opt 里已有的值 */
-static void apply_env(mc_options *opt) {
+/* each -n：行数上限。0 表示不限（也是默认值），因此不接受负号与空串 */
+static int parse_limit(const char *text, unsigned long long *out) {
+	char          *end = NULL;
+	unsigned long long v;
+
+	if (text[0] == '-' || text[0] == '\0') {
+		(void)fprintf(stderr, PROG ": -n 需要一个非负整数：%s\n", text);
+		return -1;
+	}
+
+	errno = 0;
+	v = strtoull(text, &end, 10);
+
+	if (errno != 0 || end == text || *end != '\0') {
+		(void)fprintf(stderr, PROG ": -n 需要一个非负整数：%s\n", text);
+		return -1;
+	}
+
+	*out = v;
+	return 0;
+}
+
+/* 环境变量为空或未定义时保持 opt 里已有的值 */static void apply_env(mc_options *opt) {
 	const char *v;
 
 	if ((v = getenv("MC_HOST")) != NULL && v[0] != '\0') {
@@ -212,8 +236,69 @@ static int cmd_sql(mc_conn *conn, const char *sql) {
 	return 0;
 }
 
-static int cmd_exec(mc_conn *conn, const char *sql) {
-	unsigned long long affected = 0;
+/*
+ * each 子命令的上下文。params 里放行数上限，rows 由回调累加：
+ * 回调的返回值要表示"停不停"，就没法同时把计数带出来，
+ * 计数只能放在调用方给的 ctx 里。
+ */
+typedef struct {
+	unsigned long long limit;   /* 0 表示不限 */
+	size_t             rows;
+} each_state;
+
+/*
+ * 打印一行并决定是否继续。
+ *
+ * length 参数在这里刻意不用：打印走 printf("%s")，对文本列足够，
+ * 对含 '\0' 的二进制列会截断——与 sql 子命令的行为一致，
+ * 也正因为一致，两者的输出可以逐字节比对（见 check_live.sh）。
+ * 取二进制请用 blob-get，那里按字节长度写文件。
+ */
+static int print_row(void *ctx, const char *const *cell,
+                     const size_t *length, size_t cols) {
+	each_state *state = (each_state *)ctx;
+	size_t      j;
+
+	(void)length;
+
+	for (j = 0; j < cols; j++) {
+		(void)printf("%s%s", (j == 0) ? "" : "\t",
+		             (cell[j] != NULL) ? cell[j] : "NULL");
+	}
+	(void)printf("\n");
+
+	state->rows++;
+
+	return (state->limit != 0 && (unsigned long long)state->rows >= state->limit)
+	       ? 1 : 0;
+}
+
+static int cmd_each(mc_conn *conn, const char *sql, unsigned long long limit) {
+	each_state state;
+	mc_status  st;
+	size_t     delivered = 0;
+
+	state.limit = limit;
+	state.rows  = 0;
+
+	st = mc_query_each(conn, sql, print_row, &state, &delivered);
+
+	if (st != MC_OK) {
+		/* 中途失败时 delivered 是"已经打印出去的那些行"，
+		 * 报出来才能判断输出文件是完整结果还是半截。 */
+		(void)fprintf(stderr, PROG ": %s (%s)，已输出 %lu 行\n",
+		              mc_error(conn), mc_status_string(st),
+		              (unsigned long)delivered);
+		return 1;
+	}
+
+	/* 库里交付的行数才是权威值：回调收到的次数与它相等，
+	 * 但用库的返回值可以在两者不一致时（理论上不会）暴露接线错误。 */
+	(void)fprintf(stderr, "%lu 行\n", (unsigned long)delivered);
+	return 0;
+}
+
+static int cmd_exec(mc_conn *conn, const char *sql) {	unsigned long long affected = 0;
 	mc_status          st = mc_exec(conn, sql, &affected);
 
 	if (st != MC_OK) {
@@ -308,6 +393,8 @@ int main(int argc, char *argv[]) {
 	int        rc = 1;
 	int        have_size = 0;
 	size_t     size_hint = 0;
+	int        have_limit = 0;
+	unsigned long long limit = 0;
 	const char *cmd;
 	const char *sql = NULL;
 	const char *infile = NULL;
@@ -380,12 +467,12 @@ int main(int argc, char *argv[]) {
 
 	cmd = argv[i++];
 
-	/* 命令自己的选项：-q / -f / -o，同样手工解析 */
+	/* 命令自己的选项：-q / -f / -o / -n，同样手工解析 */
 	for (; i < argc; i++) {
 		const char *a = argv[i];
 
 		if (strcmp(a, "-q") == 0 || strcmp(a, "-f") == 0 ||
-		    strcmp(a, "-o") == 0) {
+		    strcmp(a, "-o") == 0 || strcmp(a, "-n") == 0) {
 			if (i + 1 >= argc) {
 				(void)fprintf(stderr, PROG ": 选项 %s 缺少参数\n", a);
 				return 2;
@@ -393,7 +480,11 @@ int main(int argc, char *argv[]) {
 
 			if (a[1] == 'q')      sql     = argv[++i];
 			else if (a[1] == 'f') infile  = argv[++i];
-			else                  outfile = argv[++i];
+			else if (a[1] == 'o') outfile = argv[++i];
+			else {
+				if (parse_limit(argv[++i], &limit) != 0) return 2;
+				have_limit = 1;
+			}
 
 			continue;
 		}
@@ -413,6 +504,15 @@ int main(int argc, char *argv[]) {
 			(void)fprintf(stderr, PROG ": %s 需要 -q SQL\n", cmd);
 			return 2;
 		}
+	} else if (strcmp(cmd, "each") == 0) {
+		if (sql == NULL || sql[0] == '\0') {
+			(void)fprintf(stderr, PROG ": each 需要 -q SQL\n");
+			return 2;
+		}
+		if (infile != NULL || outfile != NULL) {
+			(void)fprintf(stderr, PROG ": each 不接受 -f / -o\n");
+			return 2;
+		}
 	} else if (strcmp(cmd, "blob-put") == 0) {
 		if (sql == NULL || infile == NULL) {
 			(void)fprintf(stderr, PROG ": blob-put 需要 -q SQL 与 -f FILE\n");
@@ -426,6 +526,15 @@ int main(int argc, char *argv[]) {
 	} else {
 		(void)fprintf(stderr, PROG ": 未知命令 %s\n", cmd);
 		usage(stderr, argv[0]);
+		return 2;
+	}
+
+	/*
+	 * -n 只对 each 有意义。若允许别的子命令静默忽略它，
+	 * "sql -n 10" 这种写法看起来限制了行数，实际一行也没少。
+	 */
+	if (have_limit && strcmp(cmd, "each") != 0) {
+		(void)fprintf(stderr, PROG ": -n 只用于 each\n");
 		return 2;
 	}
 
@@ -479,6 +588,8 @@ int main(int argc, char *argv[]) {
 			rc = cmd_ping(conn);
 		} else if (strcmp(cmd, "sql") == 0) {
 			rc = cmd_sql(conn, sql);
+		} else if (strcmp(cmd, "each") == 0) {
+			rc = cmd_each(conn, sql, have_limit ? limit : 0);
 		} else if (strcmp(cmd, "exec") == 0) {
 			rc = cmd_exec(conn, sql);
 		} else if (strcmp(cmd, "blob-put") == 0) {

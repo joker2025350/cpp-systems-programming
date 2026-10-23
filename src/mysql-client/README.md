@@ -1,10 +1,10 @@
 # 03 MySQL C API（mysqlclient 模块）
 
 用 MySQL 官方 C 客户端库（`libmysqlclient`）访问数据库的一个可复用模块，
-外加一个建立在它之上的命令行驱动。覆盖建连、查询、参数化语句，
-以及二进制大对象（BLOB）的写入与读回。
+外加一个建立在它之上的命令行驱动。覆盖建连、查询、参数化语句、
+流式取数，以及二进制大对象（BLOB）的写入与读回。
 
-模块的目标不只是"能跑通一段示例"，而是把下面四件事做成可依赖的性质：
+模块的目标不只是"能跑通一段示例"，而是把下面五件事做成可依赖的性质：
 
 1. **调用方不需要 `#include <mysql.h>`。** 接口层只出现 `mc_conn`（不透明句柄）、
    `mc_status`、`mc_rows` 这些自有类型，客户端库的版本差异被关在一个编译单元里。
@@ -14,6 +14,8 @@
    写入与读回的内容逐字节相同。
 4. **容量不足时明确失败，绝不截断后返回成功。** 这是 BLOB 处理里最常见、
    也最难发现的错误。
+5. **结果集可以选择不驻留内存。** `mc_query` 全量取回，`mc_query_each`
+   逐行交付，峰值内存只与最宽的一行有关。100 万行实测 10.7 MiB 对 161.9 MiB。
 
 ```bash
 $ ./bin/mysqlclient -H 127.0.0.1 -u root sql -q 'SELECT id, name FROM T'
@@ -41,9 +43,11 @@ src/mysql-client/
 │   └── main.c            命令行驱动（子命令、参数解析、输出排版、退出码）
 ├── tests/
 │   ├── test_pure.c       纯逻辑单元测试，62 项，不链接 libmysqlclient
-│   ├── test_db.c         接口层测试，17 项，含真实建连失败路径
-│   ├── check_cli.sh      命令行端到端检查，33 项，不需要数据库
-│   ├── check_live.sh     真实数据库往返验证，38 项，需要数据库
+│   ├── test_db.c         接口层测试，20 项，含真实建连失败路径
+│   ├── check_cli.sh      命令行端到端检查，41 项，不需要数据库
+│   ├── check_live.sh     真实数据库往返验证，48 项，需要数据库
+│   ├── test_stream.c     流式取数，正确性 24 项 / 内存测量，需要数据库
+│   ├── check_scale.sh    百万行下的峰值内存对照，需要数据库
 │   └── bench_file.c      文件读写吞吐测量
 ├── config.h.example      连接参数模板（config.h 不入库）
 ├── Makefile
@@ -146,7 +150,42 @@ mc_status mc_exec(mc_conn *conn, const char *sql, unsigned long long *affected);
 `mc_query` 把整个结果集取回内存，成功后必须 `mc_rows_free`。
 `mc_exec` 用于不返回结果集的语句，`affected` 可为 NULL。
 
-### 2.4 大字段
+### 2.4 流式取数（游标）
+
+```c
+typedef int (*mc_row_fn)(void *ctx, const char *const *cell,
+                         const size_t *length, size_t cols);
+
+mc_status mc_query_each(mc_conn *conn, const char *sql,
+                        mc_row_fn fn, void *ctx, size_t *out_rows);
+```
+
+回调的 `cell` / `length` 与 `mc_rows` 里的同名成员语义完全一致
+（`cell[j] == NULL` 是 SQL NULL，`length[j]` 是真实字节数，`cell[j][length[j]]` 是 `'\0'`），
+区别只在**生命周期**：这片内存在回调返回后就被下一行覆盖，不能保存指针。
+
+回调返回 0 继续，返回非 0 停止。停止有两种来源，返回值必须分开：
+
+| 情况 | 函数返回 | `*out_rows` |
+|---|---|---|
+| 取完 | `MC_OK` | 结果集行数 |
+| 回调返回非 0（主动停止） | `MC_OK` | 已交付的行数（含最后一行） |
+| 取数中途失败 | `MC_ERR_STMT` / `MC_ERR_QUERY` / `MC_ERR_NOMEM` | 失败前已交付的行数 |
+| 语句不返回结果集 | `MC_ERR_RESULT` | 0 |
+
+"主动停止"不能被表示成错误：`each -n 1` 只要一行是正常用法。
+`*out_rows` 在失败的路径上也写入，因为已经交付的行回调确实处理过了，
+续算的起点要靠它。
+
+三条约束：
+
+- 取数期间这条连接被该语句占用。回调里对同一个 `conn` 再发查询，
+  `libmysqlclient` 会报 `Commands out of sync`——协议是半双工的，
+  结果集没读完就发下一条命令属于违例。要并发就用另一条连接。
+- 不能回退。读过的行不留在任何地方，要两遍遍历只能用 `mc_query`。
+- 回调拿不到列名。需要表头时用 `mc_query`，或者自己拼一行。
+
+### 2.5 大字段
 
 ```c
 mc_status mc_blob_write(mc_conn *conn, const char *sql,
@@ -166,7 +205,7 @@ mc_status mc_blob_read(mc_conn *conn, const char *sql,
 比"取到几行算几行"严格，是因为被覆盖的那几行不会留下任何痕迹：
 循环体每轮都从头写同一块缓冲区，最后只剩下最后一行的内容，而函数看起来是成功的。
 
-### 2.5 文件辅助
+### 2.6 文件辅助
 
 ```c
 mc_status mc_file_read(const char *path, void *buf, size_t cap, size_t *out_len);
@@ -180,7 +219,7 @@ mc_status mc_file_write(const char *path, const void *buf, size_t len);
 因此要求**目录可写**而不只是目标文件可写，且 `path` 必须是普通文件路径
 （管道、`/dev/stdout` 不行，对它们 `rename` 只会失败）。
 
-### 2.6 驱动层
+### 2.7 驱动层
 
 ```
 Usage: mysqlclient [OPTIONS] COMMAND [COMMAND-OPTIONS]
@@ -188,6 +227,7 @@ Usage: mysqlclient [OPTIONS] COMMAND [COMMAND-OPTIONS]
 Commands:
   ping                      与服务器握一次手（COM_PING）
   sql   -q SQL              执行查询，结果按制表符分隔打印到 stdout
+  each  -q SQL [-n N]       逐行取数并打印，内存占用与行数无关
   exec  -q SQL              执行不返回结果集的语句，打印受影响行数
   blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的第一个 ? 参数
   blob-get -q SQL -o FILE   把单行单列的查询结果写成 FILE
@@ -198,6 +238,11 @@ Options:
 
 退出码三档：`0` 成功，`1` 运行期失败，`2` 用法错误。
 分成两档（而不是"非 0 即失败"）是为了让脚本能区分"参数写错了"与"操作失败了"。
+
+`sql` 与 `each` 的输出只在表头上不同：`each` 不打印列名（回调拿不到），
+**行的内容逐字节相同**，`check_live.sh` 用 `cmp` 比对这一点。
+`-n` 只对 `each` 有效，别的子命令用了它直接报用法错误——
+静默忽略会让 `sql -n 10` 看起来限制了行数，实际一行也没少。
 
 ---
 
@@ -465,6 +510,41 @@ rename(tmp, path);            /* POSIX 上同一文件系统内是原子替换 *
 而客户端库对它的处理是回退到默认端口——两种解释都不是调用方想要的。
 参数错误应当以参数错误的形式报出来，不要混进"连接被拒绝"。
 
+### 3.13 流式取数：关键在于**不**调用 `store_result`
+
+`mc_query` 走文本协议：`mysql_store_result` 把整个应答读进客户端，
+之后 `mysql_data_seek(res, 0)` 才能支持"第一遍量尺寸、第二遍拷内容"。
+`mc_query_each` 走预处理语句的二进制协议，并且**不调用** `mysql_stmt_store_result`：
+
+```c
+mysql_stmt_prepare → mysql_stmt_bind_result → mysql_stmt_execute
+loop: mysql_stmt_fetch   /* 每次从套接字上读一行 */
+```
+
+`mysql_stmt_store_result` 的作用就是"把剩下的行全读进内存"。
+一旦调用它，内存占用立刻变得与行数成正比，流式的意义就消失了——
+它的存在只是为了支持 `mysql_stmt_data_seek` 与 `mysql_stmt_num_rows`，
+而游标接口按定义不需要回退。这是一个**反直觉的取舍**：
+库提供的最"完整"的那条调用路径，恰恰是要避免的那条。
+
+三处细节决定这个实现是否真的正确：
+
+1. **每行开始前把 `is_null` / `error` / `length` 清零。**
+   库只在这些字段需要改变时写它们。不清零时，"上一行是 NULL"会让
+   这一行也报成 NULL，而返回值仍然是 0。
+2. **`buffer_length` 永远比分配长度少 1**，最后那个字节留给 `'\0'`。
+   若让 `buffer_length == cap`，当值正好填满缓冲区时 `ret` 为 0（不算截断），
+   接着写 `buf[len] = '\0'` 就越界一字节——ASan 能抓到，未插桩时不会崩。
+3. **`mysql_stmt_free_result` 必须在关闭语句之前调用。**
+   回调提前停止时结果集里还有没读的行，此时连接处于"结果未读完"状态，
+   下一条命令会得到 `Commands out of sync`。这个调用把剩余行读掉丢弃。
+   `test_stream.c` 里有一条用例专门验它：回调在第 3 行停下，
+   然后用同一个连接执行 `SELECT 1`。
+
+另外，`ret` 的三种取值要分开处理，理由与 3.6 节相同但方向相反：
+那里 `MYSQL_DATA_TRUNCATED` 被当成错误吞掉了真错误，这里若把真错误
+当成"取完了"，调用方会以为结果集只有这么长——**静默丢行**比报错难查得多。
+
 ---
 
 ## 4 构建
@@ -473,9 +553,10 @@ rename(tmp, path);            /* POSIX 上同一文件系统内是原子替换 *
 make              # 静态库 bin/libmysqlclient.a 与命令行工具 bin/mysqlclient
 make lib          # 只构建静态库
 make cli          # 只构建命令行工具
-make test         # 纯逻辑 62 项 + 接口层 17 项
-make check        # 命令行端到端 33 项（不需要数据库）
-make check-live   # 真实数据库往返 38 项（需要数据库，见下）
+make test         # 纯逻辑 62 项 + 接口层 20 项
+make check        # 命令行端到端 41 项（不需要数据库）
+make check-live   # 真实数据库往返 48 项 + 流式比对 24 项（需要数据库，见下）
+make check-scale  # 百万行下的峰值内存对照（需要数据库，约 30 秒）
 make sanitize     # ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
 make bench        # 文件读写吞吐
 make clean        # 删除 bin/（含全部变体）
@@ -573,7 +654,7 @@ MySQL **8.0.46**（客户端库与服务端同版本，从 Ubuntu 22.04 的 deb 
 
 ### 5.2 单元测试（不需要数据库）
 
-`make test`，79 项：
+`make test`，82 项：
 
 ```
 mysqlclient 纯逻辑单元测试            ← 62 项
@@ -596,12 +677,14 @@ ok    /proc/version 读到了内容（长度大于 0）
 ok    写入成功后不残留 .tmp 文件
 ok    写入失败后不残留 .tmp 文件
 
-mysqlclient 接口层测试                ← 17 项
+mysqlclient 接口层测试                ← 20 项
 ok    mc_ping(NULL)
 ok    mc_error(NULL) 非 NULL
 ok    失败时 out 被置为 NULL
 ok    连接 127.0.0.1:1 返回 CONNECT
 ok    错误信息带 connect 前缀
+ok    mc_query_each 回调为 NULL 被拒绝
+ok    失败时 out_rows 被写成 0
 ```
 
 三组用例值得单独说明：
@@ -627,7 +710,7 @@ $ ldd bin/test_pure | grep mysql
 
 ### 5.3 命令行端到端（不需要数据库）
 
-`make check`，33 项。全部用例都不需要运行中的服务器：
+`make check`，41 项。全部用例都不需要运行中的服务器：
 
 ```
 ok    帮助退出码 0
@@ -637,6 +720,10 @@ ok    端口非数字退出码 2
 ok    端口越界退出码 2
 ok    sql 缺 -q 退出码 2
 ok    ping 拒绝 -q 退出码 2
+ok    each 缺 -q 退出码 2
+ok    each 拒绝 -f 退出码 2
+ok    each -n 非数字退出码 2
+ok    sql 用 -n 退出码 2
 ok    blob-put 文件不存在退出码 1
 ok    文件不存在时报 cannot open file
 ok    文件错误不被误报成连接错误
@@ -654,7 +741,7 @@ ok    环境变量 MC_PORT 生效
 
 ### 5.4 真实数据库往返
 
-`make check-live`，38 项。需要一台连得上的 MySQL/MariaDB：
+`make check-live`，48 项。需要一台连得上的 MySQL/MariaDB：
 
 ```bash
 MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
@@ -665,12 +752,13 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 | 组 | 内容 |
 |---|---|
 | 文本 | UTF-8 原样取回、空串与 NULL 打印成不同的东西、列名来自服务器 |
+| 流式 | `each` 与 `sql` 的行内容 `cmp` 逐字节相同（表头除外）、`-n 1` 只出一行 |
 | BLOB 往返 | 64 KiB / 5 MiB / 0 字节，三种长度都 `cmp` 逐字节相同 |
 | 容量 | `-s 1000` 读 5 MiB → 退出码 1、报出 `5242880 bytes`、**不产生输出文件** |
 | 多行 | `blob-get` 收到 3 行 → `more than one row` |
 | NULL 列 | `blob-get` 命中 NULL → `SQL NULL` |
 | 无行 | `blob-get` 查不到 → `query returned no row` |
-| 语句错误 | 表不存在 → `query`；用 `sql` 跑 UPDATE → 提示改用 `mc_exec` |
+| 语句错误 | 表不存在 → `query`；用 `sql` / `each` 跑 UPDATE → 提示改用 `mc_exec` |
 | 绑定 | 含单引号的文本经 SQL 字面量写入后原样取回 |
 
 5 MiB 那一项同时验证了分块协议：`MC_BLOB_CHUNK` 是 16 KiB，5 MiB 要 320 次
@@ -679,30 +767,84 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 `check_live` 不并进 `make check`：没有数据库的机器上它必然全红，
 那种"永远失败的目标"等于没有目标。
 
-### 5.5 消毒剂
+### 5.5 流式取数（游标）
 
-`make sanitize` 跑 62 + 17 项，再用 ASan 版本跑一遍 38 项实测：
+`test_stream` 24 项，同样由 `make check-live` 一并运行。七行数据覆盖：
+普通文本 / 空串 / 全 NULL / 内含 `'\0'` 的二进制 / 100 KiB 的值 /
+UTF-8 多字节文本 / 负数与 `INT` 上界。
+
+| 用例组 | 内容 |
+|---|---|
+| 逐格比对 | 同一结果集分别经 `mc_query` 与 `mc_query_each`，比对 NULL 性质、长度、内容，全等 |
+| 长值 | 100 KiB 那一行的长度逐字节核对（它必然走 `fetch_column` 分支） |
+| 提前停止 | 回调在第 3 行返回非 0 → `MC_OK`，`out_rows == 3` |
+| 连接复用 | 提前停止后同一连接执行 `SELECT 1` 仍然成功（验证 `free_result` 确实排空了结果集） |
+| 空结果集 | 0 行是成功，`out_rows == 0` |
+| 无结果集 | `UPDATE` → `MC_ERR_RESULT`，提示改用 `mc_exec` |
+| 语法错误 | 在 `prepare` 阶段被拒 → `MC_ERR_STMT`，`out_rows` 为 0 |
+| 参数 | 回调为 NULL / SQL 为空 → `MC_ERR_PARAM` |
+
+"连接复用"这一条是本节的重点。它验的不是输出对不对，而是**协议状态有没有收拾干净**：
+少一次 `mysql_stmt_free_result`（或把语句句柄直接 `close` 掉而依赖内部实现），
+这里就会得到 `Commands out of sync`。
+
+### 5.6 百万行下的峰值内存
+
+`make check-scale`，5 项检查。1048576 行、每行 3 列（`INT` / `VARCHAR(32)` /
+`VARBINARY(16)` 含一个内嵌 `'\0'`），内容共 20 846 464 字节：
+
+```
+模式      行数   内容字节 峰值RSS(KiB) 耗时(ms)
+-------------------------------------------------------
+query      1048576       20846464        165760     292.5
+each       1048576       20846464         11008     211.8
+
+ok    query 行数等于服务器 COUNT(*)
+ok    each 行数等于服务器 COUNT(*)
+ok    两种模式的校验和相同
+峰值内存比（query / each）= 15.1
+ok    流式峰值内存低于物化的三分之一
+ok    流式峰值内存低于 32 MiB（与 100 万行无关）
+```
+
+三点说明：
+
+- **峰值内存必须在两个进程里测。** `ru_maxrss` 是进程级、单调不减的指标，
+  同一进程里先跑物化再跑流式，测到的仍然是物化的峰值。
+- **正确性基准来自服务器，不是另一份实现。** 行数用服务器自己算的
+  `COUNT(*)` 核对，内容用 FNV-1a 校验和核对；只让两个实现互相比对时，
+  共同的错误会互相掩护（比如两边都按 `strlen` 算长度）。
+- **`each` 反而更快。** 物化路径多了一遍"拷进 arena"的 `memcpy` 与
+  几十 MB 的分配，这些开销在 100 万行上是可测的。流式省掉的是内存搬运，
+  不是网络 I/O——两者的字节数完全相同。
+
+### 5.7 消毒剂
+
+`make sanitize` 跑 62 + 20 项，再用 ASan 版本跑一遍 48 + 24 项实测：
 
 ```
 --- 纯逻辑测试（ASan + UBSan）---   62 项检查，0 项失败
---- 接口测试（ASan + UBSan）---     17 项检查，0 项失败
---- check_live（ASan + LSan）---    检查项 38，失败 0
+--- 接口测试（ASan + UBSan）---     20 项检查，0 项失败
+--- check_live（ASan + LSan）---    检查项 48，失败 0
+--- test_stream（ASan + LSan）---   24 项检查，0 项失败
 ```
 
 没有 ASan / UBSan 报告，也没有 LeakSanitizer 报告。后者是有意义的：
 `mc_rows` 的 arena、每条语句的 `MYSQL_STMT`、连接句柄在三条失败路径上
 都要求释放，漏一处就会在 5 MiB 那一轮被放大成几 MB 的泄漏。
+流式路径上的泄漏点更密：每列一块缓冲区、四块指针数组，
+外加"回调提前停止"这条额外的退出路径——它在 5.5 节的用例里被走到。
 
-### 5.6 全仓
+### 5.8 全仓
 
 ```
 $ make test
 ==> concurrent-lock   68 项检查，0 项失败
 ==> contact-list     136 项检查，0 项失败
-==> mysql-client      79 项检查（62 + 17），0 项失败
+==> mysql-client      82 项检查（62 + 20），0 项失败
 ==> thread-pool       54 项检查，0 项失败
 ==> word-count        40 项检查，0 项失败
-合计 377 项，0 项失败
+合计 380 项，0 项失败
 ```
 
 ---
@@ -746,7 +888,32 @@ $ make test
 6~7 MB 加上指针数组（10 万 × 10 × 8 B ≈ 8 MB）。
 
 这个放大率对"取回来就处理完丢掉"的场景无所谓，对"一次导出百万行"就不合适了。
-需要那种规模时应当改用游标（`mc_query` 的流式版本，见待办）。
+那种规模用 `mc_query_each`。
+
+### 6.3 百万行：内存与吞吐
+
+同一张 1048576 行的表（内容 20 846 464 字节），同一台机器（Ryzen 7 5700X，
+服务端与客户端都在本机，走 loopback）：
+
+| 方式 | 行数 | 峰值 RSS | 耗时 | 吞吐（按内容字节） |
+|---|---|---|---|---|
+| `mc_query`（物化） | 1048576 | 161.9 MiB | 292.5 ms | 71 MB/s |
+| `mc_query_each`（游标） | 1048576 | 10.7 MiB | 211.8 ms | 99 MB/s |
+
+**内存差 15.1 倍，且流式那一侧与行数无关**——10.7 MiB 里绝大部分是
+`libmysqlclient` 自身的连接缓冲与代码段，把行数从 100 万加到 1000 万，
+这个数字不会变。物化那一侧则是线性的：行数翻倍，RSS 翻倍。
+
+流式反而快 28%，原因不是"流式协议更高效"，两条路径在网络上传输的字节完全相同。
+省掉的是本地那一段：物化要为整个结果集分配 24 MB 指针数组 + 24 MB 长度数组 +
+20 MB arena，再用 `memcpy` 把每个单元格拷进去；游标只维护每列一块缓冲区，
+行与行之间复用，拷贝发生在库把值写进缓冲区的那一次。
+
+所以这个接口的收益首先是内存，其次是顺带的吞吐——不要把它当成"并行取数"
+之类的加速手段。
+
+> 数字来自 `make check-scale`。它造数据用自连接倍增（20 条语句到 100 万行），
+> 造完即删，不依赖外部 SQL 文件。
 
 ---
 
@@ -809,12 +976,16 @@ $ make test
 
 ## 8 已知局限
 
-### 8.1 结果集全量驻留内存
+### 8.1 `mc_query_each` 不能回退，也拿不到列名
 
-`mc_query` 用 `mysql_store_result`，整个结果集先取到客户端，再用两遍遍历
-拷进一块连续内存。十万行的量级还好，百万行就要几百 MB。
-需要流式处理时必须另写一个用 `mysql_use_result` 的游标接口——
-注意那个接口不能 `mysql_data_seek`，所以"两遍遍历 + 一次分配"的优化在它上面不成立。
+游标接口按定义只能向前：读过的行不留在任何地方，`mysql_data_seek` 这类回退
+在二进制协议上也不可用。需要两遍遍历（先算总数再分配、或者先统计后输出）
+就只能用 `mc_query`，代价是内存与行数成正比。
+
+回调只拿到单元格与长度，没有列名。要做"带表头的 CSV 导出"，
+目前得先用 `mc_query` 拿 `names`，或者自己拼一行表头。
+把列名加进回调签名是可行的（元数据在 `prepare` 之后就有），
+但会让签名变成五个参数，暂时没有做。
 
 ### 8.2 一个连接一个线程
 
@@ -865,7 +1036,8 @@ $ make test
 
 ## 9 待办
 
-- [ ] 游标接口：`mysql_use_result` + 分批回调，处理百万行不驻留内存
+- [ ] 回调里给出列名：`mc_query_each` 的签名加一个 `const char *const *names`，
+      或者单独一个 `mc_query_names(conn, sql, char ***)` 预先取元数据
 - [ ] 通用的参数绑定：`mc_exec_params(conn, sql, mc_param[], n)`，
       支持 int / string / blob / NULL 四类
 - [ ] `mc_file_write` 保留权限位：`rename` 覆盖会把目标文件的权限改成临时文件的
@@ -876,3 +1048,5 @@ $ make test
 - [ ] 密码清零：`explicit_bzero` 版本，用 `#if defined(__GLIBC__)` 包起来
 - [ ] 把 `MC_BLOB_CHUNK` 做成可配置：现在的 16 KiB 是按"小于 MTU 的整数倍"选的，
       没有实测过不同块大小的吞吐差异
+- [ ] `mc_query_each` 的流式结果集不支持参数绑定：
+      目前 `sql` 只能是字面量，要传值仍得自己拼字符串（见 8.4）

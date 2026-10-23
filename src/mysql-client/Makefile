@@ -8,6 +8,7 @@
 #   make test       构建并运行单元测试（纯逻辑 + 接口参数检查）
 #   make check      命令行端到端检查（不需要运行中的数据库）
 #   make check-live 需要真实数据库的往返验证，连接参数走环境变量
+#   make check-scale 百万行下的峰值内存对照（物化 vs 流式，需要数据库）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make bench      文件读写的吞吐测量
 #   make clean      删除 bin/（含全部变体）
@@ -70,6 +71,7 @@ LIB      := $(OUT)/libmysqlclient.a
 CLI      := $(OUT)/mysqlclient
 TESTPURE := $(OUT)/test_pure
 TESTDB   := $(OUT)/test_db
+TESTSTRM := $(OUT)/test_stream
 BENCHBIN := $(OUT)/bench_file
 
 # 库的成员。file.o / options.o / status.o 不引用任何 mysql_* 符号，
@@ -78,7 +80,7 @@ BENCHBIN := $(OUT)/bench_file
 LIB_OBJ  := $(OUT)/mysqlclient.o $(OUT)/options.o $(OUT)/status.o $(OUT)/file.o
 CLI_OBJ  := $(OUT)/main.o
 
-.PHONY: all lib cli test check check-live sanitize sanitize-run bench clean
+.PHONY: all lib cli test check check-live check-scale sanitize sanitize-run bench clean
 
 all: lib cli
 
@@ -112,6 +114,11 @@ $(TESTDB): tests/test_db.c $(LIB) | $(OUT)
 $(BENCHBIN): tests/bench_file.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
+# 流式取数的测试：分"正确性"与"内存测量"两种用法（见文件顶部说明）。
+# 两者都需要运行中的服务器，因此不参与 make test。
+$(TESTSTRM): tests/test_stream.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -o $@
+
 test: $(TESTPURE) $(TESTDB)
 	@echo
 	@$(TESTPURE)
@@ -125,9 +132,17 @@ check: $(CLI)
 # 需要一台连得上的数据库。连接参数走环境变量，与驱动层的默认值来源一致：
 #   MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root make check-live
 # 不并进 make check：没有数据库的机器上它必然全红，那样的目标没人会跑。
-check-live: $(CLI)
+check-live: $(CLI) $(TESTSTRM)
 	@echo
 	@sh tests/check_live.sh $(CLI)
+	@echo "\n--- 流式取数：与物化逐格比对 ---"
+	@$(TESTSTRM)
+
+# 百万行下的峰值内存对照。单独一个目标是因为它要造 100 万行数据、
+# 占用几十秒和几百 MB 磁盘，不适合每次改代码都跑。
+check-scale: $(CLI) $(TESTSTRM)
+	@echo
+	@sh tests/check_scale.sh $(CLI) $(TESTSTRM)
 
 bench: $(BENCHBIN)
 	@echo

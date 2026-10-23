@@ -48,6 +48,16 @@ static void check_true(const char *name, int cond) {
 	else      fail(name, "条件不成立");
 }
 
+/* 只为满足 mc_query_each 的回调参数；参数检查发生在它被调用之前 */
+static int noop_row(void *ctx, const char *const *cell,
+                    const size_t *length, size_t cols) {
+	(void)ctx;
+	(void)cell;
+	(void)length;
+	(void)cols;
+	return 0;
+}
+
 int main(void) {
 
 	mc_options  opt;
@@ -68,6 +78,8 @@ int main(void) {
 	check_long("mc_ping(NULL)",   mc_ping(NULL),   MC_ERR_PARAM);
 	check_long("mc_exec(NULL)",   mc_exec(NULL, "SELECT 1", &affected), MC_ERR_PARAM);
 	check_long("mc_query(NULL)",  mc_query(NULL, "SELECT 1", &set),    MC_ERR_PARAM);
+	check_long("mc_query_each(NULL)",
+	           mc_query_each(NULL, "SELECT 1", noop_row, NULL, NULL), MC_ERR_PARAM);
 	check_long("mc_exec 空 SQL",  mc_exec(NULL, "", NULL),             MC_ERR_PARAM);
 	check_long("mc_blob_write(NULL)",
 	           mc_blob_write(NULL, "x", buf, 1), MC_ERR_PARAM);
@@ -79,6 +91,20 @@ int main(void) {
 	ok("mc_close(NULL) 不崩溃");
 	mc_rows_free(NULL);
 	ok("mc_rows_free(NULL) 不崩溃");
+
+	/*
+	 * out_rows 即使在最前面的参数检查失败时也要被写成 0：
+	 * 调用方拿到一个未初始化的计数，就会把上一次的残留值当成
+	 * "已经交付了这么多行"，续算的起点直接错掉。
+	 */
+	{
+		size_t n = 777;
+
+		check_long("mc_query_each 回调为 NULL 被拒绝",
+		           mc_query_each(NULL, "SELECT 1", NULL, NULL, &n),
+		           MC_ERR_PARAM);
+		check_long("失败时 out_rows 被写成 0", (long)n, 0);
+	}
 
 	/* mc_error 保证不返回 NULL，调用方才能直接 printf("%s") */
 	check_true("mc_error(NULL) 非 NULL", mc_error(NULL) != NULL);

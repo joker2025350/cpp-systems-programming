@@ -447,6 +447,267 @@ void mc_rows_free(mc_rows *rows) {
 }
 
 /* ------------------------------------------------------------------
+ * 流式取数（游标）
+ *
+ * 与 mc_query 的差别是"什么时候分配"：mc_query 先知道总行数，
+ * 算出一块连续内存一次分配完；这里事先不知道有多少行，
+ * 因此每一列的缓冲区按"当前这一行有多宽"增长，行与行之间复用。
+ * 峰值内存 = 各列历史最宽值之和，与行数无关。
+ *
+ * 取数走的是预处理语句的二进制协议，且**不调用 mysql_stmt_store_result**。
+ * 这一条是整个实现的关键：store_result 会让库把应答里的全部行读进
+ * 客户端内存（那正是 mc_query 的行为），不调用时 mysql_stmt_fetch
+ * 每次从套接字上读一行。
+ * ------------------------------------------------------------------ */
+
+/* 一列在取数过程中的可变状态 */
+typedef struct {
+	char         *buf;    /* cap 字节；最后 1 字节留给 '\0'，不计入内容 */
+	size_t        cap;
+	unsigned long len;    /* 本轮该列的字节数，由库写入 */
+	bool          null;   /* 本轮该列是否 SQL NULL，由库写入 */
+	bool          trunc;  /* 本轮该列是否被截断，由库写入 */
+} stream_col;
+
+/* 首行之前的初始宽度。选 256 是因为它覆盖了绝大多数整数、
+ * 时间戳与短字符串，常见场景下第一行就不必再调 fetch_column。
+ * 不选更大的值是因为它按列数成倍占用：宽表 100 列时 4 MiB 就是浪费。 */
+#define MC_STREAM_INIT 256
+
+/* 让 col 至少能放下 need 字节内容，外加 1 字节 '\0'。
+ * 增长按倍数进行，避免"每次只多一字节"时逐行 realloc。
+ * 返回 0 成功，-1 表示内存不足（原缓冲区保持有效）。 */
+static int col_reserve(stream_col *col, size_t need) {
+	size_t want;
+	char  *p;
+
+	if (need == SIZE_MAX) return -1;   /* need + 1 会回绕 */
+
+	want = need + 1;
+	if (col->cap >= want) return 0;
+	if (want < col->cap * 2) want = col->cap * 2;
+
+	p = (char *)realloc(col->buf, want);
+	if (p == NULL) return -1;
+
+	col->buf = p;
+	col->cap = want;
+	return 0;
+}
+
+mc_status mc_query_each(mc_conn *conn, const char *sql,
+                        mc_row_fn fn, void *ctx, size_t *out_rows) {
+
+	MYSQL_STMT   *stmt = NULL;
+	MYSQL_BIND   *bind = NULL;
+	stream_col   *col = NULL;
+	const char  **cell = NULL;
+	size_t       *length = NULL;
+	size_t        cols = 0;
+	size_t        j;
+	size_t        delivered = 0;
+	bool          executed = false;
+	mc_status     st = MC_OK;
+	int           ret;
+
+	/* 先写 0：后面每条失败路径都不必再操心这个出参 */
+	if (out_rows != NULL) *out_rows = 0;
+
+	if (conn == NULL || sql == NULL || sql[0] == '\0' || fn == NULL) {
+		set_error(conn, "query_each", "invalid argument");
+		return MC_ERR_PARAM;
+	}
+
+	stmt = mysql_stmt_init(conn->mysql);
+	if (stmt == NULL) {
+		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		return MC_ERR_STMT;
+	}
+
+	if (mysql_stmt_prepare(stmt, sql, (unsigned long)strlen(sql)) != 0) {
+		st = stmt_error(conn, stmt, "prepare", MC_ERR_STMT);
+		goto out;
+	}
+
+	/*
+	 * 列数来自服务器发回的元数据，prepare 之后就有。
+	 * 为 0 说明这条语句不产生结果集，与 mc_query 里的判据一致：
+	 * 把它报成错误，比让调用方对着一个空回调序列以为"没有数据"要好。
+	 */
+	cols = (size_t)mysql_stmt_field_count(stmt);
+	if (cols == 0) {
+		set_error(conn, "query_each",
+		          "statement returns no result set, use mc_exec");
+		st = MC_ERR_RESULT;
+		goto out;
+	}
+
+	bind   = (MYSQL_BIND *)calloc(cols, sizeof *bind);
+	col    = (stream_col *)calloc(cols, sizeof *col);
+	cell   = (const char **)calloc(cols, sizeof *cell);
+	length = (size_t *)calloc(cols, sizeof *length);
+
+	if (bind == NULL || col == NULL || cell == NULL || length == NULL) {
+		set_error(conn, "alloc", "out of memory");
+		st = MC_ERR_NOMEM;
+		goto out;
+	}
+
+	for (j = 0; j < cols; j++) {
+		col[j].buf = (char *)malloc(MC_STREAM_INIT);
+		if (col[j].buf == NULL) {
+			set_error(conn, "alloc", "out of memory");
+			st = MC_ERR_NOMEM;
+			goto out;
+		}
+		col[j].cap = MC_STREAM_INIT;
+
+		/*
+		 * buffer_type 一律声明成 MYSQL_TYPE_STRING：库会把整数、浮点、
+		 * 日期都转成文本形式写进缓冲区，BLOB 则原样拷字节
+		 * （长度看 length，不受内容里的 '\0' 影响）。
+		 * 逐列声明真实类型能省掉这次转换，代价是要为每种类型写一遍分支，
+		 * 而本接口交付给回调的本来就是"字节 + 长度"，没有必要。
+		 */
+		bind[j].buffer_type   = MYSQL_TYPE_STRING;
+		bind[j].buffer        = col[j].buf;
+		bind[j].buffer_length = (unsigned long)(col[j].cap - 1);
+		bind[j].length        = &col[j].len;
+		bind[j].is_null       = &col[j].null;
+		bind[j].error         = &col[j].trunc;
+	}
+
+	if (mysql_stmt_bind_result(stmt, bind) != 0) {
+		st = stmt_error(conn, stmt, "bind_result", MC_ERR_STMT);
+		goto out;
+	}
+
+	if (mysql_stmt_execute(stmt) != 0) {
+		st = stmt_error(conn, stmt, "execute", MC_ERR_QUERY);
+		goto out;
+	}
+	executed = true;
+
+	for (;;) {
+		/* 库只在"值被截断"或"出错"时写这三个字段，不清零就会把
+		 * 上一行的状态当成这一行的：上一行的 NULL 会让这一行也报 NULL，
+		 * 上一行的 trunc 会让这一行多走一遍 fetch_column。 */
+		for (j = 0; j < cols; j++) {
+			col[j].len   = 0;
+			col[j].null  = false;
+			col[j].trunc = false;
+			bind[j].buffer        = col[j].buf;
+			bind[j].buffer_length = (unsigned long)(col[j].cap - 1);
+		}
+
+		ret = mysql_stmt_fetch(stmt);
+
+		if (ret == MYSQL_NO_DATA) break;
+
+		/*
+		 * 三个返回值的含义：
+		 *   0                     本行取回成功；
+		 *   MYSQL_DATA_TRUNCATED  本行取回，但有列超出缓冲区长度——
+		 *                         库已经把真实长度写进 length，值要另行取；
+		 *   其余                  真错误（连接断开、语句被并发占用等）。
+		 * 原实现的同类代码把后两者合在一个 break 里，于是断线时
+		 * 调用方看不到任何错误，只看到"数据取完了"。
+		 */
+		if (ret != 0 && ret != MYSQL_DATA_TRUNCATED) {
+			st = stmt_error(conn, stmt, "fetch", MC_ERR_STMT);
+			goto out;
+		}
+
+		if (ret == MYSQL_DATA_TRUNCATED) {
+			/*
+			 * 判据不只看库给的 trunc 标志，也看"长度已经达到缓冲区上限"：
+			 * 只信标志的话，一旦某个版本没有按列置位，接下来写
+			 * buf[len] = '\0' 就越界了。两个条件取并集是廉价的，
+			 * 每行每列多一次比较而已。
+			 */
+			for (j = 0; j < cols; j++) {
+				if (col[j].null) continue;
+				if (!col[j].trunc &&
+				    (size_t)col[j].len < col[j].cap) continue;
+
+				if (col_reserve(&col[j], (size_t)col[j].len) != 0) {
+					set_error(conn, "alloc", "out of memory");
+					st = MC_ERR_NOMEM;
+					goto out;
+				}
+
+				/*
+				 * 请求长度正好等于字段长度，因此不会再被截断。
+				 * 此时不能沿用 buffer_length = cap - 1：那会多拷一个
+				 * 字节到缓冲区之外（cap-1 已经是"内容上限"）。
+				 */
+				bind[j].buffer        = col[j].buf;
+				bind[j].buffer_length = col[j].len;
+
+				if (mysql_stmt_fetch_column(stmt, &bind[j],
+				                            (unsigned int)j, 0) != 0) {
+					st = stmt_error(conn, stmt, "fetch_column",
+					                MC_ERR_STMT);
+					goto out;
+				}
+			}
+		}
+
+		/* 交给回调的视图。NULL 与空串是两件事：空串的 buf 非 NULL
+		 * （buf[0] == '\0'），SQL NULL 的 cell 才是 NULL。
+		 * 每一列的 buf 在进入循环之前都已分配，因此这里不需要判空。 */
+		for (j = 0; j < cols; j++) {
+			if (col[j].null) {
+				cell[j]   = NULL;
+				length[j] = 0;
+				continue;
+			}
+
+			col[j].buf[col[j].len] = '\0';
+			cell[j]   = col[j].buf;
+			length[j] = (size_t)col[j].len;
+		}
+
+		delivered++;
+
+		/* 非 0 表示调用方不再需要后续的行，这是正常结束 */
+		if (fn(ctx, cell, length, cols) != 0) break;
+	}
+
+	st = MC_OK;
+
+out:
+	/*
+	 * free_result 不能省。提前停止时结果集里还有没读的行，
+	 * 此时直接发下一条命令会得到 "Commands out of sync"；
+	 * 这个调用把这些行读掉丢弃，连接才回到可用状态。
+	 * mysql_stmt_close 内部也会做同样的事，但依赖这一点属于
+	 * 依赖实现细节，写出来更稳。
+	 */
+	if (stmt != NULL) {
+		/* 没执行过就没有结果集可释放，对未执行的语句调用它没有意义 */
+		if (executed) (void)mysql_stmt_free_result(stmt);
+
+		if (mysql_stmt_close(stmt) != 0 && st == MC_OK) {
+			set_error(conn, "stmt_close", mysql_error(conn->mysql));
+			st = MC_ERR_STMT;
+		}
+	}
+
+	if (col != NULL) {
+		for (j = 0; j < cols; j++) free(col[j].buf);
+	}
+	free(col);
+	free(bind);
+	free(cell);
+	free(length);
+
+	if (out_rows != NULL) *out_rows = delivered;
+
+	return st;
+}
+
+/* ------------------------------------------------------------------
  * 大字段
  * ------------------------------------------------------------------ */
 

@@ -115,6 +115,53 @@ check_contains "结果集带列名 id" "id" "$OUT"
 check_contains "结果集带列名 note" "note" "$OUT"
 
 # ------------------------------------------------------------
+# 1b. 流式取数（each）：行内容必须与 sql 逐字节相同
+#
+# sql 多打印一行表头（列名），each 的回调只拿到行内容，
+# 因此比对时去掉表头。除此之外必须完全一致：NULL 打印成 NULL、
+# 空串打印成空字段——这两条在流式路径上走的是另一段代码
+# （bind_result + fetch_column），不能拿 sql 的输出代之。
+# ------------------------------------------------------------
+
+"$CLI" sql -q "SELECT id, note FROM $TBL ORDER BY id" \
+	> "$TMPD/sql.out" 2>/dev/null
+check_exit "sql 取三行" 0 $?
+
+"$CLI" each -q "SELECT id, note FROM $TBL ORDER BY id" \
+	> "$TMPD/each.out" 2>/dev/null
+check_exit "each 退出码 0" 0 $?
+
+tail -n +2 "$TMPD/sql.out" > "$TMPD/sql.body"
+CHECKS=$((CHECKS + 1))
+if cmp -s "$TMPD/sql.body" "$TMPD/each.out"; then
+	printf 'ok    each 与 sql 的行内容逐字节相同\n'
+else
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-46s 输出不同\n' "each 与 sql 的行内容"
+	diff "$TMPD/sql.body" "$TMPD/each.out" | head -6
+fi
+
+ERR=$("$CLI" each -q "SELECT id FROM $TBL ORDER BY id" 2>&1 >/dev/null)
+check_contains "each 的行数摘要走 stderr" "3 行" "$ERR"
+
+# 行数上限：出口码仍是 0（主动停止不是失败），stderr 报告的交付行数受限
+OUT=$("$CLI" each -q "SELECT id FROM $TBL ORDER BY id" -n 1 2>/dev/null)
+check_equal "each -n 1 只输出一行" "$OUT" "1"
+
+ERR=$("$CLI" each -q "SELECT id FROM $TBL ORDER BY id" -n 2 2>&1 >/dev/null)
+check_contains "each -n 2 只交付两行" "2 行" "$ERR"
+
+# 不返回结果集的语句
+OUT=$("$CLI" each -q "UPDATE $TBL SET note='x' WHERE id=999" 2>&1)
+check_exit "each 收到无结果集语句时退出码 1" 1 $?
+check_contains "each 提示改用 mc_exec" "mc_exec" "$OUT"
+
+# 语法错误在 prepare 阶段被拒
+OUT=$("$CLI" each -q "SELECT FROM" 2>&1)
+check_exit "each 语法错误退出码 1" 1 $?
+check_contains "each 语法错误报 prepare" "prepare" "$OUT"
+
+# ------------------------------------------------------------
 # 2. BLOB 往返：三种长度
 # ------------------------------------------------------------
 
