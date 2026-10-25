@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>   /* stat / fchmod / mode_t：POSIX，不是 ISO C */
 
 mc_status mc_file_read(const char *path, void *buf, size_t cap, size_t *out_len) {
 
@@ -108,10 +109,29 @@ mc_status mc_file_write(const char *path, const void *buf, size_t len) {
 	size_t    written;
 	mc_status status = MC_OK;
 	int       saved_errno = 0;
+	struct stat target;
+	int       has_target;
+	mode_t    target_mode = 0;
 
 	if (path == NULL || buf == NULL) return MC_ERR_PARAM;
 
 	/* len 为 0 是合法的：创建一个空文件。 */
+
+	/*
+	 * 目标文件已经存在时，把它现有的权限位记下来。
+	 *
+	 * 必须在这里取，而不是 rename 之后：rename 之后原来的 inode 已经
+	 * 被摘掉了，新 inode 的权限是 fopen 按 0666 & ~umask 算出来的，
+	 * 与目标文件原来的权限没有关系。实测 0600 的文件被覆盖一次就变成
+	 * 0664（umask 002），这是一个静默的权限放宽——一个原本只有自己能读的
+	 * 导出文件，写第二次之后同组用户也能读了。
+	 *
+	 * stat 跟随符号链接：path 是链接时取到的是被指向文件的权限。
+	 * 这里只关心权限位，因此用 stat 而不是 lstat；至于"rename 会替换
+	 * 链接本身"这件事，属于另一个语义，见 README 的已知局限。
+	 */
+	has_target = (stat(path, &target) == 0);
+	if (has_target) target_mode = (mode_t)(target.st_mode & 0777);
 
 	/*
 	 * 先写 "<path>.tmp"，成功之后再 rename 覆盖目标文件。
@@ -140,6 +160,36 @@ mc_status mc_file_write(const char *path, const void *buf, size_t len) {
 	if (fp == NULL) {
 		free(tmp);
 		return MC_ERR_FILE_OPEN;
+	}
+
+	/*
+	 * 把权限位在写数据之前就定下来。
+	 *
+	 * 顺序有讲究：fopen 刚创建的临时文件是 0666 & ~umask（常见 0664），
+	 * 若目标是 0600，在"创建"与"改权限"之间它是空的，还没有内容可泄露；
+	 * 反过来把 fchmod 放到 fwrite 之后，就会有一段"内容已经写进去、
+	 * 权限还是 0664"的窗口。两种写法都只差几毫秒，但前者不需要解释
+	 * "为什么这段时间可以接受"。
+	 *
+	 * chmod 只复制 0777 三段权限位，不带 setuid / setgid。原因见下：
+	 * 这两个位的作用是让"执行这个文件"变成"以文件所有者（或所属组）的
+	 * 身份执行"（POSIX chmod(2)、execve(2) 的语义），而这里刚写进去的
+	 * 内容是一份**新的**、没有经过任何审查的数据。把 setuid 位从旧文件
+	 * 搬到新内容上，等于让"能触发这次写入的人"获得一个以文件所有者身份
+	 * 运行的二进制。内核在 write(2) 写已有文件时会清掉 setuid 位，
+	 * 这里换的是新 inode，内核不会替我们清，所以只能自己不带。
+	 *
+	 * 设不上就放弃这次写入：继续写下去的产物权限是 0666 & ~umask，
+	 * 与"覆盖同名文件"的预期不符，而调用方拿到的返回值却是 MC_OK。
+	 * 一个会对不上预期的成功，比一次明确的失败更难查。
+	 */
+	if (has_target && fchmod(fileno(fp), target_mode) != 0) {
+		saved_errno = errno;
+		(void)fclose(fp);
+		(void)remove(tmp);
+		free(tmp);
+		errno = saved_errno;
+		return MC_ERR_FILE_WRITE;
 	}
 
 	written = fwrite(buf, 1, len, fp);

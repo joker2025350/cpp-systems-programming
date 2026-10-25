@@ -187,6 +187,19 @@ for f in blob64k blob5m zero; do
 	fi
 done
 
+# 覆盖已有文件时保留它原有的权限位。
+#
+# blob-get 的输出走 mc_file_write（临时文件 + rename），而 rename 换掉的是
+# inode：新 inode 的权限是 0666 & ~umask，与目标文件原来的权限无关。
+# 不显式复制就会出现"0600 的导出文件被写一次变成 0664"这种静默放宽，
+# 而退出码仍然是 0。这一条在库层有单元测试，这里验的是驱动层真的走过去了。
+: > "$TMPD/perm.bin"
+chmod 600 "$TMPD/perm.bin"
+"$CLI" blob-get -q "SELECT u_img FROM $TBL WHERE id=1" \
+	-o "$TMPD/perm.bin" >/dev/null 2>&1
+check_exit "blob-get 覆盖已存在的 0600 文件" 0 $?
+check_equal "覆盖后权限位仍是 600" "$(stat -c %a "$TMPD/perm.bin")" "600"
+
 # ------------------------------------------------------------
 # 3. 失败路径（需要服务器才能触发的那几种）
 # ------------------------------------------------------------

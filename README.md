@@ -11,7 +11,7 @@ build target — not a single-file exercise.
 |---|---|---|---|
 | [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly | `counter.h` | 68 checks · ASan/UBSan · TSan |
 | [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, and a drain-on-destroy shutdown | `threadpool.h` | 54 checks · 19 end-to-end · ASan/UBSan · TSan |
-| [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 82 checks · 41 end-to-end · 48 live checks · 24 streaming checks · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
+| [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 119 checks · 41 end-to-end · 50 live checks · 24 streaming checks · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list; text format that round-trips byte for byte | `contacts.h` | 136 checks · 21 end-to-end · ASan/UBSan |
 | [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` | `wordcount.h` | 40 checks · 28 parallel-vs-sequential comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
 

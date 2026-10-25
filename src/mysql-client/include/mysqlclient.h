@@ -277,7 +277,13 @@ mc_status mc_file_read(const char *path, void *buf, size_t cap, size_t *out_len)
  * 两个推论写在这里，免得调用方踩：
  *   - 要求目录可写，而不只是目标文件可写；
  *   - path 必须是普通文件路径。管道、字符设备（/dev/stdout）不行，
- *     对它们 rename 只会失败。 */
+ *     对它们 rename 只会失败。
+ *
+ * 覆盖已有文件时保留它原有的 0777 权限位（rename 换的是 inode，
+ * 不显式复制就会变成 0666 & ~umask）；新建文件时权限仍由 umask 决定。
+ * setuid / setgid 位刻意不复制——新写入的内容没有经过审查，
+ * 不该继承"以文件所有者身份执行"的语义。
+ * 属主、属组、ACL 不保留，path 是符号链接时替换的是链接本身。 */
 mc_status mc_file_write(const char *path, const void *buf, size_t len);
 
 /* 状态码转可读描述。未知值返回 "unknown status"，不返回 NULL。 */
