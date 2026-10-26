@@ -1,7 +1,8 @@
 /*
  * contacts.h —— 通讯录模块的公开接口
  *
- * 模块职责：用双向链表保存联系人，提供增删查、遍历与文件存取。
+ * 模块职责：用双向链表保存联系人的插入顺序，用哈希索引加速按姓名定位，
+ * 提供增删查、遍历与文件存取。
  *
  * 设计上的三条约定：
  *   1. name 是主键。同一个通讯录里不允许出现重名，因此 contacts_remove
@@ -28,12 +29,15 @@ extern "C" {
 
 /* ------------------------------------------------------------------
  * 版本信息
- * ------------------------------------------------------------------ */
+ * ------------------------------------------------------------------
+ * 1.1.0：加入哈希索引，contact 与 contact_book 各多出字段，
+ *        ABI 不兼容（调用方必须与库一起重编），源码级兼容。
+ */
 
 #define CONTACTS_VERSION_MAJOR 1
-#define CONTACTS_VERSION_MINOR 0
+#define CONTACTS_VERSION_MINOR 1
 #define CONTACTS_VERSION_PATCH 0
-#define CONTACTS_VERSION_STRING "1.0.0"
+#define CONTACTS_VERSION_STRING "1.1.0"
 
 /* ------------------------------------------------------------------
  * 字段容量
@@ -61,21 +65,30 @@ extern "C" {
 /*
  * 一个联系人节点。
  *
- * prev/next 是链表指针，由模块维护。调用方通过 contacts_first /
- * contacts_next 遍历，不要自己沿着 next 走——那样写出来的代码
- * 会依赖"节点在堆上、链表双向"这些实现细节。
+ * prev/next 是链表指针，hash_next 是哈希索引的桶链指针，三者都由模块维护。
+ * 调用方通过 contacts_first / contacts_next 遍历，不要自己沿着
+ * next 或 hash_next 走——那样写出来的代码会依赖"节点在堆上、
+ * 链表双向、索引用分离链接"这些实现细节。
  */
 typedef struct contact {
 	char name[CONTACT_NAME_MAX];
 	char phone[CONTACT_PHONE_MAX];
 	struct contact *prev;
 	struct contact *next;
+	struct contact *hash_next;   /* 索引桶链，模块内部维护 */
 } contact;
 
 /*
  * 一个通讯录。
  *
- * 保存 head 与 tail 两个指针，使追加操作是 O(1)，
+ * 内部同时维护两份结构：
+ *   - 双向链表（head / tail），保存插入顺序，遍历与保存靠它；
+ *   - 哈希索引（buckets / nbuckets），保存"姓名 -> 节点"的映射，
+ *     查找、查重、删除靠它。
+ *
+ * 两份结构的一致性由 contacts_add / contacts_remove / contacts_clear
+ * 三个入口维护，调用方不需要（也不应该）碰后面两个字段。
+ * 保留 head 与 tail 两个指针，使追加是 O(1)，
  * 且遍历顺序与插入顺序一致。只保留 head 也能工作，
  * 但追加就要么遍历到表尾（O(n)），要么头插（顺序反转）。
  */
@@ -83,6 +96,8 @@ typedef struct {
 	contact *head;
 	contact *tail;
 	size_t   count;
+	contact **buckets;    /* 桶数组，长度是 2 的幂；NULL 表示还没有索引 */
+	size_t   nbuckets;    /* 桶数量，0 表示还没有索引 */
 } contact_book;
 
 /* ------------------------------------------------------------------
@@ -142,8 +157,9 @@ typedef struct {
 void contacts_init(contact_book *book);
 
 /*
- * 释放全部节点并回到空状态。可以重复调用。
- * 只是释放内容、不清零结构体本身，因此之后还能继续使用这本书。
+ * 释放全部节点与哈希索引的桶数组，回到空状态。可以重复调用。
+ * 只是释放内容、不清零结构体本身，因此之后还能继续使用这本书——
+ * 下一次 contacts_add 会重新建索引（可能因此返回 CONTACTS_ERR_NOMEM）。
  */
 void contacts_clear(contact_book *book);
 
@@ -173,7 +189,10 @@ size_t contacts_count(const contact_book *book);
  *   CONTACTS_ERR_FORMAT       字段为空或含逗号、换行符
  *   CONTACTS_ERR_TOOLONG      字段超出容量
  *   CONTACTS_ERR_DUPLICATE    同名联系人已存在
- *   CONTACTS_ERR_NOMEM        分配节点失败
+ *   CONTACTS_ERR_NOMEM        首次建立索引或分配节点时内存不足
+ *
+ * 失败时通讯录保持调用前的状态：不会留下"节点已挂上但索引里没有"的记录。
+ * 索引扩容失败不进这个分支——那种情况只降级为链更长的查找，仍然返回成功。
  */
 contacts_status contacts_add(contact_book *book, const char *name, const char *phone);
 
@@ -189,9 +208,15 @@ contacts_status contacts_remove(contact_book *book, const char *name);
 /*
  * 按姓名查找。找不到返回 NULL。
  *
+ * 平均 O(1)：内部有哈希索引，按姓名直接定位到桶链，链长在装载因子
+ * 不超过 1.0 的前提下平均 1 条多一点。最坏情形退化为 O(n)，
+ * 条件是大量姓名落在同一个桶上（哈希洪泛，见 README 9.7）。
+ * 索引是内部结构，不影响任何返回值。
+ *
  * 返回的指针在下一次 contacts_add / contacts_remove / contacts_clear
- * 之前保持有效。注意 contacts_add 可能触发 malloc，但不会移动已有节点，
- * 因此已有的指针在追加之后仍然有效；只有删除和清空才会让它失效。
+ * 之前保持有效。注意 contacts_add 可能触发 malloc，也可能触发索引扩容
+ * 并在内部重排桶链，但两者都不会移动已有节点，因此已有的指针在追加之后
+ * 仍然有效；只有删除和清空才会让它失效。
  */
 const contact *contacts_find(const contact_book *book, const char *name);
 
@@ -250,7 +275,13 @@ contacts_status contacts_save(const contact_book *book, const char *path);
  *
  * 单行超过约 510 字节、字段无法解析、字段内容不合法、与已有记录重名，
  * 这些情况都只跳过该行并计入 result->skipped，不中断整个载入过程。
- * 只有文件级别的错误（打不开、读出错、关闭出错）才返回非 0。
+ *
+ * 例外是内存不足：它与数据内容无关，继续读下去每一行都会失败。
+ * 此时立即中止，返回 CONTACTS_ERR_NOMEM，已经载入的部分保留，
+ * result 报告中止时已载入与已跳过的条数——而不是把剩下的行
+ * 全部记成"格式坏行"再返回成功。
+ *
+ * 只有文件级别的错误（打不开、读出错、关闭出错）与内存不足才返回非 0。
  *
  * result 可以为 NULL，表示不关心统计结果。
  *
@@ -281,6 +312,37 @@ const char *contacts_status_string(contacts_status status);
  * capacity 传入目标字段的容量（含 '\0'），例如 CONTACT_NAME_MAX。
  */
 contacts_status contacts_check_field(const char *value, size_t capacity);
+
+/* ------------------------------------------------------------------
+ * 诊断
+ * ------------------------------------------------------------------
+ * 索引是内部实现，正常调用方不需要关心。这组接口存在的目的是让
+ * "索引内部状态是否自洽""桶的分布是否合理"可以被测试与基准测量，
+ * 而不是只能靠"跑得快所以大概是对的"来推断。
+ */
+
+/*
+ * 索引的当前统计。
+ *
+ * buckets   桶数量，0 表示还没有索引（空表，或首次插入就失败）
+ * entries   索引里挂着的节点总数，正常情况下等于 contacts_count
+ * used      非空桶的数量
+ * max_chain 最长的一条桶链上的节点数
+ *
+ * entries 与 contacts_count 不等，说明索引与链表已经不一致——
+ * 这是断言用的不变量，不是可以忽略的统计噪声。
+ *
+ * 空表调用返回 CONTACTS_OK，四个字段全为 0。
+ */
+typedef struct {
+	size_t buckets;
+	size_t entries;
+	size_t used;
+	size_t max_chain;
+} contacts_index_stats;
+
+contacts_status contacts_index_get(const contact_book *book,
+                                   contacts_index_stats *out);
 
 #ifdef __cplusplus
 }   /* extern "C" */

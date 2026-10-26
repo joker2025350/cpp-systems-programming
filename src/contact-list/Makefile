@@ -30,12 +30,18 @@ OUT      ?= bin
 LIB      := $(OUT)/libcontacts.a
 CLI      := $(OUT)/contacts
 TESTBIN  := $(OUT)/test_contacts
+ALLOCBIN := $(OUT)/test_alloc
 BENCHBIN := $(OUT)/bench_contacts
 
 LIB_OBJ  := $(OUT)/contacts.o
 CLI_OBJ  := $(OUT)/main.o
 
-.PHONY: all lib cli test check sanitize sanitize-run bench clean
+# 分配失败注入用的链接选项。--wrap 只重定向**未定义引用**，
+# 因此 libcontacts.a 里对 malloc / calloc 的调用会经过 tests/test_alloc.c
+# 里的 __wrap_*，libc 内部的分配不受影响。
+WRAPFLAGS := -Wl,--wrap=malloc -Wl,--wrap=calloc
+
+.PHONY: all lib cli test test-alloc check sanitize sanitize-run bench clean
 
 all: lib cli
 
@@ -61,12 +67,21 @@ $(CLI): $(CLI_OBJ) $(LIB)
 $(TESTBIN): tests/test_contacts.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
+$(ALLOCBIN): tests/test_alloc.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) $(WRAPFLAGS) -o $@
+
 $(BENCHBIN): tests/bench_contacts.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
-test: $(TESTBIN)
+test: $(TESTBIN) $(ALLOCBIN)
 	@echo
 	@$(TESTBIN) $(TESTDATA)
+	@echo
+	@$(ALLOCBIN)
+
+test-alloc: $(ALLOCBIN)
+	@echo
+	@$(ALLOCBIN)
 
 check: $(CLI)
 	@sh tests/check_cli.sh $(CLI) $(TESTDATA)
@@ -77,9 +92,11 @@ sanitize:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
 		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' sanitize-run
 
-sanitize-run: all $(TESTBIN)
+sanitize-run: all $(TESTBIN) $(ALLOCBIN)
 	@echo "\n--- 单元测试（ASan + UBSan）---"
 	@$(TESTBIN) $(TESTDATA)
+	@echo "\n--- 分配失败注入（ASan + UBSan）---"
+	@$(ALLOCBIN)
 	@echo "\n--- 命令行（ASan + UBSan）---"
 	@$(CLI) -f $(OUT)/asan_book.txt add alice 13900001111
 	@$(CLI) -f $(OUT)/asan_book.txt add bob 13800002222

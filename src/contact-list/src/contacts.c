@@ -1,15 +1,22 @@
 /*
  * contacts.c —— 通讯录模块的实现
  *
- * 分三块：
- *   1. 双向链表与节点生命周期
+ * 分四块：
+ *   1. 双向链表、节点生命周期与哈希索引
  *   2. 一行的解析与一张表的序列化
  *   3. 文件级的读写，含错误分类与 errno 保存
+ *   4. 辅助
+ *
+ * 两份结构描述同一批节点：双向链表保存插入顺序（遍历、保存都靠它），
+ * 哈希索引保存"姓名 -> 节点"的映射（查找、查重、删除都靠它）。
+ * 两份结构的一致性由本文件的三个入口维护：contacts_add、contacts_remove、
+ * contacts_clear。除此之外没有任何代码改链表指针或桶链指针。
  */
 
 #include "contacts.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,16 +31,135 @@
 #define CONTACTS_LINE_MAX 512
 
 /* ------------------------------------------------------------------
- * 1. 链表与节点
+ * 1. 链表、节点生命周期与哈希索引
  * ------------------------------------------------------------------ */
+
+/*
+ * 初始桶数。桶数始终是 2 的幂，取下标时用按位与代替取模：
+ * 取模在 x86 上是 20~40 个周期的整除指令，只在除数是编译期常量时
+ * 才被优化成乘法；桶数在运行期变化，编译器替代不了，按位与没有这个问题。
+ */
+#define CONTACTS_BUCKETS_MIN ((size_t)16)
+
+/*
+ * FNV-1a 64 位哈希。
+ *
+ * 定义（可独立复现）：h = 0xcbf29ce484222325，对输入字节流逐个执行
+ *     h ^= byte;  h *= 0x100000001b3;   （乘数与偏移基都是 FNV 规范给的）
+ *
+ * 选它的理由不是"最快"，而是三条实际约束：
+ *   1. 逐字节处理，不需要预知长度，也不依赖对齐——姓名是 char[64]，
+ *      长度随内容变化，逐字节循环不必先 strlen。
+ *   2. 不引入运行期随机种子，因此同一批姓名每次都落在同一组桶里，
+ *      测试与基准的结果可复现（代价见 README 9.7 的哈希洪泛）。
+ *   3. 乘法每步都作用于 h 的全部 64 位，输入的低位变化会扩散到高位，
+ *      因此下面用低若干位做桶下标不会丢掉熵。
+ *
+ * 注意 0x100000001b3 的低字节是 0xb3（奇数）。若乘数是偶数，
+ * 每步乘法都会把 h 的最低位置 0，低位的熵会被逐位清空，
+ * 用低 b 位取下标就会退化——这是选乘数时必须满足的整除性要求。
+ */
+static uint64_t hash_name(const char *name) {
+	const unsigned char *p = (const unsigned char *)name;
+	uint64_t             h = 0xcbf29ce484222325u;
+
+	while (*p != '\0') {
+		h ^= (uint64_t)(*p);
+		h *= 0x100000001b3u;
+		p++;
+	}
+	return h;
+}
+
+/* 给定桶数求下标。nbuckets 必须是 2 的幂且非 0。 */
+static size_t bucket_index(size_t nbuckets, const char *name) {
+	return (size_t)(hash_name(name) & (uint64_t)(nbuckets - 1u));
+}
+
+/*
+ * 分配并清零一个桶数组。
+ *
+ * 用 calloc 而不是 malloc + memset：桶数组的初值必须是 NULL 指针，
+ * 全零位模式在 C 标准里不保证等于空指针（C11 6.3.2.3p3 只规定了
+ * 空指针常量转成指针的结果，没规定其位模式），但 POSIX 与所有
+ * 实际平台都满足，且 calloc 是获得"零位模式内存"的唯一标准途径。
+ * contacts_init 里对 head/tail 显式赋 NULL，这里依赖 calloc 的零值。
+ */
+static contact **buckets_alloc(size_t n) {
+	return (contact **)calloc(n, sizeof(contact *));
+}
+
+/*
+ * 为"即将插入一个节点"准备索引。返回 0 表示可用，-1 表示内存不足。
+ *
+ * 三种情况：
+ *   1. 还没有索引：按 CONTACTS_BUCKETS_MIN 建一个空表；
+ *   2. 现有桶数装得下（插入后 count <= nbuckets，即装载因子 <= 1.0）：什么都不做；
+ *   3. 装不下：桶数翻倍，把已有节点重新挂到新表上。
+ *
+ * 第 3 步扩容失败时**不返回错误**，继续用旧表。理由：桶数不足只是链变长、
+ * 查找常数变大，结果仍然正确；为了让"扩容"这种纯性能优化去否决一次
+ * 合法的插入，是把可用性问题变成了正确性问题。
+ *
+ * 而第 1 步失败必须上报：没有索引也仍然能用线性扫描工作，
+ * 但每次插入都要 O(n) 查重，把 O(n²) 的行为悄悄还给调用方，
+ * 比直接返回 CONTACTS_ERR_NOMEM 更难排查。
+ */
+static int index_prepare(contact_book *book) {
+	if (book->buckets == NULL) {
+		contact **fresh = buckets_alloc(CONTACTS_BUCKETS_MIN);
+
+		if (fresh == NULL) {
+			return -1;
+		}
+		book->buckets  = fresh;
+		book->nbuckets = CONTACTS_BUCKETS_MIN;
+		return 0;
+	}
+
+	if (book->count + 1u <= book->nbuckets) {
+		return 0;
+	}
+
+	{
+		size_t   want  = book->nbuckets * 2u;
+		contact **fresh = buckets_alloc(want);
+		contact  *item;
+
+		if (fresh == NULL) {
+			return 0;       /* 降级：旧表继续用，语义不变 */
+		}
+
+		/*
+		 * 重挂时只改 hash_next，不动 prev/next。
+		 * 若这里连 prev/next 一起重排，链表顺序就变成"按桶分组"，
+		 * 遍历顺序不再等于插入顺序，save 写出的文件也跟着变——
+		 * 那是一条会破坏文件契约的捷径。
+		 */
+		for (item = book->head; item != NULL; item = item->next) {
+			size_t i = bucket_index(want, item->name);
+
+			item->hash_next = fresh[i];
+			fresh[i] = item;
+		}
+
+		free(book->buckets);
+		book->buckets  = fresh;
+		book->nbuckets = want;
+	}
+
+	return 0;
+}
 
 void contacts_init(contact_book *book) {
 	if (book == NULL) {
 		return;
 	}
-	book->head  = NULL;
-	book->tail  = NULL;
-	book->count = 0;
+	book->head     = NULL;
+	book->tail     = NULL;
+	book->count    = 0;
+	book->buckets  = NULL;
+	book->nbuckets = 0;
 }
 
 void contacts_clear(contact_book *book) {
@@ -54,6 +180,16 @@ void contacts_clear(contact_book *book) {
 		free(item);
 		item = next;
 	}
+
+	/*
+	 * 桶数组与节点一起释放。不保留空表来"省一次分配"，是因为
+	 * clear 的语义就是"释放全部内容"：留着 64 万条的桶数组
+	 * （512 KB）而对外报告"清空了"，是与语义不符的内存占用。
+	 * 代价是 clear 之后第一次 add 要重新分配一次，可忽略。
+	 */
+	free(book->buckets);
+	book->buckets  = NULL;
+	book->nbuckets = 0;
 
 	book->head  = NULL;
 	book->tail  = NULL;
@@ -83,7 +219,23 @@ const contact *contacts_find(const contact_book *book, const char *name) {
 		return NULL;
 	}
 
-	for (item = book->head; item != NULL; item = item->next) {
+	/*
+	 * 没有索引时退回线性扫描。这条路径只在"空表"与"首次插入失败"两种
+	 * 情形下走到，结果必须与有索引时完全一致——索引是加速手段，
+	 * 不参与定义语义。
+	 */
+	if (book->buckets == NULL) {
+		for (item = book->head; item != NULL; item = item->next) {
+			if (strcmp(item->name, name) == 0) {
+				return item;
+			}
+		}
+		return NULL;
+	}
+
+	for (item = book->buckets[bucket_index(book->nbuckets, name)];
+	     item != NULL;
+	     item = item->hash_next) {
 		if (strcmp(item->name, name) == 0) {
 			return item;
 		}
@@ -125,7 +277,8 @@ contacts_status contacts_check_field(const char *value, size_t capacity) {
 
 contacts_status contacts_add(contact_book *book, const char *name, const char *phone) {
 	contacts_status status;
-	contact *item;
+	contact        *item;
+	size_t          bucket;
 
 	if (book == NULL) {
 		return CONTACTS_ERR_PARAM;
@@ -143,6 +296,15 @@ contacts_status contacts_add(contact_book *book, const char *name, const char *p
 	/* name 是主键，重名会让查找与删除的结果变得不确定 */
 	if (contacts_find(book, name) != NULL) {
 		return CONTACTS_ERR_DUPLICATE;
+	}
+
+	/*
+	 * 先备好索引，再分配节点。顺序反过来也能工作，但会产生一个
+	 * "节点已分配、索引建不起来"的状态，那时只能把节点释放掉再返回失败；
+	 * 而现在索引先行，节点分配失败时桶表是一个空表，仍然自洽。
+	 */
+	if (index_prepare(book) != 0) {
+		return CONTACTS_ERR_NOMEM;
 	}
 
 	item = (contact *)malloc(sizeof *item);
@@ -171,39 +333,64 @@ contacts_status contacts_add(contact_book *book, const char *name, const char *p
 	book->tail = item;
 	book->count++;
 
+	/* 头插进桶链：新节点成为链首，插入是 O(1) */
+	bucket = bucket_index(book->nbuckets, item->name);
+	item->hash_next = book->buckets[bucket];
+	book->buckets[bucket] = item;
+
 	return CONTACTS_OK;
 }
 
 contacts_status contacts_remove(contact_book *book, const char *name) {
-	contact *item;
+	contact  *item;
+	contact **link;
 
 	if (book == NULL || name == NULL) {
 		return CONTACTS_ERR_PARAM;
 	}
 
-	for (item = book->head; item != NULL; item = item->next) {
-		if (strcmp(item->name, name) != 0) {
-			continue;
+	if (book->buckets == NULL) {
+		/* 没有索引就只可能是空表；仍然走一遍线性查找以保持语义一致 */
+		for (item = book->head; item != NULL; item = item->next) {
+			if (strcmp(item->name, name) == 0) {
+				break;
+			}
 		}
+		if (item == NULL) {
+			return CONTACTS_ERR_NOTFOUND;
+		}
+	} else {
+		/*
+		 * link 存的是"指向本节点的那个指针"的地址，可能是桶数组里的
+		 * 某一格，也可能是前驱的 hash_next。用二级指针拆链，
+		 * 链首与非链首两种情形就不需要各写一遍。
+		 */
+		link = &book->buckets[bucket_index(book->nbuckets, name)];
 
-		/* 四种位置：表头、表中、表尾、唯一节点。下面五行覆盖全部情形。 */
-		if (item->prev != NULL) {
-			item->prev->next = item->next;
-		} else {
-			book->head = item->next;
+		while ((item = *link) != NULL && strcmp(item->name, name) != 0) {
+			link = &item->hash_next;
 		}
-		if (item->next != NULL) {
-			item->next->prev = item->prev;
-		} else {
-			book->tail = item->prev;
+		if (item == NULL) {
+			return CONTACTS_ERR_NOTFOUND;
 		}
-
-		free(item);
-		book->count--;
-		return CONTACTS_OK;
+		*link = item->hash_next;
 	}
 
-	return CONTACTS_ERR_NOTFOUND;
+	/* 四种位置：表头、表中、表尾、唯一节点。下面五行覆盖全部情形。 */
+	if (item->prev != NULL) {
+		item->prev->next = item->next;
+	} else {
+		book->head = item->next;
+	}
+	if (item->next != NULL) {
+		item->next->prev = item->prev;
+	} else {
+		book->tail = item->prev;
+	}
+
+	free(item);
+	book->count--;
+	return CONTACTS_OK;
 }
 
 /* ------------------------------------------------------------------
@@ -450,8 +637,19 @@ contacts_status contacts_load(contact_book *book, const char *path,
 		 * 重名在追加载入时是常见情况（同一个文件读两遍），
 		 * 计入 skipped 而不是让整个载入失败。
 		 */
-		if (contacts_add(book, name, phone) == CONTACTS_OK) {
+		parsed = contacts_add(book, name, phone);
+		if (parsed == CONTACTS_OK) {
 			local.loaded++;
+		} else if (parsed == CONTACTS_ERR_NOMEM) {
+			/*
+			 * 内存不足与"这一行有问题"是两回事：前者与数据内容无关，
+			 * 继续读下去每一行都会失败，而把剩下的行全部计入 skipped
+			 * 再返回 CONTACTS_OK，等于对外宣布"载入成功，只是跳过了一部分"，
+			 * 调用方无从区分"文件里有坏行"与"进程快没内存了"。
+			 * 因此立刻中止，返回 CONTACTS_ERR_NOMEM，已读入的部分保留。
+			 */
+			status = CONTACTS_ERR_NOMEM;
+			break;
 		} else {
 			local.skipped++;
 			if (local.first_bad_line == 0) {
@@ -461,7 +659,7 @@ contacts_status contacts_load(contact_book *book, const char *path,
 	}
 
 	/* fgets 返回 NULL 有两种可能：读完，或出错。ferror 用来区分。 */
-	if (ferror(fp)) {
+	if (status == CONTACTS_OK && ferror(fp)) {
 		status = CONTACTS_ERR_READ;
 	}
 
@@ -480,8 +678,53 @@ contacts_status contacts_load(contact_book *book, const char *path,
 }
 
 /* ------------------------------------------------------------------
- * 辅助
+ * 4. 辅助
  * ------------------------------------------------------------------ */
+
+contacts_status contacts_index_get(const contact_book *book,
+                                   contacts_index_stats *out) {
+	size_t i;
+
+	if (book == NULL || out == NULL) {
+		return CONTACTS_ERR_PARAM;
+	}
+
+	out->buckets   = 0;
+	out->entries   = 0;
+	out->used      = 0;
+	out->max_chain = 0;
+
+	if (book->buckets == NULL) {
+		return CONTACTS_OK;     /* 还没有索引，四个值都是 0 */
+	}
+
+	out->buckets = book->nbuckets;
+
+	for (i = 0; i < book->nbuckets; i++) {
+		const contact *item = book->buckets[i];
+		size_t         len  = 0;
+
+		/*
+		 * 链长不可能超过节点总数。加上这个上界是为了让"索引结构被破坏
+		 * （出现环）"这种情形表现为 entries 与 count 不等、断言失败，
+		 * 而不是让诊断函数自己挂在这里。
+		 */
+		while (item != NULL && len <= book->count) {
+			len++;
+			item = item->hash_next;
+		}
+
+		if (len > 0) {
+			out->used++;
+		}
+		if (len > out->max_chain) {
+			out->max_chain = len;
+		}
+		out->entries += len;
+	}
+
+	return CONTACTS_OK;
+}
 
 const char *contacts_status_string(contacts_status status) {
 	switch (status) {

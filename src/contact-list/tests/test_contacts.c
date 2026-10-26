@@ -175,8 +175,14 @@ static void test_duplicate(void) {
 	expect_int("重名不增加数量", (long)contacts_count(&book), 1);
 
 	/* 原来的号码不能被第二次添加覆盖 */
-	expect_str("重名时保留原号码",
-	           contacts_find(&book, "alice")->phone, "111");
+	{
+		const contact *again = contacts_find(&book, "alice");
+
+		expect_int("重名后仍能找到 alice", again != NULL, 1);
+		if (again != NULL) {
+			expect_str("重名时保留原号码", again->phone, "111");
+		}
+	}
 
 	contacts_destroy(&book);
 }
@@ -652,6 +658,218 @@ static void test_status_string(void) {
 }
 
 /* ---------------------------------------------------------------- */
+/* 哈希索引                                                          */
+/* ---------------------------------------------------------------- */
+
+static int is_pow2(size_t v) {
+	return (v != 0 && (v & (v - 1u)) == 0) ? 1 : 0;
+}
+
+/*
+ * 索引与链表是两个独立的结构，最容易出错的地方不是"某个函数算错了"，
+ * 而是"某条改动路径只维护了其中一个"。这一组用例盯的就是这件事：
+ * 每次结构变动之后，都用 contacts_index_get 把两份结构的规模对上。
+ */
+static void test_index_lifecycle(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	char                 name[32];
+
+	contacts_init(&book);
+
+	(void)memset(&st, 0xff, sizeof st);
+	expect_status("空表取索引统计", contacts_index_get(&book, &st), CONTACTS_OK);
+	expect_int("空表桶数为 0", (long)st.buckets, 0);
+	expect_int("空表 entries 为 0", (long)st.entries, 0);
+
+	(void)contacts_add(&book, "alice", "1");
+	expect_status("插入后取索引统计", contacts_index_get(&book, &st), CONTACTS_OK);
+	expect_int("首次插入建立索引，桶数 16", (long)st.buckets, 16);
+	expect_int("索引 entries 等于条数", (long)st.entries, 1);
+
+	/* 补到 16 条：装载因子正好 1.0，此时还不扩容 */
+	for (int i = 0; i < 15; i++) {
+		(void)snprintf(name, sizeof name, "u%02d", i);
+		(void)contacts_add(&book, name, "0");
+	}
+	(void)contacts_index_get(&book, &st);
+	expect_int("16 条时桶数仍为 16", (long)st.buckets, 16);
+	expect_int("16 条时 entries 为 16", (long)st.entries, 16);
+
+	/* 第 17 条：插入后条数超过桶数，必须扩容到 32 */
+	(void)contacts_add(&book, "u15", "0");
+	(void)contacts_index_get(&book, &st);
+	expect_int("第 17 条触发扩容，桶数 32", (long)st.buckets, 32);
+	expect_int("扩容后 entries 仍等于条数", (long)st.entries, 17);
+	expect_int("扩容后老记录仍能找到",
+	           contacts_find(&book, "alice") != NULL, 1);
+
+	(void)contacts_clear(&book);
+	(void)contacts_index_get(&book, &st);
+	expect_int("clear 后桶数归 0", (long)st.buckets, 0);
+	expect_int("clear 后 entries 归 0", (long)st.entries, 0);
+
+	expect_status("index_get(NULL, &st)",
+	              contacts_index_get(NULL, &st), CONTACTS_ERR_PARAM);
+	expect_status("index_get(&book, NULL)",
+	              contacts_index_get(&book, NULL), CONTACTS_ERR_PARAM);
+
+	contacts_destroy(&book);
+}
+
+#define INDEX_N 2000
+
+/*
+ * 规模化：两千条的插入、查找、删除、再插入。
+ *
+ * 检查的重点不是"能不能查到"，而是三份事实互相印证：
+ *   - contacts_count 的计数
+ *   - 沿 next 遍历出来的节点数
+ *   - 索引里的 entries
+ * 三者必须始终相等。任何一条路径漏维护了一份结构，这里就会不等。
+ */
+static void test_index_scale(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	char                 name[32];
+	char                 phone[32];
+	long                 added  = 0;
+	long                 found  = 0;
+	long                 absent = 0;
+
+	contacts_init(&book);
+
+	for (int i = 0; i < INDEX_N; i++) {
+		(void)snprintf(name, sizeof name, "user%04d", i);
+		(void)snprintf(phone, sizeof phone, "138%08d", i);
+		if (contacts_add(&book, name, phone) == CONTACTS_OK) {
+			added++;
+		}
+	}
+	expect_int("两千条全部插入成功", added, INDEX_N);
+	expect_int("两千条时 count 正确", (long)contacts_count(&book), INDEX_N);
+
+	(void)contacts_index_get(&book, &st);
+	expect_int("entries 等于 count", (long)st.entries, INDEX_N);
+	expect_int("桶数是 2 的幂", is_pow2(st.buckets), 1);
+	expect_int("装载因子不超过 1.0",
+	           (long)(st.entries <= st.buckets), 1);
+	/*
+	 * 分布检查。装载因子 1.0 时，随机均匀散列的最长链期望在
+	 * ln(n)/ln(ln(n)) 附近（n=2000 时约 4~6），20 是一个宽松的上界。
+	 * 真正要挡的是"哈希函数只用了少数字节，导致大量姓名挤进同一个桶"
+	 * 这类退化——那会让最长链达到几十上百。
+	 */
+	expect_int("最长链不超过 20", (long)(st.max_chain <= 20), 1);
+	expect_int("非空桶超过一半", (long)(st.used * 2u > st.buckets), 1);
+
+	for (int i = 0; i < INDEX_N; i++) {
+		(void)snprintf(name, sizeof name, "user%04d", i);
+		(void)snprintf(phone, sizeof phone, "138%08d", i);
+
+		const contact *c = contacts_find(&book, name);
+		if (c != NULL && strcmp(c->phone, phone) == 0) {
+			found++;
+		}
+	}
+	expect_int("两千条全部能查到且电话正确", found, INDEX_N);
+
+	/* 不存在的姓名不能误命中：用插入范围之外的序号 */
+	for (int i = 0; i < 500; i++) {
+		(void)snprintf(name, sizeof name, "user%04d", INDEX_N + i);
+		if (contacts_find(&book, name) == NULL) {
+			absent++;
+		}
+	}
+	expect_int("五百个不存在的姓名全部落空", absent, 500);
+
+	/*
+	 * 删除一半，按插入序号倒序删。桶链是头插，因此倒序删除
+	 * 先删到的是链首，正序删除先删到的是链尾——两种位置都要覆盖，
+	 * 拆链写错时通常只错其中一种。
+	 */
+	{
+		long removed = 0;
+
+		for (int i = INDEX_N - 1; i >= 0; i -= 2) {
+			(void)snprintf(name, sizeof name, "user%04d", i);
+			if (contacts_remove(&book, name) == CONTACTS_OK) {
+				removed++;
+			}
+		}
+		expect_int("倒序删除一千条", removed, INDEX_N / 2);
+	}
+
+	expect_int("删除后 count 为一半",
+	           (long)contacts_count(&book), INDEX_N / 2);
+	(void)contacts_index_get(&book, &st);
+	expect_int("删除后 entries 等于 count",
+	           (long)st.entries, INDEX_N / 2);
+
+	{
+		long still_there = 0;
+		long gone        = 0;
+
+		for (int i = 0; i < INDEX_N; i++) {
+			(void)snprintf(name, sizeof name, "user%04d", i);
+			if ((i % 2) == 0) {
+				if (contacts_find(&book, name) != NULL) {
+					still_there++;
+				}
+			} else {
+				if (contacts_find(&book, name) == NULL) {
+					gone++;
+				}
+			}
+		}
+		expect_int("保留项全部仍在", still_there, INDEX_N / 2);
+		expect_int("删除项全部消失", gone, INDEX_N / 2);
+	}
+
+	/* 删掉的名字可以重新加入，且不破坏索引 */
+	(void)snprintf(name, sizeof name, "user%04d", INDEX_N - 1);
+	expect_status("删除后可重新添加",
+	              contacts_add(&book, name, "139"), CONTACTS_OK);
+	{
+		const contact *again = contacts_find(&book, name);
+
+		expect_int("重新添加后能找到", again != NULL, 1);
+		if (again != NULL) {
+			expect_str("重新添加后电话是新的", again->phone, "139");
+		}
+	}
+	expect_status("重新添加同一个名字仍然重名",
+	              contacts_add(&book, name, "140"), CONTACTS_ERR_DUPLICATE);
+
+	(void)contacts_index_get(&book, &st);
+	expect_int("重名被拒后 entries 不变",
+	           (long)st.entries, INDEX_N / 2 + 1);
+	expect_int("重名被拒后 count 不变",
+	           (long)contacts_count(&book), INDEX_N / 2 + 1);
+
+	/* 全部删完：链表与索引都要回到空状态 */
+	{
+		long left = 0;
+
+		for (int i = 0; i < INDEX_N; i++) {
+			(void)snprintf(name, sizeof name, "user%04d", i);
+			(void)contacts_remove(&book, name);
+		}
+		expect_int("全删后 count 为 0", (long)contacts_count(&book), 0);
+
+		for (int i = 0; i < INDEX_N; i++) {
+			(void)snprintf(name, sizeof name, "user%04d", i);
+			if (contacts_find(&book, name) != NULL) {
+				left++;
+			}
+		}
+		expect_int("全删后没有任何残留命中", left, 0);
+	}
+
+	contacts_destroy(&book);
+}
+
+/* ---------------------------------------------------------------- */
 
 int main(int argc, char *argv[]) {
 	if (argc > 1) {
@@ -678,6 +896,8 @@ int main(int argc, char *argv[]) {
 	test_load_long_line();
 	test_load_missing();
 	test_status_string();
+	test_index_lifecycle();
+	test_index_scale();
 
 	(void)printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);
 	return (g_failures == 0) ? 0 : 1;
