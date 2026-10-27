@@ -42,8 +42,9 @@ static void usage(FILE *out, const char *prog) {
 	    "  add <name> <phone>    添加联系人\n"
 	    "  del <name>            按姓名删除\n"
 	    "  find <name>           按姓名查找\n"
-	    "  list                  列出全部联系人（顺序即插入顺序）\n"
-	    "  count                 输出联系人数量\n"
+		"  list                  列出全部联系人（顺序即插入顺序）\n"
+		"  count                 输出联系人数量\n"
+		"  stats                 输出索引统计（桶数、装载因子、最长链）\n"
 	    "  save <file>           保存到文件\n"
 	    "  load <file> [-r]      从文件载入；-r 表示先清空\n"
 	    "  menu                  交互式菜单\n"
@@ -188,6 +189,39 @@ static int cmd_list(app *a) {
 
 static int cmd_count(app *a) {
 	(void)printf("%lu\n", (unsigned long)contacts_count(&a->book));
+	return 0;
+}
+
+/*
+ * 索引统计。输出"每行一个 key: value"，是为了让脚本用一次行匹配就能取到
+ * 单个字段，不必按列宽 cut；不用表格也是同一个理由。
+ *
+ * 这一条命令存在的意义不是给最终用户看，而是让"桶数会不会随删除收缩"
+ * 这类内部行为可以在命令行上直接观察到——否则端到端测试只能间接推断。
+ */
+static int cmd_stats(app *a) {
+	contacts_index_stats st;
+	contacts_status      status;
+
+	status = contacts_index_get(&a->book, &st);
+	if (status != CONTACTS_OK) {
+		print_status("stats", status);
+		return 1;
+	}
+
+	(void)printf("count:     %lu\n", (unsigned long)contacts_count(&a->book));
+	(void)printf("buckets:   %lu\n", (unsigned long)st.buckets);
+	(void)printf("entries:   %lu\n", (unsigned long)st.entries);
+	(void)printf("used:      %lu\n", (unsigned long)st.used);
+	(void)printf("max_chain: %lu\n", (unsigned long)st.max_chain);
+	(void)printf("rehashes:  %lu\n", (unsigned long)st.rehashes);
+
+	if (st.buckets > 0) {
+		(void)printf("load:      %.3f\n",
+		             (double)st.entries / (double)st.buckets);
+	} else {
+		(void)printf("load:      n/a\n");
+	}
 	return 0;
 }
 
@@ -455,6 +489,8 @@ int main(int argc, char *argv[]) {
 		rc = cmd_list(&a);
 	} else if (strcmp(argv[i], "count") == 0) {
 		rc = cmd_count(&a);
+	} else if (strcmp(argv[i], "stats") == 0) {
+		rc = cmd_stats(&a);
 	} else if (strcmp(argv[i], "save") == 0) {
 		rc = cmd_save(&a, argc - i, argv + i);
 	} else if (strcmp(argv[i], "load") == 0) {

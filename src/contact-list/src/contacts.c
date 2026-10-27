@@ -42,6 +42,23 @@
 #define CONTACTS_BUCKETS_MIN ((size_t)16)
 
 /*
+ * 收缩阈值：装载因子低于 1/CONTACTS_SHRINK_DIV（即 1/4）时桶数减半。
+ *
+ * 取 1/4 的理由是让扩容与收缩把表都留在"半满"状态，两个方向各有 2 倍余量：
+ *   - 扩容发生在装载因子刚超过 1.0，翻倍后回到 0.5 附近；
+ *   - 收缩取 1/4 时，减半后装载因子升到 0.5 附近。
+ *
+ * 若收缩也取 1/2，减半后装载因子会回到 1.0——表是满的。这不至于造成
+ * 无限抖动（本实现的扩容判据是"插入后条数 > 桶数"，减半后 count <= nbuckets-1，
+ * 要连插两条才会再扩容，实测 2000 轮"删一条加一条"只有 1 次重分配），
+ * 但代价是刚还回去的内存立刻又处在"下一条记录就要拿回来"的状态，
+ * 而插入路径上的最坏延迟正好落在内存最紧张的时刻。取 1/4 就没有这个窗口。
+ * 这段推理的实测过程写在 README 3.11：先按教科书假设"1/2 会抖动"，
+ * 写测试一量，发现抖动并不发生，于是把理由换成了实际成立的那一条。
+ */
+#define CONTACTS_SHRINK_DIV ((size_t)4)
+
+/*
  * FNV-1a 64 位哈希。
  *
  * 定义（可独立复现）：h = 0xcbf29ce484222325，对输入字节流逐个执行
@@ -90,6 +107,41 @@ static contact **buckets_alloc(size_t n) {
 }
 
 /*
+ * 把全部节点重新挂到 want 个桶的新表上，并释放旧表。want 必须是 2 的幂。
+ * 返回 0 表示成功，-1 表示新表分配失败——此时旧表原样保留，调用方不需要
+ * 做任何清理。
+ *
+ * 扩容与收缩共用这一段，因为它们要做的事完全相同：换一张表，按新桶数重算
+ * 每个节点的下标。区别只在 want 是 nbuckets * 2 还是 nbuckets / 2。
+ *
+ * 重挂时只改 hash_next，不动 prev / next。
+ * 若这里连 prev/next 一起重排，链表顺序就变成"按桶分组"，
+ * 遍历顺序不再等于插入顺序，save 写出的文件也跟着变——
+ * 那是一条会破坏文件契约的捷径。
+ */
+static int index_rehash(contact_book *book, size_t want) {
+	contact **fresh = buckets_alloc(want);
+	contact  *item;
+
+	if (fresh == NULL) {
+		return -1;
+	}
+
+	for (item = book->head; item != NULL; item = item->next) {
+		size_t i = bucket_index(want, item->name);
+
+		item->hash_next = fresh[i];
+		fresh[i] = item;
+	}
+
+	free(book->buckets);
+	book->buckets  = fresh;
+	book->nbuckets = want;
+	book->rehashes++;
+	return 0;
+}
+
+/*
  * 为"即将插入一个节点"准备索引。返回 0 表示可用，-1 表示内存不足。
  *
  * 三种情况：
@@ -107,48 +159,54 @@ static contact **buckets_alloc(size_t n) {
  */
 static int index_prepare(contact_book *book) {
 	if (book->buckets == NULL) {
-		contact **fresh = buckets_alloc(CONTACTS_BUCKETS_MIN);
-
-		if (fresh == NULL) {
-			return -1;
-		}
-		book->buckets  = fresh;
-		book->nbuckets = CONTACTS_BUCKETS_MIN;
-		return 0;
+		return (index_rehash(book, CONTACTS_BUCKETS_MIN) == 0) ? 0 : -1;
 	}
 
 	if (book->count + 1u <= book->nbuckets) {
 		return 0;
 	}
 
-	{
-		size_t   want  = book->nbuckets * 2u;
-		contact **fresh = buckets_alloc(want);
-		contact  *item;
+	(void)index_rehash(book, book->nbuckets * 2u);   /* 失败就是降级，不影响返回值 */
+	return 0;
+}
 
-		if (fresh == NULL) {
-			return 0;       /* 降级：旧表继续用，语义不变 */
-		}
-
-		/*
-		 * 重挂时只改 hash_next，不动 prev/next。
-		 * 若这里连 prev/next 一起重排，链表顺序就变成"按桶分组"，
-		 * 遍历顺序不再等于插入顺序，save 写出的文件也跟着变——
-		 * 那是一条会破坏文件契约的捷径。
-		 */
-		for (item = book->head; item != NULL; item = item->next) {
-			size_t i = bucket_index(want, item->name);
-
-			item->hash_next = fresh[i];
-			fresh[i] = item;
-		}
-
-		free(book->buckets);
-		book->buckets  = fresh;
-		book->nbuckets = want;
+/*
+ * 按需收缩桶表。调用点在 contacts_remove 的末尾，也就是"删除已经完成、
+ * count 已经减一"之后。
+ *
+ * 三种情形：
+ *   1. 还没有索引（从未插入过，或上一次删空已经把表释放）：什么都不做；
+ *   2. count 归零：直接释放桶表，回到与 contacts_init 完全一致的状态。
+ *      头文件里 buckets == 0 的定义就是"还没有索引"，空表留着 64K 个桶
+ *      与这个约定不符，也与 contacts_clear 的语义不符；
+ *   3. 装载因子低于 1/4：桶数减半，直到条件不再成立或触到 CONTACTS_BUCKETS_MIN。
+ *
+ * 用 while 而不是 if，是因为一次删除可能跨过好几档：桶表 256 个桶、只剩
+ * 2 条记录时，减半到 128 之后 2 < 32 仍然成立，继续减半才对。正常使用时
+ * 每次删除只会减一档（装载因子从 1/4 降到 1/4 以下，减半后回到 1/2），
+ * 因此循环绝大多数情况下只跑一次判断。
+ *
+ * 减半的分配失败按降级处理：桶表保持原样，删除已经成功，语义不受影响——
+ * 与扩容失败同一套理由。因此本函数没有返回值。
+ */
+static void index_shrink(contact_book *book) {
+	if (book->buckets == NULL) {
+		return;
 	}
 
-	return 0;
+	if (book->count == 0) {
+		free(book->buckets);
+		book->buckets  = NULL;
+		book->nbuckets = 0;
+		return;
+	}
+
+	while (book->nbuckets > CONTACTS_BUCKETS_MIN
+	       && book->count < book->nbuckets / CONTACTS_SHRINK_DIV) {
+		if (index_rehash(book, book->nbuckets / 2u) != 0) {
+			return;     /* 降级：继续用当前这张表 */
+		}
+	}
 }
 
 void contacts_init(contact_book *book) {
@@ -160,6 +218,7 @@ void contacts_init(contact_book *book) {
 	book->count    = 0;
 	book->buckets  = NULL;
 	book->nbuckets = 0;
+	book->rehashes = 0;
 }
 
 void contacts_clear(contact_book *book) {
@@ -390,6 +449,15 @@ contacts_status contacts_remove(contact_book *book, const char *name) {
 
 	free(item);
 	book->count--;
+
+	/*
+	 * 删除会让装载因子下降，因此这里要给它一次收缩的机会。
+	 * 顺序不能反：先减 count 再判断，判据才是"删除之后"的真实状态。
+	 *
+	 * 收缩失败不回滚、也不报错：删除本身已经完成且语义正确，
+	 * 桶表偏大只是多占内存，不该让一次成功的删除变成失败。
+	 */
+	index_shrink(book);
 	return CONTACTS_OK;
 }
 
@@ -693,9 +761,10 @@ contacts_status contacts_index_get(const contact_book *book,
 	out->entries   = 0;
 	out->used      = 0;
 	out->max_chain = 0;
+	out->rehashes  = book->rehashes;
 
 	if (book->buckets == NULL) {
-		return CONTACTS_OK;     /* 还没有索引，四个值都是 0 */
+		return CONTACTS_OK;     /* 还没有索引，前四个值都是 0 */
 	}
 
 	out->buckets = book->nbuckets;

@@ -32,12 +32,16 @@ extern "C" {
  * ------------------------------------------------------------------
  * 1.1.0：加入哈希索引，contact 与 contact_book 各多出字段，
  *        ABI 不兼容（调用方必须与库一起重编），源码级兼容。
+ * 1.2.0：删除时按装载因子收缩桶表；新增重分配计数。
+ *        ABI 不兼容：contact_book 末尾多一个 size_t，contacts_index_stats
+ *        末尾也多一个；contact 本身没变。contact_book 由调用方在栈上分配，
+ *        因此库与调用方必须一起重编。
  */
 
 #define CONTACTS_VERSION_MAJOR 1
-#define CONTACTS_VERSION_MINOR 1
+#define CONTACTS_VERSION_MINOR 2
 #define CONTACTS_VERSION_PATCH 0
-#define CONTACTS_VERSION_STRING "1.1.0"
+#define CONTACTS_VERSION_STRING "1.2.0"
 
 /* ------------------------------------------------------------------
  * 字段容量
@@ -98,6 +102,7 @@ typedef struct {
 	size_t   count;
 	contact **buckets;    /* 桶数组，长度是 2 的幂；NULL 表示还没有索引 */
 	size_t   nbuckets;    /* 桶数量，0 表示还没有索引 */
+	size_t   rehashes;    /* 桶表重分配次数（扩容 + 收缩），从 contacts_init 起累计 */
 } contact_book;
 
 /* ------------------------------------------------------------------
@@ -202,6 +207,11 @@ contacts_status contacts_add(contact_book *book, const char *name, const char *p
  *
  * 删除后指针不再有效，调用方不要在删除之后继续使用之前拿到的
  * const contact *——这是释放后使用，ASan 会报 heap-use-after-free。
+ *
+ * 删除可能顺带把桶表减半（装载因子低于 1/4 时），这一次重挂是 O(n)，
+ * 但均摊到导致它发生的那些删除上仍是 O(1)。重挂只改桶链指针，不移动节点，
+ * 因此本次删除之外的其它 const contact * 仍然有效——不过这个保证不建议依赖：
+ * 需要跨删除持有指针的调用方应当假定指针已失效。
  */
 contacts_status contacts_remove(contact_book *book, const char *name);
 
@@ -324,21 +334,32 @@ contacts_status contacts_check_field(const char *value, size_t capacity);
 /*
  * 索引的当前统计。
  *
- * buckets   桶数量，0 表示还没有索引（空表，或首次插入就失败）
+ * buckets   桶数量，0 表示还没有索引（空表、删空之后，或首次插入就失败）
  * entries   索引里挂着的节点总数，正常情况下等于 contacts_count
  * used      非空桶的数量
  * max_chain 最长的一条桶链上的节点数
+ * rehashes  桶表重分配的累计次数（扩容 + 收缩），从 contacts_init 起算
  *
  * entries 与 contacts_count 不等，说明索引与链表已经不一致——
  * 这是断言用的不变量，不是可以忽略的统计噪声。
  *
- * 空表调用返回 CONTACTS_OK，四个字段全为 0。
+ * 桶数随插入与删除变化：装载因子超过 1.0 时翻倍，低于 1/4 时减半，
+ * 下限 16。因此"桶数"不是稳定的量，只有"桶数是 2 的幂""装载因子落在
+ * 1/4 到 1.0 之间"这两个性质可以断言。
+ *
+ * rehashes 用来回答"这套阈值会不会在边界上反复抖动"：抖动就是同一批数据
+ * 上重分配次数不断上涨。它是确定值，不像耗时那样受调度与机器频率影响，
+ * 因此适合写成断言而不是基准。
+ *
+ * 空表调用返回 CONTACTS_OK，五个字段全为 0（rehashes 只在 contacts_init
+ * 之后归零；contacts_clear 不重新分配，所以不清零）。
  */
 typedef struct {
 	size_t buckets;
 	size_t entries;
 	size_t used;
 	size_t max_chain;
+	size_t rehashes;
 } contacts_index_stats;
 
 contacts_status contacts_index_get(const contact_book *book,

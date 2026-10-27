@@ -143,6 +143,94 @@ typedef struct {
 	size_t               heap;      /* 建完这本书之后堆上占用的字节数 */
 } bench_row;
 
+/*
+ * 收缩的代价与收益。
+ *
+ * 与上面四列回答的问题不同：上面问"操作多快"，这里问"删掉大部分记录之后，
+ * 内存有没有还回去"。三个数字：桶数、堆占用、删除耗时。
+ *
+ * 抖动那一段专门跑"删一条、加一条"十万次，落点选在装载因子 0.5——
+ * 也就是收缩阈值若取 1/2 就会反复收缩膨胀的那个位置。桶表重分配的**次数**
+ * 取自 contacts_index_stats.rehashes，是确定值；耗时只作参考。
+ */
+static void bench_shrink(long n) {
+	contact_book         book;
+	contacts_index_stats before;
+	contacts_index_stats mid;
+	contacts_index_stats final;
+	size_t               heap_before;
+	size_t               heap_after;
+	double               t_remove;
+	double               t_churn;
+	size_t               rehash_base;
+	const long           keep = 1024;
+	char                 name[CONTACT_NAME_MAX];
+
+	contacts_init(&book);
+	for (long i = 0; i < n; i++) {
+		make_name(name, sizeof name, i);
+		if (contacts_add(&book, name, "13800000000") != CONTACTS_OK) {
+			(void)fprintf(stderr, "收缩基准：构建失败于 i=%ld\n", i);
+			contacts_destroy(&book);
+			return;
+		}
+	}
+	(void)contacts_index_get(&book, &before);
+	heap_before = heap_used();
+
+	t_remove = now_ms();
+	for (long i = n - 1; i >= keep; i--) {
+		make_name(name, sizeof name, i);
+		if (contacts_remove(&book, name) != CONTACTS_OK) {
+			(void)fprintf(stderr, "收缩基准：删除失败于 i=%ld\n", i);
+			contacts_destroy(&book);
+			return;
+		}
+	}
+	t_remove = now_ms() - t_remove;
+
+	(void)contacts_index_get(&book, &mid);
+	heap_after = heap_used();
+
+	/* 抖动：删掉一条再加回来，十万次，count 与桶数都应当纹丝不动 */
+	rehash_base = mid.rehashes;
+	t_churn = now_ms();
+	for (long k = 0; k < 100000; k++) {
+		make_name(name, sizeof name, 0);
+		if (contacts_remove(&book, name) != CONTACTS_OK) {
+			(void)fprintf(stderr, "收缩基准：抖动删除失败\n");
+			break;
+		}
+		if (contacts_add(&book, name, "13800000000") != CONTACTS_OK) {
+			(void)fprintf(stderr, "收缩基准：抖动插入失败\n");
+			break;
+		}
+	}
+	t_churn = now_ms() - t_churn;
+	(void)contacts_index_get(&book, &final);
+	rehash_base = final.rehashes - rehash_base;
+
+	(void)printf("\n收缩（n = %ld，删到 %ld 条，再抖动 %d 轮）\n\n", n, keep, 100000);
+	(void)printf("  桶数         建完 %lu -> 删完 %lu -> 抖动后 %lu\n",
+	             (unsigned long)before.buckets, (unsigned long)mid.buckets,
+	             (unsigned long)final.buckets);
+	(void)printf("  装载因子     %.2f -> %.2f -> %.2f\n",
+	             (before.buckets > 0)
+	                 ? (double)before.entries / (double)before.buckets : 0.0,
+	             (mid.buckets > 0)
+	                 ? (double)mid.entries / (double)mid.buckets : 0.0,
+	             (final.buckets > 0)
+	                 ? (double)final.entries / (double)final.buckets : 0.0);
+	(void)printf("  堆占用       %zu KiB -> %zu KiB\n",
+	             heap_before / 1024u, heap_after / 1024u);
+	(void)printf("  删除耗时     %ld 次 contacts_remove 共 %.1f ms（单次 %.2f µs）\n",
+	             n - keep, t_remove, t_remove * 1000.0 / (double)(n - keep));
+	(void)printf("  抖动         %d 次删一条加一条共 %.1f ms，桶表重分配 %zu 次（本轮）\n",
+	             100000, t_churn, rehash_base);
+
+	contacts_destroy(&book);
+}
+
 int main(void) {
 	static const long sizes[] = {1000, 4000, 16000, 64000};
 	const size_t      n_sizes = sizeof sizes / sizeof sizes[0];
@@ -217,6 +305,9 @@ int main(void) {
 	}
 
 	(void)remove(BENCH_FILE);
+
+	bench_shrink(sizes[n_sizes - 1]);
+
 	(void)printf("\nfind 一列做的是 2n 次查找（n 次命中 + n 次落空）。\n");
 	(void)printf("find(ns) 是单次查找平均耗时，包含命中的一次 strcmp。\n");
 	(void)printf("load 是 entries/buckets 的装载因子；超过 1.0 说明扩容分配失败，处于降级状态。\n");

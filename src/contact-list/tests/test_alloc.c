@@ -331,12 +331,209 @@ static void test_alloc_sweep(void) {
 	(void)printf("      扫描了 %ld 个分配点\n", points);
 }
 
+/* 从尾部删掉 make_name 的 [to, from) 这一段，返回实际删除条数 */
+static long remove_range(contact_book *book, long from, long to) {
+	char name[CONTACT_NAME_MAX];
+	long removed = 0;
+
+	for (long i = from - 1; i >= to; i--) {
+		make_name(name, sizeof name, i);
+		if (contacts_remove(book, name) == CONTACTS_OK) {
+			removed++;
+		}
+	}
+	return removed;
+}
+
+/*
+ * 收缩路径上的分配失败。
+ *
+ * 收缩与扩容共用 index_rehash，因此失败语义也应当一致：**只降级，不失败**。
+ * 删除已经完成、count 已经减一，此时返回 NOMEM 等于让调用方以为"没删掉"，
+ * 而实际上记录已经没了——这比桶表偏大严重得多。
+ *
+ * 因此这里断言的不是"返回了 OK"，而是"返回 OK 之后结构仍然自洽"：
+ * verify 会核对 count、遍历长度、索引 entries 三者相等，且剩余姓名全部可查。
+ */
+static void test_shrink_alloc(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	char                 name[CONTACT_NAME_MAX];
+	long                 base;
+
+	if (build(&book, 1024) != 0) {
+		expect_long("构造 1024 条", 0, 1);
+		contacts_destroy(&book);
+		return;
+	}
+
+	(void)remove_range(&book, 1024, 256);
+	(void)contacts_index_get(&book, &st);
+	expect_long("收缩点之前桶数 1024", (long)st.buckets, 1024);
+
+	/* 第 769 次删除恰好让装载因子低于 1/4，收缩要用的桶数组分配失败 */
+	base = (long)st.rehashes;
+	make_name(name, sizeof name, 255);
+	inject_at(0);
+	expect_status("收缩的桶数组分配失败，删除仍然成功",
+	              contacts_remove(&book, name), CONTACTS_OK);
+	inject_off();
+
+	(void)contacts_index_get(&book, &st);
+	expect_long("收缩失败后桶数仍是 1024", (long)st.buckets, 1024);
+	expect_long("收缩失败不计入重分配次数",
+	           (long)(st.rehashes - (size_t)base), 0);
+	verify("收缩失败后", &book, 255);
+
+	/* 再删一条会重试收缩，这次分配成功 */
+	base = (long)st.rehashes;
+	make_name(name, sizeof name, 254);
+	expect_status("下一次删除重试收缩", contacts_remove(&book, name), CONTACTS_OK);
+	(void)contacts_index_get(&book, &st);
+	expect_long("重试成功后桶数减半到 512", (long)st.buckets, 512);
+	expect_long("重试成功计入一次重分配",
+	            (long)(st.rehashes - (size_t)base), 1);
+	verify("收缩成功后", &book, 254);
+
+	contacts_destroy(&book);
+}
+
+/*
+ * 收缩的积压：连续多次失败之后，一次删除要补做多档。
+ *
+ * 这条用例专门覆盖 index_shrink 里的 while 而不是 if。若那里写成 if，
+ * 桶表停在 1024 而 count 已经降到 127，装载因子 0.12——功能仍然正确，
+ * 但"收缩"这件事实际上没做成，内存白占。
+ *
+ * 这也是唯一能把"一次删除跨两档"打出来的路径：正常运行中每次删除只让
+ * count 减一，装载因子不会一次跨过两个阈值。
+ */
+static void test_shrink_backlog(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	char                 name[CONTACT_NAME_MAX];
+	long                 base;
+
+	if (build(&book, 1024) != 0) {
+		expect_long("构造 1024 条（积压用例）", 0, 1);
+		contacts_destroy(&book);
+		return;
+	}
+
+	/* 每次删除都让收缩失败：桶表停在 1024，count 一路降到 128 */
+	for (long i = 1023; i >= 128; i--) {
+		make_name(name, sizeof name, i);
+		inject_at(0);
+		(void)contacts_remove(&book, name);
+		inject_off();
+	}
+
+	(void)contacts_index_get(&book, &st);
+	expect_long("连续收缩失败后 count 为 128", (long)contacts_count(&book), 128);
+	expect_long("连续收缩失败后桶数仍是 1024", (long)st.buckets, 1024);
+	verify("连续收缩失败后", &book, 128);
+
+	/* 分配恢复：127 < 1024/4 且 127 < 512/4，一次删除应当连减两档 */
+	base = (long)st.rehashes;
+	make_name(name, sizeof name, 127);
+	expect_status("积压的收缩在分配恢复后补做",
+	              contacts_remove(&book, name), CONTACTS_OK);
+	(void)contacts_index_get(&book, &st);
+	expect_long("一次删除连减两档到 256", (long)st.buckets, 256);
+	expect_long("连减两档计入两次重分配",
+	            (long)(st.rehashes - (size_t)base), 2);
+	verify("积压收缩补做后", &book, 127);
+
+	contacts_destroy(&book);
+}
+
+/*
+ * 滞回：同一个名字在收缩阈值上反复增删，桶表不该反复重分配。
+ *
+ * 场景特意落在装载因子**正好 0.25**：count = 256、桶数 1024。这是收缩判据
+ * 只差一条的位置：删到 255 收缩一次，桶数变 512，装载因子回到 0.5；
+ * 之后无论怎么增删都停在 0.5 到 1.0 之间，不再重分配。
+ *
+ * 判据用 contacts_index_stats 的 rehashes 增量，而不是耗时：重分配次数是
+ * 确定值，耗时受调度与机器频率影响。
+ *
+ * 这一组用例在把阈值改成 1/2 时会失败，但失败的不是"抖动"——
+ * 实测 2000 轮"删一条加一条"在两种阈值下都只有 1 次重分配（扩容判据是
+ * "插入后条数 > 桶数"，减半后 count <= nbuckets-1，要连插两条才会再扩容）。
+ * 真正被抓的是"抖动后装载因子回到 0.5"这一条：取 1/2 时收缩后装载因子是
+ * 1.0，表是满的。教训是别把教科书结论当成本实现的性质，先量再说。
+ *
+ * 为什么不用 "--wrap=calloc 数调用次数"：`-O2` 下 GCC 会把
+ * `malloc(n)` 紧跟 `memset(p, 0, n)` 合并成 `calloc(1, n)`（两者可观察行为
+ * 相同，变换合法），而 contacts_add 正好是"malloc 节点 + 全零"这种写法。
+ * 于是节点分配也走了 calloc，计数里混进了每条记录的分配，实测每轮恒为 1，
+ * 看不出桶表到底有没有被重新分配。计数器放进模块里才可靠。
+ */
+static void test_shrink_no_thrash(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	char                 name[CONTACT_NAME_MAX];
+	char                 phone[CONTACT_PHONE_MAX];
+	long                 base;
+	long                 reallocs;
+
+	if (build(&book, 1024) != 0) {
+		expect_long("构造 1024 条（滞回用例）", 0, 1);
+		contacts_destroy(&book);
+		return;
+	}
+
+	/* 删到 256 条：装载因子正好 1/4，桶数仍是 1024 */
+	(void)remove_range(&book, 1024, 256);
+	(void)contacts_index_get(&book, &st);
+	expect_long("抖动起点 count 为 256", (long)contacts_count(&book), 256);
+	expect_long("抖动起点桶数为 1024", (long)st.buckets, 1024);
+
+	/* 第一轮：删一条越过阈值，收缩一次；加回去之后不该再动 */
+	base = (long)st.rehashes;
+	for (long k = 0; k < 2000; k++) {
+		make_name(name, sizeof name, 255);
+		(void)contacts_remove(&book, name);
+
+		make_name(name, sizeof name, 255);
+		make_phone(phone, sizeof phone, 255);
+		(void)contacts_add(&book, name, phone);
+	}
+	(void)contacts_index_get(&book, &st);
+	reallocs = (long)st.rehashes - base;
+
+	expect_long("2000 次跨阈值增删只重分配 1 次", reallocs, 1);
+	expect_long("抖动后 count 仍为 256", (long)contacts_count(&book), 256);
+	expect_long("抖动后桶数收缩到 512", (long)st.buckets, 512);
+	expect_long("抖动后装载因子回到 0.5",
+	           (long)(st.entries * 2u == st.buckets), 1);
+	verify("抖动后", &book, 256);
+
+	/* 第二轮：这时的状态已经在滞回带里面，一次都不该再重分配 */
+	base = (long)st.rehashes;
+	for (long k = 0; k < 1000; k++) {
+		make_name(name, sizeof name, 255);
+		(void)contacts_remove(&book, name);
+
+		make_name(name, sizeof name, 255);
+		make_phone(phone, sizeof phone, 255);
+		(void)contacts_add(&book, name, phone);
+	}
+	(void)contacts_index_get(&book, &st);
+	reallocs = (long)st.rehashes - base;
+
+	expect_long("稳定后再抖 1000 次没有重分配", reallocs, 0);
+	expect_long("稳定后桶数仍为 512", (long)st.buckets, 512);
+	verify("稳定后", &book, 256);
+
+	contacts_destroy(&book);
+}
+
 /*
  * load 中途内存不足：必须返回 NOMEM，而不是把剩下的行全部记成
  * "格式坏行"再返回 CONTACTS_OK——后者让调用方无法区分"文件里有坏行"
  * 与"进程快没内存了"，而两者的处置完全不同。
- */
-static void test_load_alloc(void) {
+ */static void test_load_alloc(void) {
 	char                 path[] = "bin/tmp_alloc_load.txt";
 	char                 name[CONTACT_NAME_MAX];
 	FILE                *fp;
@@ -399,6 +596,9 @@ int main(void) {
 	test_first_node_alloc();
 	test_growth_alloc();
 	test_alloc_sweep();
+	test_shrink_alloc();
+	test_shrink_backlog();
+	test_shrink_no_thrash();
 	test_load_alloc();
 
 	(void)printf("\n%ld 项检查，%ld 项失败\n", g_checks, g_failures);

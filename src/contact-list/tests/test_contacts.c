@@ -871,6 +871,162 @@ static void test_index_scale(void) {
 
 /* ---------------------------------------------------------------- */
 
+/*
+ * 从尾部按名字删掉 user[to, from) 这一段，返回实际删除条数。
+ * 倒序删：桶链是头插，倒序删除先删到链首，与正序删除覆盖的位置不同。
+ */
+static long remove_names(contact_book *book, long from, long to) {
+	char name[32];
+	long removed = 0;
+
+	for (long i = from - 1; i >= to; i--) {
+		(void)snprintf(name, sizeof name, "user%04ld", i);
+		if (contacts_remove(book, name) == CONTACTS_OK) {
+			removed++;
+		}
+	}
+	return removed;
+}
+
+static void add_names(contact_book *book, long n) {
+	char name[32];
+
+	for (long i = 0; i < n; i++) {
+		(void)snprintf(name, sizeof name, "user%04ld", i);
+		(void)contacts_add(book, name, "138");
+	}
+}
+
+/*
+ * 收缩：删除把装载因子压到 1/4 以下时，桶数减半。
+ *
+ * 这一组用例盯四个数：
+ *   1. 阈值的**边界**——256/1024 恰好等于 1/4 时不收缩，255 才收缩。
+ *      差一条的边界是最容易写错的地方（`<` 写成 `<=` 就会在 1/4 处多缩一次）。
+ *   2. 减半之后索引与链表仍然一致：entries、count、遍历长度三者相等。
+ *   3. 遍历顺序不受影响——重挂只改 hash_next，链表的 prev/next 一根不动，
+ *      因此 save 写出的文件与收缩前逐字节相同。
+ *   4. 空表回到 buckets == 0，与新建的表状态一致；再插入能重新建索引。
+ */
+static void test_index_shrink(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	char                 path[] = "bin/tmp_test_shrink.txt";
+	const contact       *item;
+	char                 name[32];
+	long                 i;
+	long                 in_order = 0;
+
+	contacts_init(&book);
+	add_names(&book, 1024);
+
+	(void)contacts_index_get(&book, &st);
+	expect_int("收缩：1024 条时桶数 1024", (long)st.buckets, 1024);
+	/* 建表 1 次 + 扩容 6 次（16→32→64→128→256→512→1024） */
+	expect_int("收缩：建 1024 条共重分配 7 次", (long)st.rehashes, 7);
+
+	/* 删到 256 条：装载因子正好 1/4，判据是"低于"，此处不该收缩 */
+	expect_int("收缩：删掉 768 条", remove_names(&book, 1024, 256), 768);
+	expect_int("收缩：剩余 256 条", (long)contacts_count(&book), 256);
+	(void)contacts_index_get(&book, &st);
+	expect_int("收缩：装载因子 1/4 时不收缩", (long)st.buckets, 1024);
+	expect_int("收缩：不收缩时 entries 等于 count", (long)st.entries, 256);
+
+	/* 再删一条：255 < 1024/4，桶数减半 */
+	expect_int("收缩：删掉第 769 条", remove_names(&book, 256, 255), 1);
+	(void)contacts_index_get(&book, &st);
+	expect_int("收缩：装载因子低于 1/4 时桶数减半", (long)st.buckets, 512);
+	expect_int("收缩后 entries 等于 count", (long)st.entries, 255);
+	expect_int("收缩后桶数仍是 2 的幂", is_pow2(st.buckets), 1);
+	expect_int("收缩后装载因子回到 1/2 附近",
+	           (long)(st.entries * 4u >= st.buckets), 1);
+
+	/* 继续删到 127：跨过 512/4 = 128 这条线，桶数再减半 */
+	expect_int("收缩：删到 127 条", remove_names(&book, 255, 127), 128);
+	(void)contacts_index_get(&book, &st);
+	expect_int("收缩：127 条时桶数 256", (long)st.buckets, 256);
+	expect_int("收缩：127 条时 entries 为 127", (long)st.entries, 127);
+
+	/* 顺序：剩下的必须是 user0000..user0126，且按插入顺序排列 */
+	for (item = contacts_first(&book), i = 0;
+	     item != NULL;
+	     item = contacts_next(item), i++) {
+		(void)snprintf(name, sizeof name, "user%04ld", i);
+		if (strcmp(item->name, name) == 0) {
+			in_order++;
+		}
+	}
+	expect_int("收缩后遍历顺序仍是插入顺序", in_order, 127);
+	expect_int("收缩后遍历长度是 127", i, 127);
+
+	/*
+	 * 文件契约：收缩只重挂桶链，链表一根不动，因此写出的内容必须与
+	 * "插入了 127 条、从未删过"的表逐字节相同。
+	 */
+	expect_status("收缩后保存", contacts_save(&book, path), CONTACTS_OK);
+	{
+		FILE *fp = fopen(path, "r");
+		long  lines = 0;
+		int   first_ok = 0;
+
+		if (fp != NULL) {
+			char line[256];
+
+			while (fgets(line, (int)sizeof line, fp) != NULL) {
+				if (lines == 0
+				    && strcmp(line, "name: user0000, phone: 138\n") == 0) {
+					first_ok = 1;
+				}
+				lines++;
+			}
+			(void)fclose(fp);
+		}
+		expect_int("收缩后保存的行数是 127", lines, 127);
+		expect_int("收缩后保存的第一行不变", first_ok, 1);
+	}
+	(void)remove(path);
+
+	/* 继续删到 3 条：一路减半到下限 16 */
+	expect_int("收缩：删到 3 条", remove_names(&book, 127, 3), 124);
+	(void)contacts_index_get(&book, &st);
+	expect_int("收缩：3 条时触到下限 16", (long)st.buckets, 16);
+	expect_int("收缩：3 条时 entries 为 3", (long)st.entries, 3);
+	/* 扩容 6 次 + 建表 1 次 + 收缩 6 次（1024→512→256→128→64→32→16） */
+	expect_int("收缩：累计重分配 13 次", (long)st.rehashes, 13);
+	expect_int("收缩：3 条时仍能查到 user0002",
+	           contacts_find(&book, "user0002") != NULL, 1);
+
+	/* 下限之下不再收缩：1 条时仍是 16 个桶 */
+	expect_int("收缩：删到 1 条", remove_names(&book, 3, 1), 2);
+	(void)contacts_index_get(&book, &st);
+	expect_int("收缩：1 条时桶数不低于下限", (long)st.buckets, 16);
+
+	/* 删空：桶表整块释放，回到 buckets == 0，与新建的表一致 */
+	expect_int("收缩：删掉最后一条", remove_names(&book, 1, 0), 1);
+	(void)contacts_index_get(&book, &st);
+	expect_int("删空后桶数归 0", (long)st.buckets, 0);
+	expect_int("删空后 entries 归 0", (long)st.entries, 0);
+	expect_int("删空后 used 归 0", (long)st.used, 0);
+	expect_int("删空后 count 归 0", (long)contacts_count(&book), 0);
+	expect_int("删空后 find 落空",
+	           contacts_find(&book, "user0000") == NULL, 1);
+
+	/*
+	 * 删空之后再插入：重建索引，条数为 1、桶数为 16。
+	 * 这条用例挡的是"删空时忘了把 nbuckets 清零"——那种实现会让下一次
+	 * 插入用到一张已释放的桶表，ASan 会直接报 heap-use-after-free。
+	 */
+	expect_status("删空后重新插入",
+	              contacts_add(&book, "user0000", "139"), CONTACTS_OK);
+	(void)contacts_index_get(&book, &st);
+	expect_int("删空后重新插入，桶数 16", (long)st.buckets, 16);
+	expect_int("删空后重新插入，entries 为 1", (long)st.entries, 1);
+
+	contacts_destroy(&book);
+}
+
+/* ---------------------------------------------------------------- */
+
 int main(int argc, char *argv[]) {
 	if (argc > 1) {
 		g_testdata = argv[1];
@@ -898,6 +1054,7 @@ int main(int argc, char *argv[]) {
 	test_status_string();
 	test_index_lifecycle();
 	test_index_scale();
+	test_index_shrink();
 
 	(void)printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);
 	return (g_failures == 0) ? 0 : 1;

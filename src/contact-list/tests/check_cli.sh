@@ -167,6 +167,43 @@ rm -f "$WORK/sample_c.txt"
 check_eq "c.txt 的电话不带字段标签" "name: king, phone: 344567754" \
          "$("$CLI" -f "$WORK/sample_c.txt" find king 2>/dev/null)"
 
+# ---------------------------------------------------------------- 7. 索引统计
+# stats 把内部索引状态暴露到命令行上，让"桶数会不会随删除收缩"这类行为
+# 可以被直接看到，而不是只能从耗时反推。
+stats_of() {
+	# $1 工作文件  $2 字段名
+	"$CLI" -f "$1" stats 2>/dev/null | sed -n "s/^$2:[[:space:]]*//p"
+}
+
+check_eq "空表的 buckets 为 0" "0" "$(stats_of "$WORK/empty_stats.txt" buckets)"
+check_eq "空表的 load 为 n/a" "n/a" "$(stats_of "$WORK/empty_stats.txt" load)"
+
+check_eq "stats 的 count 与 count 子命令一致" \
+         "$("$CLI" -f "$BOOK" count 2>/dev/null)" "$(stats_of "$BOOK" count)"
+check_eq "2 条时桶数为 16" "16" "$(stats_of "$BOOK" buckets)"
+check_eq "2 条时 entries 等于 count" "2" "$(stats_of "$BOOK" entries)"
+
+# 批量载入 20 条：插入超过 16 条时扩容一次，桶数 32
+i=1
+: > "$WORK/many.txt"
+while [ "$i" -le 20 ]; do
+	printf 'name: u%02d, phone: 138%08d\n' "$i" "$i" >> "$WORK/many.txt"
+	i=$((i + 1))
+done
+
+rm -f "$WORK/bulk.txt"
+"$CLI" -f "$WORK/bulk.txt" load "$WORK/many.txt" -r >/dev/null 2>&1
+check_eq "20 条时桶数为 32" "32" "$(stats_of "$WORK/bulk.txt" buckets)"
+
+i=1
+while [ "$i" -le 17 ]; do
+	"$CLI" -f "$WORK/bulk.txt" del "$(printf 'u%02d' "$i")" >/dev/null 2>&1
+	i=$((i + 1))
+done
+check_eq "删到 3 条后 count 为 3" "3" "$(stats_of "$WORK/bulk.txt" count)"
+check_eq "删到 3 条后桶数收缩到下限 16" "16" "$(stats_of "$WORK/bulk.txt" buckets)"
+check_eq "收缩后 entries 仍等于 count" "3" "$(stats_of "$WORK/bulk.txt" entries)"
+
 # ---------------------------------------------------------------- 汇总
 echo
 if [ "$failed" -eq 0 ]; then

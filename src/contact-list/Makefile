@@ -101,7 +101,9 @@ sanitize-run: all $(TESTBIN) $(ALLOCBIN)
 	@$(CLI) -f $(OUT)/asan_book.txt add alice 13900001111
 	@$(CLI) -f $(OUT)/asan_book.txt add bob 13800002222
 	@$(CLI) -f $(OUT)/asan_book.txt list
+	@$(CLI) -f $(OUT)/asan_book.txt stats
 	@$(CLI) -f $(OUT)/asan_book.txt del alice
+	@$(CLI) -f $(OUT)/asan_book.txt stats
 	@$(CLI) -f $(OUT)/asan_book.txt load $(TESTDATA)/c.txt -r
 	@$(CLI) -f $(OUT)/asan_book.txt list
 	@echo "\n--- 错误路径 ---"
