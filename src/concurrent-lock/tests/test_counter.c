@@ -48,11 +48,17 @@ static void expect_status(const char *name, counter_status got, counter_status w
 	(void)printf("ok    %s\n", name);
 }
 
-/* 报告一个值，不判定对错（用于 raw 的结果） */
+/*
+ * 报告一个值，不判定对错（用于 raw 的结果）。
+ * 与 test_raw_demonstrates_loss 一起被 COUNTER_TEST_SKIP_RAW 关掉：
+ * 它唯一的调用者就在那段条件编译里，单独留着会报 -Wunused-function。
+ */
+#ifndef COUNTER_TEST_SKIP_RAW
 static void report_value(const char *name, long long got, long long want) {
 	(void)printf("info  %-46s 实际 %lld（期望 %lld，差 %lld）\n",
 	             name, got, want, want - got);
 }
+#endif
 
 /* ---------------------------------------------------------------- */
 
