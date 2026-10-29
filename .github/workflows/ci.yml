@@ -186,7 +186,10 @@ jobs:
             CFLAGS='-std=c11 -Wall -Wextra -Wconversion -Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes -O2 -g -pthread' \
             2>&1 | tee /tmp/strict.log || rc=$?
           total=$(grep -c 'warning:' /tmp/strict.log || true)
-          castq=$(grep -c 'Wcast-qual' /tmp/strict.log || true)
+          # 只数"告警行里的 -Wcast-qual"。不能直接 grep -c 'Wcast-qual'：
+          # make 会把每条编译命令回显出来，命令行里也含这个旗标，
+          # 于是统计值比告警总数还大（实测 25 > 12）。
+          castq=$(grep 'warning:' /tmp/strict.log | grep -c 'Wcast-qual' || true)
           other=$((total - castq))
           echo "加严警告构建：$total 条警告，其中 -Wcast-qual $castq 条（不判定），其余 $other 条（make 退出码 $rc）" >> /tmp/ci-summary.txt
           if [ $rc -ne 0 ]; then

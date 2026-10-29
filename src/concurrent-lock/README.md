@@ -297,6 +297,15 @@ cc -std=c11 -Wall -Wextra -O2 -pthread -Iinclude your_app.c bin/libcounter.a -o 
 | `make sanitize` | 0 条 |
 | `make tsan` | 0 条 |
 
+`make tsan` 这一行到 2026-10-29 才真正成立。TSan 构建用 `-DCOUNTER_TEST_SKIP_RAW`
+关掉了 raw 用例——它故意制造数据竞争，开着必然报错——但只关了 `main` 里的调用点，
+没关函数的定义。于是 `test_raw_demonstrates_loss` 与它专用的 `report_value`
+成了没有引用的 `static` 函数，GCC 报 `-Wunused-function`。
+
+这个缺陷此前没有暴露的原因不在模块里：根 `Makefile` 一直没有 `tsan` 转发目标，
+只有单个模块自己定义了它，所以全仓构建从不走这条路径。2026-10-29 补上根目标、
+CI 第一次跑全仓 `make tsan` 时才发现。修法是把两个定义也纳入同一个条件编译块。
+
 ### 5.2 单元测试
 
 `make test`，68 项检查：
@@ -568,6 +577,12 @@ ARMv8.1 的 `LDADD`；RISC-V 用 `amoadd`。指令形式完全不同，不能共
 - [ ] 用 `perf stat` 采集 cache-miss 与总线锁次数，把"spin 为什么慢"从机制解释变成数据证据
 - [ ] 在 1/2/4/8/16/32 线程下各跑一遍，画出吞吐随线程数变化的曲线，找拐点
 - [ ] 补"内存占用"一行——现在表格里只有时间和吞吐
+- [ ] 把 `mtx.lock` / `spin.lock` 移出 `counter` 对象（改为指向单独分配的
+      `sync` 块），消掉 `counter_get` 里两处 `-Wcast-qual` 转型。
+      C 没有 `mutable`，让 `const counter *` 上的读既能加锁、又不丢弃 `const`
+      的唯一办法，是让锁成为"指针指向的、本身非 const 的对象"。
+      目前那两处转型按 C11 6.7.3p6 是良定义的（对象由 `create` 分配、
+      调用方持有非 const 句柄），所以 CI 只计数不判定失败
 
 ---
 

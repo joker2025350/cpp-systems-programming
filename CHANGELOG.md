@@ -12,6 +12,99 @@
 
 ---
 
+## 2026-10-29
+
+### thread-pool
+
+- 有界队列与提交背压，1.1.0（代码在 10-28 写完，本节记录 10-29 的验证结果）。
+  1.0.0 只有无界队列：提交速度持续高于消费速度时，队列与任务节点线性增长，
+  最后在某一次 `submit` 里以 `malloc` 失败收场，调用方没有回退路径。
+  新增 `threadpool_create_bounded` / `threadpool_submit_wait` /
+  `threadpool_capacity` / `threadpool_backpressure` 与状态码 `TPOOL_ERR_FULL`
+  （枚举末尾，旧值不变；句柄不透明，无 ABI 破坏）。结构上加第三个条件变量
+  `space`、`max_queued` / `waiting` / `backpressure` 三个字段。
+- 两处不改就会出错的细节：`destroy` 必须等 `waiting` 归零才释放池，
+  否则被唤醒的提交方还持着已释放的互斥量（C11 6.2.4p2，对象生存期已结束）；
+  `submit_wait` 醒来必须重查 `closed`，漏掉即把任务塞进停机中的池，
+  提交方拿到 `OK` 而任务永不执行。工作线程调用 `submit_wait` 时满队列直接
+  `FULL`，不等待空位——取任务的只有工作线程，都去等空位就没人消费，必然死锁。
+- 驱动层加 `bounded` 子命令（`-c 容量`，阻塞提交，输出 `capacity=` /
+  `backpressure=`）；`check_cli.sh` 加 8 项；`bench` 加第 4 组，
+  `fork` 两个子进程分别跑无界与容量 64（`ru_maxrss` 是进程级高水位，
+  同一进程内连跑两组，第二个数一定包含第一个的峰值）。
+- 测试 54 → **109 项**（新增 6 组用例：参数与容量、满即失败、阻塞提交、
+  工作线程不等待、4×500 生产者采样队列深度、destroy 唤醒阻塞提交方）。
+  用例通过"闸门"构造"队列此刻恰好处在满/非满"这个事实，不靠 `sleep` 猜时序；
+  闸门自带超时，实现有缺陷时报 FAIL 而不是把 `make test` 挂死。
+- 实测（4 vCPU CI 运行器，`make bench` 第 4 组，1 个工作线程，每任务忙等 3 µs，
+  提交 20 万）：无界 8.5 ~ 9.9 ms、队列深度峰值 197008 ~ 197540、RSS 6964 ~ 7092 KiB；
+  容量 64 时 852 ~ 887 ms、深度硬性 64、背压 101409 ~ 107864 次、RSS 1204 KiB
+  （内存省 5.8 倍，代价是提交端被串行化）。
+
+### 测试与验证（thread-pool 的验证通道换成 CI）
+
+- 10-28 写完之后内网 Ubuntu 连不上（本机换了网段），本机也没有任何 Linux 工具链，
+  于是把验证搬到 GitHub Actions：`ubuntu-22.04`、gcc 11.4.0，与各模块 README
+  记录的编译器同版本。选这个镜像的理由写进 workflow 文件头：换到 24.04（gcc 13）
+  会引入新警告，已经写进文档的"0 条警告"就不再成立于同一前提。
+- 第一次真跑抓到 11 项断言失败，**全部在测试代码里，实现一行没改**：
+  闸门用 `clock_gettime(CLOCK_MONOTONIC)` 构造截止时间，而
+  `pthread_cond_timedwait` 按条件变量自身的时钟解释它，默认是 `CLOCK_REALTIME`
+  （POSIX `pthread_condattr_getclock` 的默认值）。monotonic 的值是"开机以来的
+  时长"，当成 1970 年的时间点必然已经过去，`timedwait` 立刻返回 `ETIMEDOUT`——
+  闸门从不阻塞，退化成空操作，于是"满队列"被瞬间排空、"背压计数"恒为 0。
+  修法：`pthread_condattr_setclock(CLOCK_MONOTONIC)`，并让闸门记录 `timed_out`，
+  在"闸门本应按住"的用例里断言它没被兜底超时放开（这条断言即回归检查）。
+- TSan 报的一处 data race 也在测试里：`workerprobe.status` 由工作线程写、
+  主线程在 `sleep_ms(50)` 之后读。`sleep` 不建立 happens-before，
+  两条访问仍构成数据竞争（C11 5.1.2.4p25 的"冲突"定义不看实际是否交叠）。
+  改为工作线程 release 存储 `done`、主线程 acquire 读等待它。
+- 流水线本身也有一个缺陷：`make test 2>&1 | tee log` 的退出状态取管道最后一段
+  （`tee`，恒为 0），不加 `set -o pipefail` 时测试失败而步骤报绿。第一轮的
+  11 项失败因此只体现在报告文字里、没有体现在运行结论上。
+
+### CI
+
+- 新增 `.github/workflows/ci.yml`：默认构建、单元测试、`check`、ASan+UBSan、
+  TSan、`bench`、加严警告构建，零警告与 sanitizer 干净作为硬条件；
+  `SKIP=mysql-client`（需要客户端头文件与活的服务器，`check-live` / `check-scale`
+  依赖真实数据库）。同一分支的新 push 取消旧运行。
+- 汇总写到 `ci-reports` 分支（每次提交一个文件）。原因：Actions 日志读取要凭据，
+  仓库内容不用，报告落在仓库里才是任何人都能查的构建记录；
+  代码分支的 diff 也因此不被机器产物污染。失败时把日志尾部一并写进汇总，
+  否则"失败"这个事实只能靠人猜。
+- `-Wcast-qual` 单独计数、不判定失败：`const` 查询函数要给同步原语加锁，
+  而 `pthread_mutex_lock` 的形参非 `const`；按 C11 6.7.3p6，只要对象本身不是
+  `const` 限定的，通过转型丢弃 `const` 再修改它是良定义的（`counter` 与
+  `threadpool` 都由 `create` 分配、调用方持有非 const 句柄）。
+  彻底消掉要把同步原语移出对象（C 没有 `mutable`），已记入两个模块的待办。
+- 统计口径踩过一个坑：想数"-Wcast-qual 有几条"不能 `grep -c 'Wcast-qual'`，
+  make 回显的编译命令里也含这个旗标，实测数出 25 条而告警总数只有 12 条。
+  只数"告警行里的 `-Wcast-qual`"才对。
+
+### 根 Makefile
+
+- 补 `tsan` 转发目标：此前只有单个模块定义了 `tsan`，根入口没有，
+  于是 `concurrent-lock` 从没在 TSan 下构建过。加上之后第一次构建就报两处
+  `-Wunused-function`——raw 施加例故意制造数据竞争，TSan 构建用
+  `-DCOUNTER_TEST_SKIP_RAW` 把它从 `main` 里关掉，但只关了调用点，
+  没关 `static` 函数的定义（`test_raw_demonstrates_loss`、`report_value`）。
+  把定义纳入同一个条件编译块，两种构建都干净。
+
+### 全仓验证（CI，2026-10-29，ubuntu-22.04 / gcc 11.4.0）
+
+- 默认构建 0 警告；加严警告（追加 `-Wpedantic -Wundef -Wvla -Wformat=2
+  -Wshadow -Wstrict-prototypes -Wmissing-prototypes`）0 条，
+  另有 12 条 `-Wcast-qual` 记录在案、不参与判定。
+- `make test` 全仓 **892 项 0 失败**：concurrent-lock 68、contact-list 209 + 注入 466、
+  thread-pool 109、word-count 40。mysql-client 被 `SKIP` 排除，其 119 项不在其中。
+- `make check`：contact-list 30 项、thread-pool 30 项、word-count 的两个脚本
+  （`wc` 对照 6 项、并行与顺序 28 项比对）全部一致。
+- `make sanitize`：0 警告，同一套 892 项全过，无 ASan / UBSan / LSan 报告。
+- `make tsan`：0 警告，concurrent-lock 67 项（raw 用例按设计关闭）、
+  thread-pool 109 项、word-count 40 项，无 data race 报告。
+- `src/*/testdata/*` 未改动：本次 diff 里没有任何 testdata 路径，字节数仍是原值。
+
 ## 2026-10-27
 
 ### contact-list
