@@ -1,19 +1,24 @@
 # ============================================================
 # 持续集成：在一块真实的 Linux 上把三种构建完整跑一遍
 #
-# 为什么需要它：这台仓库的每一处改动都要求"在 Linux 上真实编译并运行过"，
-# 而改动是在 Windows 上写的。之前靠一台内网 Ubuntu 机器远程验证，
-# 那台机器与代码之间没有可追溯的记录；换成 CI 之后，
-# 每次 push 都留下一份可回溯、可复现的构建与测试记录。
+# 为什么需要它：这个仓库的改动是在 Windows 上写的，而每一处改动都要求
+# "在 Linux 上真实编译并运行过"。之前靠一台内网 Ubuntu 机器远程验证，
+# 那台机器与代码之间不留任何可追溯的记录；换成 CI 之后每次 push 都留下
+# 一份可回溯、可复现的构建与测试记录。
 #
-# 为什么钉在 ubuntu-22.04：它自带 gcc 11.4.0，与文档里各模块
-# "测试与验证"一节记录的编译器版本一致。换到 24.04（gcc 13）会引入
-# 一批新警告，那些已经写进文档的"0 条警告"就不再成立于同一前提之下。
-# 要在更新的编译器上验证是另一件事，应当单独做、单独记录。
+# 为什么钉在 ubuntu-22.04：它自带 gcc 11.4.0，与各模块 README 里
+# "测试与验证"一节记录的编译器版本一致。换到 24.04（gcc 13）会引入一批
+# 新警告，那些已经写进文档的"0 条警告"就不再成立于同一前提之下。
+# 要覆盖更新的编译器是另一件事，应当单独做、单独记录。
 #
 # 为什么 SKIP=mysql-client：该模块需要 libmysqlclient 头文件与一个可连的
-# 服务器实例，CI 里没有；它的 check-live / check-scale 依赖真实数据库。
+# 数据库实例，CI 里没有；它的 check-live / check-scale 依赖真实服务器。
 # 根 Makefile 的 SKIP 变量就是为这种情况准备的。
+#
+# 为什么报告走独立分支：GitHub 只允许带凭据读 Actions 日志，
+# 而不带凭据能读的是仓库内容。把汇总写进 ci-reports 分支，
+# 任何人事后都能直接读，也不必给仓库塞凭据。
+# 代码分支因此不会被机器产物污染。
 # ============================================================
 
 name: ci
@@ -42,7 +47,6 @@ jobs:
 
     env:
       SKIP: mysql-client
-      # sanitizer 报告里带符号名才好定位，所以统一开 -g（模块 Makefile 已有）。
       ASAN_OPTIONS: detect_leaks=1:abort_on_error=0
       UBSAN_OPTIONS: print_stacktrace=1
       TSAN_OPTIONS: halt_on_error=0
@@ -57,72 +61,107 @@ jobs:
           make --version | head -1
           echo "nproc=$(nproc)"
 
-      # 零警告是硬性要求，所以每条构建命令都先把输出落到文件，
-      # 再数一遍 "warning:" 的条数。make 自己返回 0 不代表没有警告。
+      # 零警告是硬性要求。make 自己返回 0 不代表没有警告，
+      # 所以每条构建命令都先把输出落到文件，再数一遍 "warning:" 的条数。
+      #
+      # 每个失败路径都要把日志尾部搬进汇总：Actions 的日志读出来要凭据，
+      # 而这份汇总会被推到 ci-reports 分支，是唯一不依赖凭据的通道。
+      # 失败时不带上下文，等于把"失败"这个事实单独留给人猜。
       - name: 默认构建（零警告）
         run: |
-          set -o pipefail
-          make 2>&1 | tee /tmp/build.log
+          rc=0
+          make 2>&1 | tee /tmp/build.log || rc=$?
           n=$(grep -c 'warning:' /tmp/build.log || true)
-          echo "默认构建：$n 条警告" | tee -a /tmp/ci-summary.txt
+          echo "默认构建：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          if [ $rc -ne 0 ]; then
+            { echo "!! 默认构建失败，最后 60 行："; tail -60 /tmp/build.log; } >> /tmp/ci-summary.txt
+            exit $rc
+          fi
+          if [ "$n" -ne 0 ]; then
+            { echo "!! 默认构建出现 $n 条警告："; grep 'warning:' /tmp/build.log | head -20; } >> /tmp/ci-summary.txt
+            exit 1
+          fi
 
       - name: 单元测试
         run: |
-          set -o pipefail
-          make test 2>&1 | tee /tmp/test.log
-          grep -E '检查项|^==> ' /tmp/test.log >> /tmp/ci-summary.txt || true
+          rc=0
+          make test 2>&1 | tee /tmp/test.log || rc=$?
+          grep -E '^==> |检查项' /tmp/test.log >> /tmp/ci-summary.txt || true
+          if [ $rc -ne 0 ]; then
+            { echo "!! 单元测试失败，最后 80 行："; tail -80 /tmp/test.log; } >> /tmp/ci-summary.txt
+            exit $rc
+          fi
 
       - name: 命令行端到端检查
         run: |
-          set -o pipefail
-          make check 2>&1 | tee /tmp/check.log
-          grep -E '检查项|^==> ' /tmp/check.log >> /tmp/ci-summary.txt || true
+          rc=0
+          make check 2>&1 | tee /tmp/check.log || rc=$?
+          grep -E '^==> |检查项' /tmp/check.log >> /tmp/ci-summary.txt || true
+          if [ $rc -ne 0 ]; then
+            { echo "!! 命令行检查失败，最后 80 行："; tail -80 /tmp/check.log; } >> /tmp/ci-summary.txt
+            exit $rc
+          fi
 
       - name: ASan + UBSan
         run: |
-          set -o pipefail
-          make sanitize 2>&1 | tee /tmp/sanitize.log
+          rc=0
+          make sanitize 2>&1 | tee /tmp/sanitize.log || rc=$?
           n=$(grep -c 'warning:' /tmp/sanitize.log || true)
-          echo "ASan+UBSan 构建：$n 条警告" | tee -a /tmp/ci-summary.txt
-          # sanitizer 报错时进程以非 0 退出、make 随之失败，上面已由 pipefail 兜住；
-          # 这里再兜一层"报告出现在输出里但退出码没传上来"的情况。
-          if grep -qE 'ERROR: (Address|Leak)Sanitizer|runtime error:' /tmp/sanitize.log; then
-            echo "::error::sanitizer 有报告"
+          echo "ASan+UBSan：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          if [ $rc -ne 0 ] || grep -qE 'ERROR: (Address|Leak)Sanitizer|runtime error:' /tmp/sanitize.log; then
+            { echo "!! sanitizer 失败或报错，最后 80 行："; tail -80 /tmp/sanitize.log; } >> /tmp/ci-summary.txt
+            exit 1
+          fi
+          if [ "$n" -ne 0 ]; then
+            { echo "!! sanitizer 构建出现 $n 条警告"; grep 'warning:' /tmp/sanitize.log | head -20; } >> /tmp/ci-summary.txt
             exit 1
           fi
 
       - name: ThreadSanitizer
         run: |
-          set -o pipefail
-          make tsan 2>&1 | tee /tmp/tsan.log
+          rc=0
+          make tsan 2>&1 | tee /tmp/tsan.log || rc=$?
           n=$(grep -c 'warning:' /tmp/tsan.log || true)
-          echo "TSan 构建：$n 条警告" | tee -a /tmp/ci-summary.txt
-          if grep -q 'WARNING: ThreadSanitizer' /tmp/tsan.log; then
-            echo "::error::TSan 报告了 data race"
+          echo "TSan：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          if [ $rc -ne 0 ] || grep -q 'WARNING: ThreadSanitizer' /tmp/tsan.log; then
+            { echo "!! TSan 失败或报 data race，最后 80 行："; tail -80 /tmp/tsan.log; } >> /tmp/ci-summary.txt
+            exit 1
+          fi
+          if [ "$n" -ne 0 ]; then
+            { echo "!! TSan 构建出现 $n 条警告"; grep 'warning:' /tmp/tsan.log | head -20; } >> /tmp/ci-summary.txt
             exit 1
           fi
 
       - name: 基准
         run: |
-          set -o pipefail
-          make bench 2>&1 | tee /tmp/bench.log
+          rc=0
+          make bench 2>&1 | tee /tmp/bench.log || rc=$?
+          if [ $rc -ne 0 ]; then
+            { echo "!! 基准失败，最后 40 行："; tail -40 /tmp/bench.log; } >> /tmp/ci-summary.txt
+            exit $rc
+          fi
 
       # 放在最后：它要先 make clean，否则共用 bin/ 时 make 只比时间戳、
       # 认为目标已是最新，一套新选项根本不会生效。
       - name: 加严警告构建（零警告）
         run: |
-          set -o pipefail
+          rc=0
           make clean >/dev/null
           make \
-            CFLAGS='-std=c11 -Wall -Wextra -Wconversion -Wpedantic -Wcast-qual \
-                    -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes \
-                    -Wmissing-prototypes -O2 -g -pthread' \
-            2>&1 | tee /tmp/strict.log
+            CFLAGS='-std=c11 -Wall -Wextra -Wconversion -Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes -O2 -g -pthread' \
+            2>&1 | tee /tmp/strict.log || rc=$?
           n=$(grep -c 'warning:' /tmp/strict.log || true)
-          echo "加严警告构建：$n 条警告" | tee -a /tmp/ci-summary.txt
+          echo "加严警告构建：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          if [ $rc -ne 0 ]; then
+            { echo "!! 加严警告构建失败，最后 60 行："; tail -60 /tmp/strict.log; } >> /tmp/ci-summary.txt
+            exit $rc
+          fi
+          if [ "$n" -ne 0 ]; then
+            { echo "!! 加严警告构建出现 $n 条警告："; grep 'warning:' /tmp/strict.log | head -20; } >> /tmp/ci-summary.txt
+            exit 1
+          fi
 
       # 无论前面成败都写报告：失败时更需要这份记录。
-      # 报告走独立分支而不是提交到代码分支，代码分支的 diff 才不会被机器产物污染。
       - name: 汇总到 ci-reports 分支
         if: always()
         env:
@@ -130,10 +169,11 @@ jobs:
         run: |
           mkdir -p /tmp/report
           {
-            echo "sha:    $GITHUB_SHA"
-            echo "ref:    $GITHUB_REF_NAME"
-            echo "run:    $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "sha:      $GITHUB_SHA"
+            echo "ref:      $GITHUB_REF_NAME"
+            echo "run:      $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "compiler: $(gcc --version | head -1)"
+            echo "result:   ${{ job.status }}"
             echo
             echo "== 步骤 =="
             cat /tmp/ci-summary.txt 2>/dev/null || echo "(无汇总)"
