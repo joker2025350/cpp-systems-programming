@@ -20,6 +20,7 @@
 #include "threadpool.h"
 
 #include <pthread.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,12 @@ static long atomic_inc(long *p) {
 
 static long atomic_load(const long *p) {
 	return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+
+/* 释放存储：把"在此之前写下的普通字段"与这个标志位的置位捆绑发布出去。
+ * 与 wait_for_count 里的 ACQUIRE 读配对，构成一次 release/acquire 同步。 */
+static void atomic_store_release(long *p, long v) {
+	__atomic_store_n(p, v, __ATOMIC_RELEASE);
 }
 
 /* ---------------------------------------------------------------- */
@@ -208,12 +215,53 @@ typedef struct {
 	pthread_mutex_t mu;
 	pthread_cond_t  cv;
 	int             open;
+	int             timed_out;   /* 兜底超时被触发过：说明闸门没按住 */
 } gate;
 
 static void gate_init(gate *g) {
+	pthread_condattr_t attr;
+	int                attr_ok = 0;
+	int                rc;
+
+	g->open      = 0;
+	g->timed_out = 0;
+
 	(void)pthread_mutex_init(&g->mu, NULL);
-	(void)pthread_cond_init(&g->cv, NULL);
-	g->open = 0;
+
+	/*
+	 * 条件变量的时钟必须显式设成 CLOCK_MONOTONIC。
+	 *
+	 * pthread_cond_timedwait 的截止时间按"条件变量自身的时钟"解释，而这个时钟
+	 * 默认是 CLOCK_REALTIME（POSIX：pthread_condattr_getclock 的默认值即
+	 * CLOCK_REALTIME）。若拿 clock_gettime(CLOCK_MONOTONIC) 的返回值当截止时间
+	 * 传进去，它表示的是"开机以来的时长"（例如 5000 秒），会被当成 1970-01-01
+	 * 的某个时刻——早已过去，于是 timedwait 立刻返回 ETIMEDOUT，闸门一个任务
+	 * 都拦不住，退化成空操作。
+	 *
+	 * 这个错误不会有任何编译期或运行期提示：闸门照样"工作"，只是从不阻塞，
+	 * 依赖它的断言全部改测另一种状态。本仓库第一次跑 CI 时就栽在这里——
+	 * 有界队列的 11 项断言失败，而实现本身是对的。
+	 *
+	 * 选 MONOTONIC 而不是把 deadline 改成 CLOCK_REALTIME：后者会被系统时间
+	 * 调整（NTP 步进）影响，一次向后的步进就能让 max_ms 变成任意长的等待，
+	 * 而 max_ms 存在的意义正是"实现有缺陷时不要把测试挂死"。
+	 */
+	rc = pthread_condattr_init(&attr);
+	if (rc == 0) {
+		attr_ok = 1;
+		rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+	}
+	if (rc == 0) {
+		rc = pthread_cond_init(&g->cv, &attr);
+	}
+	if (attr_ok != 0) {
+		(void)pthread_condattr_destroy(&attr);
+	}
+	if (rc != 0) {
+		/* 初始化失败不静默：退化成默认时钟继续跑，但把失败记成一条断言 */
+		expect_true("闸门条件变量支持 CLOCK_MONOTONIC", 0);
+		(void)pthread_cond_init(&g->cv, NULL);
+	}
 }
 
 static void gate_release(gate *g) {
@@ -225,6 +273,7 @@ static void gate_release(gate *g) {
 
 static void gate_wait(gate *g, int max_ms) {
 	struct timespec deadline;
+	int             rc = 0;
 
 	(void)pthread_mutex_lock(&g->mu);
 
@@ -237,9 +286,13 @@ static void gate_wait(gate *g, int max_ms) {
 	}
 
 	while (!g->open) {
-		if (pthread_cond_timedwait(&g->cv, &g->mu, &deadline) != 0) {
+		rc = pthread_cond_timedwait(&g->cv, &g->mu, &deadline);
+		if (rc != 0) {
 			break;   /* 超时或出错：不再等，让测试继续跑到断言处 */
 		}
+	}
+	if (rc == ETIMEDOUT && g->open == 0) {
+		g->timed_out = 1;
 	}
 
 	(void)pthread_mutex_unlock(&g->mu);
@@ -280,6 +333,7 @@ typedef struct {
 	threadpool *pool;
 	gate       *go;        /* 主线程把队列填满后放行 */
 	long        reached;   /* 已进入任务（主线程据此确认工作线程就位） */
+	long        done;      /* status / wait_ms 写完之后才置位 */
 	tpool_status status;
 	double      wait_ms;   /* submit_wait 自身的耗时 */
 } workerprobe;
@@ -297,6 +351,14 @@ static void task_worker_probe(void *arg) {
 	t0 = now_ms();
 	w->status  = threadpool_submit_wait(w->pool, task_nop, NULL);
 	w->wait_ms = now_ms() - t0;
+
+	/*
+	 * status 与 wait_ms 是普通字段，主线程也要读它们。让主线程 sleep 一段时间
+	 * 再来读是不够的：sleep 不建立任何 happens-before，两条访问仍构成数据竞争
+	 * （C11 5.1.2.4p25 的"冲突"定义不看实际是否交叠）。这里用 release 存储
+	 * 发布这两个字段，主线程用 wait_for_count 的 acquire 读收下它们。
+	 */
+	atomic_store_release(&w->done, 1);
 }
 
 /* 阻塞提交：主线程在队列满时调用 submit_wait，记录它等了多久 */
@@ -339,12 +401,17 @@ static void *bounded_producer_main(void *arg) {
 }
 
 /* 自旋等待某个计数达到目标值，最多 timeout_ms。仅用于等待"工作线程已就位"这类
- * 由本测试自己构造的前置条件，不用于断言性能。 */
+ * 由本测试自己构造的前置条件，不用于断言性能。
+ *
+ * 这里用 __ATOMIC_ACQUIRE 读，不是为了读到新值，而是为了建立"看到标志位之后，
+ * 标志位之前写下的那些字段也可见"的 happens-before 关系。用 relaxed 读只能
+ * 保证计数本身不撕裂，随后去读任务写下的普通字段仍然是一次数据竞争
+ * （C11 5.1.2.4p25）。 */
 static int wait_for_count(const long *p, long want, int timeout_ms) {
 	double end = now_ms() + (double)timeout_ms;
 
 	while (now_ms() < end) {
-		if (atomic_load(p) >= want) {
+		if (__atomic_load_n(p, __ATOMIC_ACQUIRE) >= want) {
 			return 0;
 		}
 		sleep_ms(1);
@@ -839,6 +906,10 @@ static void test_bounded_full(void) {
 	expect_int("第二次排空后 completed == 容量 + 2",
 	           (long long)threadpool_completed(p), CAP + 2);
 
+	/* 闸门按设计应该一直按住到 gate_release 为止。若它被兜底超时放开，
+	 * 上面那些"队列已满"的断言测的就不是满队列了，所以这条单独记一笔。 */
+	expect_true("闸门一直按住（未被兜底超时放开）", g.timed_out == 0);
+
 	threadpool_destroy(p);
 	gate_destroy(&g);
 }
@@ -909,6 +980,7 @@ static void test_bounded_submit_wait_blocks(void) {
 	(void)threadpool_wait(p);
 	expect_int("四个任务全部执行", (long long)threadpool_completed(p), CAP + 2);
 	expect_int("背压计数最终为 1", (long long)threadpool_backpressure(p), 1);
+	expect_true("闸门一直按住（未被兜底超时放开）", g.timed_out == 0);
 
 	threadpool_destroy(p);
 	gate_destroy(&g);
@@ -943,6 +1015,7 @@ static void test_worker_submit_wait_does_not_block(void) {
 	w.pool    = NULL;
 	w.go      = &go_gate;
 	w.reached = 0;
+	w.done    = 0;
 	w.status  = TPOOL_ERR_CLOSED;   /* 哨兵：不是任何合法返回值 */
 	w.wait_ms = 0.0;
 	filler.index = 0;
@@ -967,7 +1040,10 @@ static void test_worker_submit_wait_does_not_block(void) {
 	expect_int("队列已满（1/1）", (long long)threadpool_queued(p), 1);
 
 	gate_release(&go_gate);
-	sleep_ms(50);
+
+	/* 等探针任务走完 submit_wait 再读它的结果。这里必须真的等 done，
+	 * 不能用 sleep 代替：读 status 时若工作线程正在写它，就是数据竞争。 */
+	expect_int("探针任务已返回", wait_for_count(&w.done, 1, 2000) == 0 ? 1 : 0, 1);
 
 	expect_status("工作线程调用 submit_wait 返回 TPOOL_ERR_FULL",
 	              w.status, TPOOL_ERR_FULL);

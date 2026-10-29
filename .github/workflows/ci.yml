@@ -69,6 +69,9 @@ jobs:
       # 失败时不带上下文，等于把"失败"这个事实单独留给人猜。
       - name: 默认构建（零警告）
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make 2>&1 | tee /tmp/build.log || rc=$?
           n=$(grep -c 'warning:' /tmp/build.log || true)
@@ -84,6 +87,9 @@ jobs:
 
       - name: 单元测试
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make test 2>&1 | tee /tmp/test.log || rc=$?
           grep -E '^==> |检查项' /tmp/test.log >> /tmp/ci-summary.txt || true
@@ -94,6 +100,9 @@ jobs:
 
       - name: 命令行端到端检查
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make check 2>&1 | tee /tmp/check.log || rc=$?
           grep -E '^==> |检查项' /tmp/check.log >> /tmp/ci-summary.txt || true
@@ -104,6 +113,9 @@ jobs:
 
       - name: ASan + UBSan
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make sanitize 2>&1 | tee /tmp/sanitize.log || rc=$?
           n=$(grep -c 'warning:' /tmp/sanitize.log || true)
@@ -119,6 +131,9 @@ jobs:
 
       - name: ThreadSanitizer
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make tsan 2>&1 | tee /tmp/tsan.log || rc=$?
           n=$(grep -c 'warning:' /tmp/tsan.log || true)
@@ -134,6 +149,9 @@ jobs:
 
       - name: 基准
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make bench 2>&1 | tee /tmp/bench.log || rc=$?
           if [ $rc -ne 0 ]; then
@@ -145,6 +163,9 @@ jobs:
       # 认为目标已是最新，一套新选项根本不会生效。
       - name: 加严警告构建（零警告）
         run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
+          set -o pipefail
           rc=0
           make clean >/dev/null
           make \
