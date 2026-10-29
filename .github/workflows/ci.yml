@@ -92,7 +92,9 @@ jobs:
           set -o pipefail
           rc=0
           make test 2>&1 | tee /tmp/test.log || rc=$?
-          grep -E '^==> |检查项' /tmp/test.log >> /tmp/ci-summary.txt || true
+          # 各模块的汇总行措辞不同：thread-pool 是"检查项 N，失败 M"，
+          # 其余模块是"N 项检查，M 项失败"。两种都要抓，否则报告里只剩模块名。
+          grep -E '^==> |项检查|检查项' /tmp/test.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ]; then
             { echo "!! 单元测试失败，最后 80 行："; tail -80 /tmp/test.log; } >> /tmp/ci-summary.txt
             exit $rc
@@ -105,7 +107,7 @@ jobs:
           set -o pipefail
           rc=0
           make check 2>&1 | tee /tmp/check.log || rc=$?
-          grep -E '^==> |检查项' /tmp/check.log >> /tmp/ci-summary.txt || true
+          grep -E '^==> |项检查|检查项' /tmp/check.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ]; then
             { echo "!! 命令行检查失败，最后 80 行："; tail -80 /tmp/check.log; } >> /tmp/ci-summary.txt
             exit $rc
@@ -120,6 +122,7 @@ jobs:
           make sanitize 2>&1 | tee /tmp/sanitize.log || rc=$?
           n=$(grep -c 'warning:' /tmp/sanitize.log || true)
           echo "ASan+UBSan：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          grep -E '^==> |项检查|检查项|项全过' /tmp/sanitize.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ] || grep -qE 'ERROR: (Address|Leak)Sanitizer|runtime error:' /tmp/sanitize.log; then
             { echo "!! sanitizer 失败或报错，最后 80 行："; tail -80 /tmp/sanitize.log; } >> /tmp/ci-summary.txt
             exit 1
@@ -138,6 +141,7 @@ jobs:
           make tsan 2>&1 | tee /tmp/tsan.log || rc=$?
           n=$(grep -c 'warning:' /tmp/tsan.log || true)
           echo "TSan：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          grep -E '^==> |项检查|检查项|项全过' /tmp/tsan.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ] || grep -q 'WARNING: ThreadSanitizer' /tmp/tsan.log; then
             { echo "!! TSan 失败或报 data race，最后 80 行："; tail -80 /tmp/tsan.log; } >> /tmp/ci-summary.txt
             exit 1

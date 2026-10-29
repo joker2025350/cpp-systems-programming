@@ -250,7 +250,13 @@ static void test_multi_thread_exact(void) {
  * 属于未定义行为，理论上结果可以是任何东西。要求它"一定丢更新"
  * 本身就是一条没有标准依据的断言。这个用例的作用是留下观测记录，
  * 不是判定对错。
+ *
+ * 定义本身也要跟着 main 里的调用点一起被 COUNTER_TEST_SKIP_RAW 关掉：
+ * 只关调用点的话，TSan 构建下这个 static 函数没有任何引用，
+ * GCC 报 -Wunused-function。这条警告是根 Makefile 补上 tsan 目标、
+ * CI 第一次跑 make tsan 时暴露出来的——在那之前没人用 TSan 构建过这个模块。
  */
+#ifndef COUNTER_TEST_SKIP_RAW
 static void test_raw_demonstrates_loss(void) {
 	const int       threads    = 8;
 	const long long per_thread = 200000;
@@ -280,6 +286,7 @@ static void test_raw_demonstrates_loss(void) {
 
 	counter_destroy(c);
 }
+#endif /* COUNTER_TEST_SKIP_RAW */
 
 static void test_kind_helpers(void) {
 	expect_true("raw 不是原子的", counter_kind_is_atomic(COUNTER_KIND_RAW) == 0);
