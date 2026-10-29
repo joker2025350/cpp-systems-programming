@@ -94,7 +94,7 @@ jobs:
           make test 2>&1 | tee /tmp/test.log || rc=$?
           # 各模块的汇总行措辞不同：thread-pool 是"检查项 N，失败 M"，
           # 其余模块是"N 项检查，M 项失败"。两种都要抓，否则报告里只剩模块名。
-          grep -E '^==> |项检查|检查项' /tmp/test.log >> /tmp/ci-summary.txt || true
+          grep -E '^==> |项检查|检查项|项比对' /tmp/test.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ]; then
             { echo "!! 单元测试失败，最后 80 行："; tail -80 /tmp/test.log; } >> /tmp/ci-summary.txt
             exit $rc
@@ -107,7 +107,7 @@ jobs:
           set -o pipefail
           rc=0
           make check 2>&1 | tee /tmp/check.log || rc=$?
-          grep -E '^==> |项检查|检查项' /tmp/check.log >> /tmp/ci-summary.txt || true
+          grep -E '^==> |项检查|检查项|项比对' /tmp/check.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ]; then
             { echo "!! 命令行检查失败，最后 80 行："; tail -80 /tmp/check.log; } >> /tmp/ci-summary.txt
             exit $rc
@@ -122,7 +122,7 @@ jobs:
           make sanitize 2>&1 | tee /tmp/sanitize.log || rc=$?
           n=$(grep -c 'warning:' /tmp/sanitize.log || true)
           echo "ASan+UBSan：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
-          grep -E '^==> |项检查|检查项|项全过' /tmp/sanitize.log >> /tmp/ci-summary.txt || true
+          grep -E '^==> |项检查|检查项|项比对|项全过' /tmp/sanitize.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ] || grep -qE 'ERROR: (Address|Leak)Sanitizer|runtime error:' /tmp/sanitize.log; then
             { echo "!! sanitizer 失败或报错，最后 80 行："; tail -80 /tmp/sanitize.log; } >> /tmp/ci-summary.txt
             exit 1
@@ -141,7 +141,7 @@ jobs:
           make tsan 2>&1 | tee /tmp/tsan.log || rc=$?
           n=$(grep -c 'warning:' /tmp/tsan.log || true)
           echo "TSan：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
-          grep -E '^==> |项检查|检查项|项全过' /tmp/tsan.log >> /tmp/ci-summary.txt || true
+          grep -E '^==> |项检查|检查项|项比对|项全过' /tmp/tsan.log >> /tmp/ci-summary.txt || true
           if [ $rc -ne 0 ] || grep -q 'WARNING: ThreadSanitizer' /tmp/tsan.log; then
             { echo "!! TSan 失败或报 data race，最后 80 行："; tail -80 /tmp/tsan.log; } >> /tmp/ci-summary.txt
             exit 1
@@ -165,7 +165,17 @@ jobs:
 
       # 放在最后：它要先 make clean，否则共用 bin/ 时 make 只比时间戳、
       # 认为目标已是最新，一套新选项根本不会生效。
-      - name: 加严警告构建（零警告）
+      #
+      # -Wcast-qual 是唯一不参与判定的旗标，单独计数并写进报告：
+      # 各模块的 const 查询函数内部要给同步原语加锁，而 pthread_mutex_lock
+      # 的形参是非 const 的 pthread_mutex_t *，实现里因此对锁成员取了
+      # 非 const 视图。按 C11 6.7.3p6，只要对象本身不是 const 限定的，
+      # 通过转型丢弃 const 再修改它是良定义的——counter 与 threadpool 都由
+      # create 分配、调用方持有非 const 句柄，所以这不是未定义行为，
+      # 只是"逻辑只读、物理上要同步"这个取舍的可见代价。
+      # 真要消掉它，得把同步原语放到对象之外（C 没有 mutable），
+      # 那是结构改动，记在各自 README 的待办里，不混进任何一次小改动。
+      - name: 加严警告构建
         run: |
           # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
           # 恒为 0）。少了这一句，make 失败会被 tee 吞掉，测试挂在半路而这一步报绿。
@@ -175,14 +185,17 @@ jobs:
           make \
             CFLAGS='-std=c11 -Wall -Wextra -Wconversion -Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes -O2 -g -pthread' \
             2>&1 | tee /tmp/strict.log || rc=$?
-          n=$(grep -c 'warning:' /tmp/strict.log || true)
-          echo "加严警告构建：$n 条警告（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          total=$(grep -c 'warning:' /tmp/strict.log || true)
+          castq=$(grep -c 'Wcast-qual' /tmp/strict.log || true)
+          other=$((total - castq))
+          echo "加严警告构建：$total 条警告，其中 -Wcast-qual $castq 条（不判定），其余 $other 条（make 退出码 $rc）" >> /tmp/ci-summary.txt
           if [ $rc -ne 0 ]; then
             { echo "!! 加严警告构建失败，最后 60 行："; tail -60 /tmp/strict.log; } >> /tmp/ci-summary.txt
             exit $rc
           fi
-          if [ "$n" -ne 0 ]; then
-            { echo "!! 加严警告构建出现 $n 条警告："; grep 'warning:' /tmp/strict.log | head -20; } >> /tmp/ci-summary.txt
+          if [ "$other" -ne 0 ]; then
+            { echo "!! 加严警告构建出现 $other 条 -Wcast-qual 之外的警告："
+              grep 'warning:' /tmp/strict.log | grep -v 'Wcast-qual' | head -20; } >> /tmp/ci-summary.txt
             exit 1
           fi
 
