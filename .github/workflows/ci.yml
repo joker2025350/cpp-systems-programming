@@ -1,0 +1,152 @@
+# ============================================================
+# 持续集成：在一块真实的 Linux 上把三种构建完整跑一遍
+#
+# 为什么需要它：这台仓库的每一处改动都要求"在 Linux 上真实编译并运行过"，
+# 而改动是在 Windows 上写的。之前靠一台内网 Ubuntu 机器远程验证，
+# 那台机器与代码之间没有可追溯的记录；换成 CI 之后，
+# 每次 push 都留下一份可回溯、可复现的构建与测试记录。
+#
+# 为什么钉在 ubuntu-22.04：它自带 gcc 11.4.0，与文档里各模块
+# "测试与验证"一节记录的编译器版本一致。换到 24.04（gcc 13）会引入
+# 一批新警告，那些已经写进文档的"0 条警告"就不再成立于同一前提之下。
+# 要在更新的编译器上验证是另一件事，应当单独做、单独记录。
+#
+# 为什么 SKIP=mysql-client：该模块需要 libmysqlclient 头文件与一个可连的
+# 服务器实例，CI 里没有；它的 check-live / check-scale 依赖真实数据库。
+# 根 Makefile 的 SKIP 变量就是为这种情况准备的。
+# ============================================================
+
+name: ci
+
+on:
+  push:
+    # ci-reports 是本工作流自己写报告用的分支，不参与构建，
+    # 否则"推送报告"会再触发一次"构建 → 推送报告"。
+    branches-ignore:
+      - ci-reports
+  pull_request:
+
+# 同一分支上新的推送取消旧的一次，避免排队
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最后一步要把汇总写到 ci-reports 分支，需要写权限。
+# GITHUB_TOKEN 的默认权限是只读，这里显式申请。
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+
+    env:
+      SKIP: mysql-client
+      # sanitizer 报告里带符号名才好定位，所以统一开 -g（模块 Makefile 已有）。
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=0
+      UBSAN_OPTIONS: print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链信息
+        run: |
+          uname -a
+          gcc --version | head -1
+          make --version | head -1
+          echo "nproc=$(nproc)"
+
+      # 零警告是硬性要求，所以每条构建命令都先把输出落到文件，
+      # 再数一遍 "warning:" 的条数。make 自己返回 0 不代表没有警告。
+      - name: 默认构建（零警告）
+        run: |
+          set -o pipefail
+          make 2>&1 | tee /tmp/build.log
+          n=$(grep -c 'warning:' /tmp/build.log || true)
+          echo "默认构建：$n 条警告" | tee -a /tmp/ci-summary.txt
+
+      - name: 单元测试
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee /tmp/test.log
+          grep -E '检查项|^==> ' /tmp/test.log >> /tmp/ci-summary.txt || true
+
+      - name: 命令行端到端检查
+        run: |
+          set -o pipefail
+          make check 2>&1 | tee /tmp/check.log
+          grep -E '检查项|^==> ' /tmp/check.log >> /tmp/ci-summary.txt || true
+
+      - name: ASan + UBSan
+        run: |
+          set -o pipefail
+          make sanitize 2>&1 | tee /tmp/sanitize.log
+          n=$(grep -c 'warning:' /tmp/sanitize.log || true)
+          echo "ASan+UBSan 构建：$n 条警告" | tee -a /tmp/ci-summary.txt
+          # sanitizer 报错时进程以非 0 退出、make 随之失败，上面已由 pipefail 兜住；
+          # 这里再兜一层"报告出现在输出里但退出码没传上来"的情况。
+          if grep -qE 'ERROR: (Address|Leak)Sanitizer|runtime error:' /tmp/sanitize.log; then
+            echo "::error::sanitizer 有报告"
+            exit 1
+          fi
+
+      - name: ThreadSanitizer
+        run: |
+          set -o pipefail
+          make tsan 2>&1 | tee /tmp/tsan.log
+          n=$(grep -c 'warning:' /tmp/tsan.log || true)
+          echo "TSan 构建：$n 条警告" | tee -a /tmp/ci-summary.txt
+          if grep -q 'WARNING: ThreadSanitizer' /tmp/tsan.log; then
+            echo "::error::TSan 报告了 data race"
+            exit 1
+          fi
+
+      - name: 基准
+        run: |
+          set -o pipefail
+          make bench 2>&1 | tee /tmp/bench.log
+
+      # 放在最后：它要先 make clean，否则共用 bin/ 时 make 只比时间戳、
+      # 认为目标已是最新，一套新选项根本不会生效。
+      - name: 加严警告构建（零警告）
+        run: |
+          set -o pipefail
+          make clean >/dev/null
+          make \
+            CFLAGS='-std=c11 -Wall -Wextra -Wconversion -Wpedantic -Wcast-qual \
+                    -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes \
+                    -Wmissing-prototypes -O2 -g -pthread' \
+            2>&1 | tee /tmp/strict.log
+          n=$(grep -c 'warning:' /tmp/strict.log || true)
+          echo "加严警告构建：$n 条警告" | tee -a /tmp/ci-summary.txt
+
+      # 无论前面成败都写报告：失败时更需要这份记录。
+      # 报告走独立分支而不是提交到代码分支，代码分支的 diff 才不会被机器产物污染。
+      - name: 汇总到 ci-reports 分支
+        if: always()
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/report
+          {
+            echo "sha:    $GITHUB_SHA"
+            echo "ref:    $GITHUB_REF_NAME"
+            echo "run:    $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "compiler: $(gcc --version | head -1)"
+            echo
+            echo "== 步骤 =="
+            cat /tmp/ci-summary.txt 2>/dev/null || echo "(无汇总)"
+            echo
+            echo "== 基准 =="
+            tail -80 /tmp/bench.log 2>/dev/null || echo "(未跑)"
+          } > "/tmp/report/${GITHUB_SHA}.txt"
+
+          cd /tmp/report
+          git init -q
+          git config user.name  "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout -q -b ci-reports
+          git add -A
+          git commit -qm "ci report ${GITHUB_SHA}"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:ci-reports

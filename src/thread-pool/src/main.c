@@ -5,11 +5,14 @@
  * 在每次构建时都被验证一次。
  *
  * 子命令：
- *   run   [-t 线程数] [-n 任务数] [-w 每个任务的忙等毫秒]
- *   spawn [-n 任务数]        对照组：每个任务新建一个线程
+ *   run     [-t 线程数] [-n 任务数] [-w 每个任务的忙等毫秒]
+ *   bounded [-t 线程数] [-c 队列上限] [-n 任务数] [-w 每个任务的忙等毫秒]
+ *   spawn   [-n 任务数]        对照组：每个任务新建一个线程
  *   help
  *
  * run 与 spawn 用同一份任务函数与同一份工作量，两者的耗时可以直接比较。
+ * bounded 与 run 的区别只在创建方式与提交方式：有界队列 + 阻塞式提交，
+ * 因此可以观察背压计数。
  */
 
 #include "threadpool.h"
@@ -56,10 +59,11 @@ static void job_entry(void *arg) {
 static void usage(const char *prog) {
 	printf("用法：%s <命令> [选项]\n\n", prog);
 	printf("命令：\n");
-	printf("  run   [-t 线程数] [-n 任务数] [-w 每任务忙等毫秒]   用线程池执行\n");
-	printf("  spawn [-n 任务数] [-w 每任务忙等毫秒]              每任务新建线程（对照）\n");
-	printf("  help                                              显示本页\n\n");
-	printf("默认：-t 4 -n 16 -w 0\n");
+	printf("  run     [-t 线程数] [-n 任务数] [-w 每任务忙等毫秒]       用线程池执行\n");
+	printf("  bounded [-t 线程数] [-c 队列上限] [-n 任务数] [-w 毫秒]   有界队列 + 阻塞提交\n");
+	printf("  spawn   [-n 任务数] [-w 每任务忙等毫秒]                   每任务新建线程（对照）\n");
+	printf("  help                                                      显示本页\n\n");
+	printf("默认：-t 4 -c 8 -n 16 -w 0\n");
 }
 
 static int parse_int(const char *s, int *out) {
@@ -153,8 +157,85 @@ done:
 	return rc;
 }
 
-/* 对照组：每个任务 pthread_create 一个线程，join 之后才算完成 */
+/*
+ * 有界队列版本：与 cmd_run 用同一份任务函数与工作量，区别只有两点 ——
+ * 创建时给队列上限，提交用阻塞式接口。
+ *
+ * 输出的 capacity / backpressure 是这条路径唯一的可观测证据：
+ * 只报耗时的话，"提交端被背压挡住"与"任务本身慢"看起来完全一样。
+ */
+static int cmd_bounded(int nthreads, int capacity, int ntasks, double work_ms) {
+	threadpool *p    = NULL;
+	job        *jobs = NULL;
+	double      t0;
+	double      t1;
+	int         rc   = 1;
 
+	if (threadpool_create_bounded(nthreads, (size_t)capacity, &p) != TPOOL_OK) {
+		(void)fprintf(stderr, "threadpool_create_bounded 失败\n");
+		return 1;
+	}
+
+	jobs = (job *)calloc((size_t)ntasks, sizeof *jobs);
+	if (jobs == NULL) {
+		(void)fprintf(stderr, "calloc 失败\n");
+		threadpool_destroy(p);
+		return 1;
+	}
+
+	printf("有界线程池：%d 个工作线程，队列上限 %d，提交 %d 个任务，每任务忙等 %.2f ms\n",
+	       nthreads, capacity, ntasks, work_ms);
+
+	t0 = now_ms();
+	for (int i = 0; i < ntasks; i++) {
+		tpool_status st;
+
+		jobs[i].index   = i;
+		jobs[i].work_ms = work_ms;
+		st = threadpool_submit_wait(p, job_entry, &jobs[i]);
+		if (st != TPOOL_OK) {
+			(void)fprintf(stderr, "第 %d 个任务提交失败：%s\n",
+			              i, threadpool_status_string(st));
+			goto done;
+		}
+	}
+	(void)threadpool_wait(p);
+	t1 = now_ms();
+
+	{
+		int bad = 0;
+
+		for (int i = 0; i < ntasks; i++) {
+			long long want = (long long)i * (long long)i + 1;
+
+			if (jobs[i].checksum != want) {
+				bad++;
+			}
+		}
+		printf("校验：%d 个任务结果正确，%d 个不正确\n", ntasks - bad, bad);
+		if (bad != 0) {
+			goto done;
+		}
+	}
+
+	printf("capacity=%zu backpressure=%llu\n",
+	       threadpool_capacity(p), threadpool_backpressure(p));
+	printf("submitted=%llu completed=%llu queued=%zu running=%zu\n",
+	       threadpool_submitted(p),
+	       threadpool_completed(p),
+	       threadpool_queued(p),
+	       threadpool_running(p));
+	printf("墙钟耗时 %.1f ms（串行工作量为 %.1f ms）\n",
+	       t1 - t0, (double)ntasks * work_ms);
+	rc = 0;
+
+done:
+	threadpool_destroy(p);
+	free(jobs);
+	return rc;
+}
+
+/* 对照组：每个任务 pthread_create 一个线程，join 之后才算完成 */
 /*
  * pthread_create 要求入口是 void *(*)(void *)，而 job_entry 是 void (*)(void *)。
  * 用函数指针强转把两者混用是未定义行为：参数与返回值的传递约定可能不同，
@@ -212,9 +293,10 @@ static int cmd_spawn(int ntasks, double work_ms) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
-	const char *cmd = (argc > 1) ? argv[1] : "help";
+	const char *cmd      = (argc > 1) ? argv[1] : "help";
 	int         nthreads = 4;
 	int         ntasks   = 16;
+	int         capacity = 8;
 	double      work_ms  = 0.0;
 
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
@@ -238,6 +320,11 @@ int main(int argc, char **argv) {
 				(void)fprintf(stderr, "-w 需要非负数\n");
 				return 2;
 			}
+		} else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+			if (parse_int(argv[++i], &capacity) != 0) {
+				(void)fprintf(stderr, "-c 需要非负整数\n");
+				return 2;
+			}
 		} else {
 			(void)fprintf(stderr, "无法识别的选项：%s\n", argv[i]);
 			usage(argv[0]);
@@ -255,6 +342,21 @@ int main(int argc, char **argv) {
 			return 2;
 		}
 		return cmd_run(nthreads, ntasks, work_ms);
+	}
+	if (strcmp(cmd, "bounded") == 0) {
+		if (nthreads < 1) {
+			(void)fprintf(stderr, "-t 必须 >= 1\n");
+			return 2;
+		}
+		if (capacity < 1) {
+			(void)fprintf(stderr, "-c 必须 >= 1\n");
+			return 2;
+		}
+		if (ntasks < 1) {
+			(void)fprintf(stderr, "-n 必须 >= 1\n");
+			return 2;
+		}
+		return cmd_bounded(nthreads, capacity, ntasks, work_ms);
 	}
 	if (strcmp(cmd, "spawn") == 0) {
 		return cmd_spawn(ntasks, work_ms);

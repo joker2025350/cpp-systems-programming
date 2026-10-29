@@ -50,6 +50,7 @@ check_contains() {
 OUT=$("$CLI" help 2>&1)
 check_exit "help 退出码 0" 0 $?
 check_contains "help 列出 run 子命令" "run" "$OUT"
+check_contains "help 列出 bounded 子命令" "bounded" "$OUT"
 check_contains "help 列出 spawn 子命令" "spawn" "$OUT"
 
 # ------------------------------------------------------------
@@ -87,6 +88,28 @@ check_exit "未知命令退出码 2" 2 $?
 
 "$CLI" run -z >/dev/null 2>&1
 check_exit "未知选项退出码 2" 2 $?
+
+# ------------------------------------------------------------
+# 有界队列 + 阻塞提交
+
+OUT=$("$CLI" bounded -t 2 -c 4 -n 200 -w 0.02 2>&1)
+check_exit "bounded -t 2 -c 4 -n 200 退出码 0" 0 $?
+check_contains "bounded 报告队列上限" "队列上限 4" "$OUT"
+check_contains "bounded 校验 200 个任务全部正确" "校验：200 个任务结果正确，0 个不正确" "$OUT"
+check_contains "bounded 报告 capacity=4" "capacity=4" "$OUT"
+check_contains "bounded 报告 completed=200" "completed=200" "$OUT"
+check_contains "bounded 结束后队列为空" "queued=0 running=0" "$OUT"
+
+# 容量 1 也要成立：每次提交都要等到工作线程取走上一个任务
+OUT=$("$CLI" bounded -t 1 -c 1 -n 50 2>&1)
+check_exit "bounded -c 1 退出码 0" 0 $?
+check_contains "capacity=1 时 50 个任务全部正确" "50 个任务结果正确" "$OUT"
+
+"$CLI" bounded -t 2 -c 0 -n 8 >/dev/null 2>&1
+check_exit "bounded -c 0 被拒绝（退出码 2）" 2 $?
+
+"$CLI" bounded -t 2 -c 4 -n 0 >/dev/null 2>&1
+check_exit "bounded -n 0 被拒绝（退出码 2）" 2 $?
 
 # ------------------------------------------------------------
 

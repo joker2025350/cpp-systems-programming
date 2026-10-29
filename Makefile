@@ -8,6 +8,7 @@
 #   make test       跑全部模块的单元测试
 #   make check      跑全部模块的端到端检查
 #   make sanitize   全部模块用 ASan + UBSan 重建并跑测试
+#   make tsan       有该目标模块用 TSan 重建并跑测试
 #   make bench      跑全部模块的基准
 #   make clean      清理全部模块
 #   make list       列出被识别的模块
@@ -21,7 +22,7 @@
 ALL_MODULES := $(patsubst src/%/Makefile,%,$(wildcard src/*/Makefile))
 MODULES     := $(filter-out $(SKIP),$(ALL_MODULES))
 
-.PHONY: all test check sanitize bench clean list
+.PHONY: all test check sanitize tsan bench clean list
 
 all:
 	@for m in $(MODULES); do \
@@ -48,6 +49,17 @@ sanitize:
 	@for m in $(MODULES); do \
 		printf '\n==> %s\n' "$$m"; \
 		$(MAKE) -C src/$$m sanitize || exit 1; \
+	done
+
+# TSan 与 ASan 的运行时不兼容，只能各建一份；这里只转发给写了 tsan 目标的模块。
+# contact-list 与 mysql-client 没有该目标：前者的分配失败注入用 --wrap 拦截
+# malloc，与 TSan 的插桩叠在一起时拦截顺序不确定；后者要连真实数据库。
+tsan:
+	@for m in $(MODULES); do \
+		if grep -q '^tsan:' src/$$m/Makefile 2>/dev/null; then \
+			printf '\n==> %s\n' "$$m"; \
+			$(MAKE) -C src/$$m tsan || exit 1; \
+		fi; \
 	done
 
 bench:

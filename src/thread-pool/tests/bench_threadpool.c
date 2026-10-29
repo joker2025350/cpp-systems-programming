@@ -7,9 +7,13 @@
  *      pthread_join 能换多少个池内任务。
  *   3. 固定工作量任务的并行加速比：每个任务忙等 100 µs，
  *      看墙钟时间随线程数怎么变。
+ *   4. 积压时的内存峰值：同一套负载分别用无界队列（非阻塞提交）与有界队列
+ *      （阻塞提交）跑，比较队列深度与 RSS 峰值。这是背压唯一能给出的
+ *      硬指标——墙钟时间与吞吐在两种模式下都可能相同。
  *
- * 计时只用 CLOCK_MONOTONIC。单次测量噪声较大，因此每组跑 REPEAT 轮取最小值：
+ * 计时只用 CLOCK_MONOTONIC。单次测量噪声较大，因此前三组跑 REPEAT 轮取最小值：
  * 最小值最接近"没有别的进程干扰时"的真实成本，平均值会被偶发的调度抖动抬高。
+ * 第四组不取最小值：它测的是峰值，重复跑只会把高水位叠上去。
  *
  * 编译运行：make bench
  */
@@ -19,7 +23,10 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #define REPEAT 5
 
@@ -135,6 +142,110 @@ static double bench_busy(int nthreads, int ntasks) {
 }
 
 /* ---------------------------------------------------------------- */
+/* [4] 积压时的内存峰值                                              */
+/* ---------------------------------------------------------------- */
+
+static void task_busy_3us(void *arg) {
+	(void)arg;
+	busy_wait_ms(0.003);
+}
+
+/* 当前进程的 RSS 峰值（Linux 上 ru_maxrss 的单位是 KiB）。 */
+static long rss_peak_kib(void) {
+	struct rusage ru;
+
+	if (getrusage(RUSAGE_SELF, &ru) != 0) {
+		return -1;
+	}
+	return (long)ru.ru_maxrss;
+}
+
+/*
+ * 在子进程里跑一遍积压，打印结果后直接 _exit。
+ *
+ * 为什么要 fork：ru_maxrss 是"本进程曾经达到的最高水位"，只会涨不会跌。
+ * 同一个进程里先跑无界再跑有界，第二个数字必然包含第一个的峰值，无法比较。
+ * 两个独立进程各测各的，才是可以并排看的两个数。
+ *
+ * 为什么不 destroy 之后再退出：destroy 会排空队列，有界那一组要花
+ * 提交数 × 任务耗时（秒级），而这一组关心的只是"积压期间"的内存。
+ * 子进程直接 _exit 把整个地址空间交还给内核，不需要走优雅停机。
+ */
+static void bench_backlog_child(int bounded, size_t cap, int ntasks) {
+	threadpool *p   = NULL;
+	size_t      peak = 0;
+	double      t0;
+	int         submitted = 0;
+	tpool_status st;
+
+	st = bounded ? threadpool_create_bounded(1, cap, &p)
+	             : threadpool_create(1, &p);
+	if (st != TPOOL_OK) {
+		printf("  创建失败：%s\n", threadpool_status_string(st));
+		(void)fflush(stdout);
+		_exit(1);
+	}
+
+	t0 = now_ms();
+	for (int i = 0; i < ntasks; i++) {
+		st = bounded ? threadpool_submit_wait(p, task_busy_3us, NULL)
+		             : threadpool_submit(p, task_busy_3us, NULL);
+		if (st != TPOOL_OK) {
+			break;   /* 两种模式下都不该发生，发生就如实报告提交数 */
+		}
+		submitted++;
+
+		/* 每 1024 次采一次队列深度：逐次采样会让提交端变慢，
+		 * 反而让消费端追上来，测出来的积压偏小。 */
+		if ((i & 1023) == 0) {
+			size_t q = threadpool_queued(p);
+
+			if (q > peak) {
+				peak = q;
+			}
+		}
+	}
+	{
+		size_t q = threadpool_queued(p);
+
+		if (q > peak) {
+			peak = q;
+		}
+	}
+
+	printf("  %-12s %8d %10.1f %10zu %10llu %10ld\n",
+	       bounded ? "有界(64)" : "无界",
+	       submitted,
+	       now_ms() - t0,
+	       peak,
+	       threadpool_backpressure(p),
+	       rss_peak_kib());
+
+	(void)fflush(stdout);
+	_exit(0);
+}
+
+static void bench_backlog(int ntasks) {
+	printf("\n[4] 积压：1 个工作线程，每任务忙等 3 µs，提交 %d 个任务\n", ntasks);
+	printf("  %-12s %8s %10s %10s %10s %10s\n",
+	       "队列", "提交数", "耗时(ms)", "峰值深度", "背压次数", "RSS峰值(KiB)");
+
+	for (int mode = 0; mode < 2; mode++) {
+		pid_t pid = fork();
+
+		if (pid == 0) {
+			bench_backlog_child(mode, 64, ntasks);
+			_exit(0);   /* 不会走到这里 */
+		}
+		if (pid < 0) {
+			printf("  fork 失败\n");
+			return;
+		}
+		(void)waitpid(pid, NULL, 0);
+	}
+}
+
+/* ---------------------------------------------------------------- */
 
 int main(void) {
 	const int sizes[] = { 1, 2, 4, 8 };
@@ -188,6 +299,10 @@ int main(void) {
 		}
 	}
 
+	bench_backlog(200000);
+
 	printf("\n说明：加速比以 1 线程为基准；效率 = 加速比 / 线程数。\n");
+	printf("      [4] 的两行来自两个独立的子进程（ru_maxrss 是进程级高水位，\n");
+	printf("      同一进程内先跑一组再跑另一组，第二个数会包含第一个的峰值）。\n");
 	return 0;
 }

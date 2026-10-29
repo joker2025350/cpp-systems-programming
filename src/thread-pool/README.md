@@ -2,6 +2,8 @@
 
 预先创建 N 个工作线程，它们从一条共享的任务队列里取任务执行。
 对外是一个静态库：调用方提交任务函数和参数，其余的生命周期由线程池管理。
+队列可以无界，也可以给定容量上限；后者在队列满时提供两种背压方式
+（拒绝 或 阻塞），把"内存无限增长"提前变成一个可处理的返回值。
 
 线程池解决的是线程创建的固定成本问题。`pthread_create` 要做线程栈、内核调度实体、
 TLS 块等一整套资源分配，实测在这台机器上"创建 + join"一个什么都不做的线程约 17 µs；
@@ -13,14 +15,14 @@ TLS 块等一整套资源分配，实测在这台机器上"创建 + join"一个�
 ```
 thread-pool/
 ├── include/
-│   └── threadpool.h          公开接口：不透明句柄 + 10 个函数 + 6 个状态码
+│   └── threadpool.h          公开接口：不透明句柄 + 14 个函数 + 7 个状态码
 ├── src/
-│   ├── threadpool.c          实现：FIFO 队列、工作线程主循环、停机流程
+│   ├── threadpool.c          实现：FIFO 队列、三个条件变量、工作线程主循环、停机流程
 │   └── main.c                命令行驱动，只链接 libthreadpool.a
 ├── tests/
-│   ├── test_threadpool.c     54 项单元测试
-│   ├── check_cli.sh          19 项命令行端到端检查
-│   └── bench_threadpool.c    三组基准
+│   ├── test_threadpool.c     单元测试（含闸门构造的容量与背压用例）
+│   ├── check_cli.sh          命令行端到端检查
+│   └── bench_threadpool.c    四组基准
 ├── notes/
 │   ├── threadpool_annotated.c   模块化之前的逐行注释版（历史材料，不参与构建）
 │   ├── threadpool_bug_demo.c    故意保留缺陷的演示版（历史材料，不参与构建）
@@ -41,19 +43,23 @@ thread-pool/
 
 | 函数 | 作用 |
 |---|---|
-| `threadpool_create(nthreads, &pool)` | 创建池，返回前 N 个工作线程已就绪 |
-| `threadpool_destroy(pool)` | 优雅停机：排空队列 → join 线程 → 释放 |
-| `threadpool_submit(pool, fn, arg)` | 提交任务，成功即保证被执行一次 |
+| `threadpool_create(nthreads, &pool)` | 创建池（队列无界），返回前 N 个工作线程已就绪 |
+| `threadpool_create_bounded(nthreads, max_queued, &pool)` | 创建池，队列最多容纳 `max_queued` 个待执行任务 |
+| `threadpool_destroy(pool)` | 优雅停机：排空队列 → 唤醒等待中的提交方 → join 线程 → 释放 |
+| `threadpool_submit(pool, fn, arg)` | 提交任务；队列满时立即返回 `TPOOL_ERR_FULL` |
+| `threadpool_submit_wait(pool, fn, arg)` | 提交任务；队列满时等待空位（工作线程不会被阻塞，见下） |
 | `threadpool_wait(pool)` | 屏障：等到队列空且无人执行 |
 | `threadpool_queued(pool)` | 队列中待执行的任务数 |
 | `threadpool_running(pool)` | 正在执行的任务数 |
 | `threadpool_completed(pool)` | 累计执行完成数 |
 | `threadpool_submitted(pool)` | 累计提交成功数 |
+| `threadpool_capacity(pool)` | 队列容量上限；无界池返回 0 |
+| `threadpool_backpressure(pool)` | 累计"因队列满而真正进入等待"的提交次数 |
 | `threadpool_thread_count(pool)` | 工作线程数 |
 | `threadpool_status_string(s)` | 状态码的英文短名 |
 
 状态码：`TPOOL_OK`、`TPOOL_ERR_PARAM`、`TPOOL_ERR_NOMEM`、`TPOOL_ERR_SYSTEM`、
-`TPOOL_ERR_CLOSED`、`TPOOL_ERR_BLOCKING`。
+`TPOOL_ERR_CLOSED`、`TPOOL_ERR_BLOCKING`、`TPOOL_ERR_FULL`。
 
 ### 所有权
 
@@ -69,6 +75,9 @@ thread-pool/
 ### 线程模型
 
 - `submit` / `wait` 可以从任意线程调用，包括工作线程内部（任务里再提交任务是允许的）。
+- `submit` 与 `submit_wait` 在有界池上行为不同：前者满即返回 `TPOOL_ERR_FULL`，
+  后者阻塞到出现空位。**唯一的例外是工作线程**：工作线程调用 `submit_wait`
+  时若队列已满，直接返回 `TPOOL_ERR_FULL`，不进入等待（理由见设计要点 8.4）。
 - `wait` **不能**由工作线程调用：它等的是"正在执行的任务数归零"，而调用者本身
   就是一个正在执行的任务。实现里用 `pthread_equal(pthread_self(), tids[i])` 检测
   并返回 `TPOOL_ERR_BLOCKING`，不进入等待。
@@ -163,14 +172,120 @@ POSIX 只规定 `pthread_t` 是"用于标识线程的不透明类型"，
 没有规定它是算术类型或指针，可比较性由实现决定。Linux 的 glibc 里它是
 `unsigned long`，`==` 恰好能编过；换一个实现就可能编译不过或者比错。
 
+### 8 有界队列与背压
+
+#### 8.1 无界队列的真实故障模式
+
+`threadpool_submit` 从不阻塞，也不看队列长度。生产速度持续高于消费速度时，
+队列长度与 `malloc` 出来的任务节点一起增长，直到某一次 `malloc` 返回 `NULL`。
+那一刻的错误码是 `TPOOL_ERR_NOMEM`，出现在**任意**一次提交里——调用方通常
+没有任何回退路径：任务参数已经准备好，队列里还压着几十万个没执行的任务，
+程序除了退出没有别的选择。内存耗尽不是"性能问题"，它是在一个无法处理的位置
+把控制流交给调用方。
+
+有界队列把这件事提前：队列满是一个**可以预期、可以处理**的状态。两种处理方式
+对应两种接口：
+
+| 接口 | 队列满时的行为 | 适合的场景 |
+|---|---|---|
+| `threadpool_submit` | 立即返回 `TPOOL_ERR_FULL` | 有降级路径：丢任务、合并、写磁盘、给上游返回 429 |
+| `threadpool_submit_wait` | 阻塞到出现空位再入队 | 不能丢任务，且提交方不怕慢：批处理、文件导入 |
+
+两种都提供，是因为它们对调用方的时间语义完全不同。库只给阻塞版，会把"想丢任务"
+的调用方逼成"自己开一个线程池 + 一个中转队列"；只给拒绝版，则把重试循环
+（带退避、带超时、带放弃）的复杂度推给每个调用方。语义放在接口上，
+调用点才是可读的。
+
+#### 8.2 容量只约束"排队"，不约束"执行中"
+
+`max_queued` 的判据是 `queued >= max_queued`，其中 `queued` 只统计仍在队列里、
+尚未被取走的任务。所以：
+
+```
+任意时刻在途任务数 <= max_queued + nthreads
+```
+
+为什么不把正在执行的任务也算进去：容量约束的对象是**积压**，而正在执行的任务
+已经出队、节点在任务返回时立刻 `free`，它不构成积压。把它算进去的后果是
+`max_queued == 1` 在 4 线程池上只能有一个任务在跑，其余三个线程空转——
+容量参数变成"并发度参数"，两件事被一个数字绑在一起。
+
+这个不等式的用处是把内存上限变成可以算的数：任务节点是
+`sizeof(struct task)` = 24 字节（函数指针 + 参数指针 + next），加上 glibc 的
+`malloc` 块头（16 字节）与对齐，实际约 40 字节/任务。8 线程 + `max_queued = 1024`
+的池，积压内存上界约 40 KiB。第 5 节有实测：同样提交 20 万个任务，
+无界队列的 RSS 峰值比容量 64 的有界队列高一个数量级。
+
+#### 8.3 第三个条件变量
+
+前两个条件变量（`work` / `idle`）等待的方向是"队列出现任务"与"任务全部执行完"，
+有界队列引入的是第三个方向：**"队列出现空位"**。
+
+不能复用 `work`：等在 `work` 上的是工作线程，它们在等"有任务"；提交方在等
+"有空位"。这两个条件在同一个状态（队列从满变成不满）下正好一个成立一个不成立，
+合并就只能 `broadcast`，每次出队把 N 个工作线程全部惊醒再让它们睡回去。
+`space` 只被提交方等待，出队时 `signal` 一个即可。
+
+唤醒时机只有两处：工作线程出队之后（腾出一个位置），以及 `destroy` 置
+`closed` 之后（叫醒所有人去看"池已关门"这个新条件）。提交方入队不会唤醒
+同类——它自己刚占掉一个位置。
+
+#### 8.4 工作线程永远不等待空位
+
+`threadpool_submit_wait` 在队列满时先判断调用者是不是本池的工作线程；
+是的话直接返回 `TPOOL_ERR_FULL`，与 `submit` 相同。
+
+这条规则不是保守，而是消除一整类死锁。把任务从队列里取走的**只有**工作线程。
+若工作线程允许在满队列上等待空位，就出现"消费者等待生产者生产、而生产者
+就是消费者自己"的环：当所有工作线程都卡在这个等待上，没有任何线程会去消费
+队列，"队列出现空位"永远不会发生。这是死锁的教科书构造——循环等待，
+且每个线程占有的资源（自己这个执行者）正是别人等待的资源。
+
+只让非工作线程等待，就把这个环切断了：等待者一定不在"唯一的资源持有者"集合里。
+判定方式与 `wait` 相同（`pthread_equal` 逐个比 `tids`），复用一个
+`is_worker()` 静态函数，避免两处判定逻辑漂移。
+
+代价是：一个"父任务提交子任务"的流水线在有界池上可能拿到 `FULL`，
+需要调用方自己处理。这与直接把死锁暴露出来相比是划算的交换。
+
+#### 8.5 destroy 与阻塞中的提交方
+
+`destroy` 的流程多了一步：置 `closed` 之后立刻 `broadcast(&space)`。
+少了这一步，等在 `space` 上的提交方永远等不到空位（队列只会越来越空，
+但没有任何人通知它），而 `destroy` 又在等队列排空——双方互等。
+
+更隐蔽的是**释放时机**。被唤醒的提交方还要重新拿一次锁，才能读到 `closed`
+并返回。如果 `destroy` 只看 `queued == 0 && running == 0` 就继续往下走，
+它可能在对方仍持有 `p->lock` 这个地址的时候 `pthread_mutex_destroy` 并 `free(p)`；
+对方随后对这块内存执行 `unlock`。按 C11 6.2.4p2，对象的生存期在 `free` 时结束，
+之后任何访问都是未定义行为。这类 bug 在普通构建下经常"看起来正常"
+（内存还没被复用），只有 ASan 稳定报 `heap-use-after-free`。
+
+修法是加一个 `waiting` 计数：提交方进入等待前 `waiting++`，醒来后 `waiting--`，
+并在归零时 `broadcast(&idle)`；`destroy` 的等待条件因此变成
+`queued > 0 || running > 0 || waiting > 0`。这与"等待者必须在离开临界区之后
+才允许销毁它使用的同步原语"是同一条规则的两种写法。
+
+#### 8.6 被唤醒后必须重新检查 closed
+
+`pthread_cond_wait` 返回不代表条件成立（虚假唤醒，以及被 `destroy` 的
+broadcast 唤醒），因此等待写成 `while (满 && !closed)`。循环退出有两种原因，
+必须分开处理：`while` 条件因 `closed` 成立而退出时，要返回 `TPOOL_ERR_CLOSED`
+并且**不入队**。
+
+漏掉这一步的后果是静默丢工作：任务被塞进一个正在停机的池，而 `destroy`
+在上一步已经观察到"队列空且无人执行"，随后置 `stop` 唤醒工作线程退出。
+这条任务留在队列里，没有任何线程会取它，`submit_wait` 却返回了 `TPOOL_OK`。
+仓库里对"静默丢工作"的一贯立场是：宁可返回错误，也不能返回成功却什么都不做。
+
 ## 构建
 
 ```bash
 cd src/thread-pool
 make            # libthreadpool.a + threadpool 命令行工具
-make test       # 54 项单元测试
-make check      # 19 项命令行端到端检查
-make bench      # 三组基准
+make test       # 单元测试
+make check      # 命令行端到端检查
+make bench      # 四组基准
 make sanitize   # ASan + UBSan，产物在 bin/sanitize/
 make tsan       # TSan，产物在 bin/tsan/
 make clean
@@ -179,12 +294,18 @@ make clean
 命令行工具：
 
 ```bash
-./bin/threadpool run   -t 4 -n 1000 -w 0.05   # 4 个线程跑 1000 个任务，每个忙等 0.05 ms
-./bin/threadpool spawn -n 1000 -w 0.05        # 对照组：每任务新建一个线程
+./bin/threadpool run     -t 4 -n 1000 -w 0.05   # 4 个线程跑 1000 个任务，每个忙等 0.05 ms
+./bin/threadpool bounded -t 4 -c 8 -n 1000 -w 0.05
+                                                # 队列上限 8，用阻塞提交，输出背压次数
+./bin/threadpool spawn   -n 1000 -w 0.05        # 对照组：每任务新建一个线程
 ./bin/threadpool help
 ```
 
 `run` 与 `spawn` 用同一个任务函数、同一份工作量，可以直接对比墙钟时间。
+`bounded` 与 `run` 同样共用任务函数，区别只在创建方式与提交方式，
+因此两者的墙钟时间差就是背压的代价，而 `capacity=` 与 `backpressure=`
+是"队列真的被卡住过"的唯一直接证据——只报耗时的话，
+"提交端被挡住"与"任务本身慢"无法区分。
 
 变体构建（`sanitize` / `tsan`）落在独立目录。原因与其它模块相同：make 判断
 "要不要重建"只比较时间戳、不比较编译选项，共用 `bin/` 会留下插桩过的二进制。
@@ -201,6 +322,11 @@ make clean
 | ASan + UBSan + LSan | `make sanitize` | 0 条警告，54 项全过，无报告 |
 | ThreadSanitizer | `make tsan` | 0 条警告，54 项全过，无 data race 报告 |
 
+> 上表是 **1.0.0** 的实测数据。1.1.0（有界队列与背压）的用例与基准已经写好，
+> 但还没有在 Linux 上跑过，所以这里不填新数字：没有实测的数值不写进文档。
+> 待补的项是单元测试项数（新增 6 组用例）、`check_cli.sh` 项数（新增 8 项）
+> 与基准第 4 组的两个 RSS 峰值。
+
 单元测试覆盖的六类行为：
 
 | 类别 | 断言内容 |
@@ -211,6 +337,7 @@ make clean
 | 并发语义 | 4 个生产者并发提交 1000 个任务，无一丢失；任务内部再提交成功且父子都执行 |
 | 同步语义 | `wait` 幂等（第二次 < 50 ms 返回）；`wait` 之后池可继续使用；工作线程调用 `wait` 返回 `TPOOL_ERR_BLOCKING` 且主线程不死锁 |
 | 停机语义 | 200 个 1 ms 任务提交后立即 destroy，200 个全部执行完；10 万个空任务的压力测试计数无丢失 |
+| 有界与背压 | 容量 0 被拒绝；队列满时 `submit` 返回 `FULL` 且被拒任务从未执行；`submit_wait` 在满队列上确实阻塞（背压计数 +1，等待 > 30 ms）并在出现空位后返回 `OK`；工作线程在满队列上不等待、直接 `FULL` 且耗时 < 100 ms；4 个生产者 × 500 个任务的采样队列深度不超过容量；`destroy` 唤醒阻塞中的提交方并返回 `CLOSED`，已接受的任务一个不丢 |
 
 第一次跑 TSan 时报告了一处 data race，位置在**测试代码**：
 
@@ -299,6 +426,32 @@ WARNING: ThreadSanitizer: data race
 返回值的传递约定可能不同。对照组因此加了一层真正的适配函数 `spawn_entry`，
 而不是强转。
 
+### 1.1.0 加有界队列与背压
+
+1.0.0 的接口只有"提交、断言、查询"三件事，没有对积压的任何约束。1.1.0 增加：
+
+| 新增 | 作用 |
+|---|---|
+| `threadpool_create_bounded(nthreads, max_queued, &pool)` | 容量上限 |
+| `TPOOL_ERR_FULL` | 队列满 |
+| `threadpool_submit_wait(pool, fn, arg)` | 满则等待空位 |
+| `threadpool_capacity(pool)` | 读容量；无界为 0 |
+| `threadpool_backpressure(pool)` | "背压生效过几次"的计数器 |
+
+结构上的改动是加一个 `pthread_cond_t space`、两个字段（`max_queued`、`waiting`）
+与一个 `backpressure` 计数器。句柄不透明，所以这次改版**没有 ABI 破坏**
+（1.1.0 之前的调用方二进制仍可用，只是拿不到新函数）；`TPOOL_ERR_FULL` 是枚举的
+新值，位于末尾，已有状态码的数值不变。
+
+`backpressure` 这个计数器是被测试逼出来的，和 `contact-list` 的 `rehashes`
+同一个来源：想断言"背压确实生效"，看耗时不行（提交端等 3 ms 与任务本身慢 3 ms
+在外部完全一样），看内存也不行（RSS 是分配器的行为）。必须由模块自己记录
+"有一次提交真的进入了等待"。它同时也是排查线上"提交为什么慢"时的第一手数据。
+
+实现过程中有两处不改就会出错的地方，都写进了设计要点：`destroy` 必须等
+`waiting` 归零才能释放池（8.5），醒来后必须重新检查 `closed` 才能入队（8.6）。
+前者是 use-after-free，后者是静默丢工作——两种都不报错，只在对的天气里出错。
+
 ### 与仓库其它模块的一致性
 
 - 目录、Makefile 目标集、README 节次与 `concurrent-lock` / `contact-list` / `word-count` 相同。
@@ -310,8 +463,18 @@ WARNING: ThreadSanitizer: data race
 - **单一全局队列 + 单一互斥锁。** 空任务吞吐随线程数下降（见性能第 1 条）。
   真正的解决办法是分片队列（每个工作线程一条）配合 work stealing，
   本轮没有实现。
-- **无界队列。** 提交速度持续高于消费速度时，队列与内存线性增长，没有背压。
-  `threadpool_submit` 永不阻塞，这对调用方简单，但没有保护内存的机制。
+- **无界队列仍是默认值。** `threadpool_create` 的队列没有上限：提交速度持续高于
+  消费速度时，队列与任务节点占用的内存线性增长，直到 `malloc` 失败。要背压必须
+  显式用 `threadpool_create_bounded`；模块不替调用方决定容量，因为容量取决于
+  任务耗时、可接受延迟与可接受内存，这三者只有调用方知道。
+- **阻塞提交没有超时。** `threadpool_submit_wait` 等到出现空位为止。若消费端被
+  一个永久阻塞的任务卡住（例如任务在等一个不会到来的网络包），提交方会一直等下去。
+  容量与任务耗时只能给出期望值，不构成上界；需要上界得调用方自己在外面套一层定时器
+  或改用 `threadpool_submit` 加重试预算。
+- **等待空位的唤醒顺序没有保证。** 多个提交方同时等 `space` 时，
+  `pthread_cond_signal` 唤醒哪一个由实现决定（POSIX 只说"至少唤醒一个"，
+  glibc 实践上偏向等待最久的，但不构成约定）。因此最坏情况下某个提交方会比其他
+  提交方多等若干轮。要严格公平需要显式的票据队列，代价是每个提交都要多一次入队。
 - **`destroy` 没有强制版本。** 它一定等队列排空；若某个任务永久阻塞，
   `destroy` 就永久阻塞。没有超时参数，也没有"取消队列中剩余任务"的接口。
 - **`destroy` 不能从任务函数里调用**，否则它在等 `running` 归零，而自己就是其中之一。
@@ -324,8 +487,14 @@ WARNING: ThreadSanitizer: data race
 
 ## 待办
 
+- [x] 有界队列与提交阻塞（背压），以及队列满时的返回码（1.1.0 完成）
+- [ ] `threadpool_submit_wait` 的超时版本：`submit_wait_until(pool, fn, arg, deadline)`，
+      超时返回一个新状态码；实现上把 `pthread_cond_wait` 换成
+      `pthread_cond_timedwait` 即可，难点在"绝对时间"要由调用方给
+      （`CLOCK_MONOTONIC` 的绝对时刻），否则内部取当前时间会把等待时间变成
+      "每次被唤醒就重新计时"
 - [ ] 分片队列 + work stealing，与当前单队列做吞吐对比
-- [ ] 有界队列与提交阻塞（背压），以及队列满时的返回码
 - [ ] `destroy` 的超时与强制中止版本
-- [ ] 让 `concurrent-lock` 的基准用本模块提交任务，而不是自己 `pthread_create`：
-      两个模块协作后，"锁的实现差异"与"任务调度开销"可以在同一套代码路径上比较
+- [ ] 让 `concurrent-lock` 的基准改用本模块提交任务，而不是自己 `pthread_create`：
+      `word-count` 的 `-j` 已经在驱动层用上了本模块，基准还没迁移；
+      迁移后"锁的实现差异"与"任务调度开销"可以在同一套代码路径上比较
