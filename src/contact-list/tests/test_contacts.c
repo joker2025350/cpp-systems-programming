@@ -1027,6 +1027,137 @@ static void test_index_shrink(void) {
 
 /* ---------------------------------------------------------------- */
 
+/*
+ * contacts_order：按姓名升序取指针数组。
+ *
+ * 盯四类东西：
+ *   1. 参数合同——book 为 NULL、cap 不足、out 为 NULL、空表；
+ *   2. 顺序本身，包括"字节序而不是大小写不敏感"这一点；
+ *   3. 排序是只读的：链表顺序、数量、索引统计一个都不许动；
+ *   4. 规模大一点时（200 条，倒序插入）仍然严格递增——只测 3 条的话，
+ *      把比较函数写成"只比较第一个字节"也能过。
+ */
+static void test_order_by_name(void) {
+	contact_book         book;
+	contacts_index_stats st;
+	const contact       *arr[4];
+	contacts_status      status;
+	size_t               i;
+
+	contacts_init(&book);
+
+	/* ---- 参数合同 ---- */
+	expect_status("排序：空表返回 OK", contacts_order(&book, NULL, 0), CONTACTS_OK);
+	expect_status("排序：book 为 NULL 被拒绝",
+	              contacts_order(NULL, arr, 4), CONTACTS_ERR_PARAM);
+
+	expect_status("排序：插入 carol", contacts_add(&book, "carol", "138"), CONTACTS_OK);
+	expect_status("排序：插入 alice", contacts_add(&book, "alice", "139"), CONTACTS_OK);
+	expect_status("排序：插入 bob",   contacts_add(&book, "bob",   "137"), CONTACTS_OK);
+
+	for (i = 0; i < 4; i++) {
+		arr[i] = NULL;
+	}
+	expect_status("排序：cap 小于条数被拒绝",
+	              contacts_order(&book, arr, 2), CONTACTS_ERR_PARAM);
+	expect_int("排序：cap 不足时不写数组", arr[0] == NULL, 1);
+	expect_status("排序：out 为 NULL 被拒绝",
+	              contacts_order(&book, NULL, 3), CONTACTS_ERR_PARAM);
+
+	/* ---- 顺序 ---- */
+	status = contacts_order(&book, arr, 3);
+	expect_status("排序：三条返回 OK", status, CONTACTS_OK);
+	expect_str("排序：第 1 条是 alice", arr[0]->name, "alice");
+	expect_str("排序：第 2 条是 bob",   arr[1]->name, "bob");
+	expect_str("排序：第 3 条是 carol", arr[2]->name, "carol");
+
+	/* 填进去的是节点指针，不是副本：电话必须与原记录一致 */
+	expect_str("排序：第 2 条电话仍是原值", arr[1]->phone, "137");
+	expect_int("排序：拿到的是同一个对象",
+	           arr[1] == contacts_find(&book, "bob"), 1);
+
+	/* ---- 只读 ---- */
+	expect_int("排序后数量不变", (long)contacts_count(&book), 3);
+	expect_str("排序后 first 仍是插入的第一条",
+	           contacts_first(&book)->name, "carol");
+	expect_str("排序后遍历仍是插入顺序",
+	           contacts_next(contacts_first(&book))->name, "alice");
+	(void)contacts_index_get(&book, &st);
+	expect_int("排序后索引 entries 不变", (long)st.entries, 3);
+	expect_int("排序后桶数不变", (long)st.buckets, 16);
+
+	contacts_destroy(&book);
+
+	/*
+	 * ---- 字节序 ----
+	 * '0'=0x30 < 'Z'=0x5A < 'a'=0x61 < 0xE5（"张"的 UTF-8 首字节）。
+	 * 最后一条是关键：若实现把字节按 signed char 比较，0xE5 是负数，
+	 * "张三"会被排到最前面——这是 C 里逐字节比较最常见的错法。
+	 */
+	contacts_init(&book);
+	expect_status("排序：插入 alice（字节序用例）",
+	              contacts_add(&book, "alice", "1"), CONTACTS_OK);
+	expect_status("排序：插入 Zoe",
+	              contacts_add(&book, "Zoe", "2"), CONTACTS_OK);
+	expect_status("排序：插入 007",
+	              contacts_add(&book, "007", "3"), CONTACTS_OK);
+	expect_status("排序：插入 张三",
+	              contacts_add(&book, "张三", "4"), CONTACTS_OK);
+
+	status = contacts_order(&book, arr, 4);
+	expect_status("排序：字节序用例返回 OK", status, CONTACTS_OK);
+	expect_str("字节序：数字在最前", arr[0]->name, "007");
+	expect_str("字节序：大写在小写之前", arr[1]->name, "Zoe");
+	expect_str("字节序：小写随后", arr[2]->name, "alice");
+	expect_str("字节序：非 ASCII 在最后（按无符号字节比较）",
+	           arr[3]->name, "张三");
+	contacts_destroy(&book);
+
+	/* ---- 规模：200 条倒序插入 ---- */
+	contacts_init(&book);
+	for (i = 200; i > 0; i--) {
+		char name[CONTACT_NAME_MAX];
+
+		(void)snprintf(name, sizeof name, "n%03lu", (unsigned long)i);
+		if (contacts_add(&book, name, "13800000000") != CONTACTS_OK) {
+			expect_int("排序：200 条全部插入成功", 0, 1);
+			contacts_destroy(&book);
+			return;
+		}
+	}
+
+	{
+		const contact **big = (const contact **)malloc(200 * sizeof *big);
+		int             ok  = 1;
+
+		if (big == NULL) {
+			expect_int("排序：为 200 个指针分配内存", 0, 1);
+			contacts_destroy(&book);
+			return;
+		}
+
+		status = contacts_order(&book, big, 200);
+		expect_status("排序：200 条返回 OK", status, CONTACTS_OK);
+		expect_str("排序：200 条的首条是 n001", big[0]->name, "n001");
+		expect_str("排序：200 条的末条是 n200", big[199]->name, "n200");
+
+		for (i = 0; i + 1 < 200; i++) {
+			if (strcmp(big[i]->name, big[i + 1]->name) >= 0) {
+				ok = 0;
+			}
+		}
+		expect_int("排序：200 条严格递增", ok, 1);
+
+		(void)contacts_index_get(&book, &st);
+		expect_int("排序：200 条时索引 entries 仍为 200", (long)st.entries, 200);
+		free(big);
+	}
+
+	contacts_destroy(&book);
+}
+
+/* ---------------------------------------------------------------- */
+
 int main(int argc, char *argv[]) {
 	if (argc > 1) {
 		g_testdata = argv[1];
@@ -1040,6 +1171,7 @@ int main(int argc, char *argv[]) {
 	test_add_validation();
 	test_duplicate();
 	test_insert_order();
+	test_order_by_name();
 	test_remove_positions();
 	test_remove_notfound();
 	test_clear_and_reuse();

@@ -36,12 +36,15 @@ extern "C" {
  *        ABI 不兼容：contact_book 末尾多一个 size_t，contacts_index_stats
  *        末尾也多一个；contact 本身没变。contact_book 由调用方在栈上分配，
  *        因此库与调用方必须一起重编。
+ * 1.3.0：新增 contacts_order（按姓名升序取指针数组）。
+ *        只增加一个函数，结构体一个字节没动，因此 ABI 兼容；
+ *        用旧的库配新的头文件编译出的程序仍然能跑（不要反过来）。
  */
 
 #define CONTACTS_VERSION_MAJOR 1
-#define CONTACTS_VERSION_MINOR 2
+#define CONTACTS_VERSION_MINOR 3
 #define CONTACTS_VERSION_PATCH 0
-#define CONTACTS_VERSION_STRING "1.2.0"
+#define CONTACTS_VERSION_STRING "1.3.0"
 
 /* ------------------------------------------------------------------
  * 字段容量
@@ -247,6 +250,49 @@ const contact *contacts_find(const contact_book *book, const char *name);
 
 const contact *contacts_first(const contact_book *book);
 const contact *contacts_next(const contact *c);
+
+/* ------------------------------------------------------------------
+ * 排序
+ * ------------------------------------------------------------------
+ * 遍历给的是插入顺序，那是"用户先后录入了什么"；按姓名排序是另一个
+ * 需求，两者不能同时由同一条链表满足，所以排序做成一次性取一批指针：
+ * 调用方给一块数组，模块把全部节点的指针按姓名升序填进去。
+ *
+ * 为什么由调用方给数组，而不是模块返回一个数组：
+ *   - 返回 malloc 出来的数组，就把释放责任推给调用方，还得再定义并导出
+ *     一个释放函数，否则调用方无从知道该用 free 还是别的释放方式；
+ *   - 调用方自己给缓冲区，模块内部不产生新的分配点，也就不引入
+ *     "取指针数组时内存不足"这条新的失败路径（分配失败在调用方那一侧，
+ *     它有完整的上下文：可以退化成按插入顺序输出，或者少排几条）。
+ * 代价是调用方要知道元素个数，也就是先调一次 contacts_count。
+ *
+ * 排序键是姓名的字节序，即 strcmp 的语义。按 C11 7.24.4.4，
+ * strcmp 把两个字符串的字节当作 unsigned char 逐个比较，与 LC_COLLATE
+ * 无关。具体后果："Zoe" 排在 "alice" 之前（'Z'=0x5A < 'a'=0x61），
+ * 中文按 UTF-8 编码字节排序，而不是拼音序。选字节序的理由写在 README 3.12：
+ * 排序结果必须只取决于数据本身，不能取决于进程启动时恰好设了什么 locale。
+ *
+ * 这个函数是 const 的：不改链表、不改索引、不移动节点，
+ * 因此返回的指针与 contacts_find 拿到的是同一批对象。
+ * 但这些指针同样在下一次 contacts_remove / contacts_clear 之后失效。
+ *
+ * 返回：
+ *   CONTACTS_OK         成功；out[0..count-1] 是按姓名升序的全部指针
+ *   CONTACTS_ERR_PARAM  book 为 NULL；cap 小于 contacts_count；
+ *                       或者 count 大于 0 而 out 为 NULL
+ * 空表（count 为 0）返回 OK，此时 out 可以是 NULL，cap 也不看。
+ * 失败时不写 out 的任何元素。
+ *
+ * 还有一个同样返回 PARAM 的情形：count 与实际遍历出的节点数不一致。
+ * 参数并没有错，是模块内部不变量（见 contacts_index_get 的说明）被破坏，
+ * 通常意味着内存被非法改写。此时 out 的内容不可用——正常调用方不会遇到，
+ * 但如果看到了，应当按"数据损坏"处理，而不是当成参数写错了。
+ *
+ * 复杂度：O(n log n) 次比较 + O(n) 次写指针。额外内存全在调用方的数组里，
+ * 即 n * sizeof(const contact *)（64 位下 8 字节/条）。
+ */
+contacts_status contacts_order(const contact_book *book,
+                               const contact **out, size_t cap);
 
 /* ------------------------------------------------------------------
  * 文件存取

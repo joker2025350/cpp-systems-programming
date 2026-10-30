@@ -1,10 +1,11 @@
 /*
  * bench_contacts.c —— 量一下"链表 + 哈希索引"的代价
  *
- * 测四件事：
+ * 测五件事：
  *
  *   build  每加一条都要查重；有索引时是 O(1) 均摊，因此整批是 O(n)
  *   find   按姓名定位桶链，链长在装载因子 <= 1.0 时平均 1 条多一点
+ *   order  按姓名排序：取 n 个指针 + qsort，O(n log n) 次比较
  *   save   顺序遍历链表，O(n)；与索引无关，因为顺序保存在链表里
  *   load   逐行解析 + 插入，O(n)
  *
@@ -103,6 +104,47 @@ static double bench_find(contact_book *book, long n) {
 	return now_ms() - t0;
 }
 
+/*
+ * 排序：取 n 个指针再 qsort。
+ *
+ * 计时包含调用方的 malloc/free，因为调用方实际付出的就是从"一本书"
+ * 得到"有序结果"的总代价，而分配数组本来就是这一步的一部分——
+ * 只计 contacts_order 里的时间，会漏掉 n*8 字节分配的实际开销。
+ *
+ * 结果顺手校验一次严格递增：基准输出常被当数据读，排错的表比没有表更糟。
+ */
+static double bench_order(contact_book *book, long n) {
+	const contact **buf;
+	double          t0;
+	int             ok = 1;
+
+	buf = (const contact **)malloc((size_t)n * sizeof *buf);
+	if (buf == NULL) {
+		(void)fprintf(stderr, "排序基准：分配 %ld 个指针失败\n", n);
+		return -1.0;
+	}
+
+	t0 = now_ms();
+	if (contacts_order(book, buf, (size_t)n) != CONTACTS_OK) {
+		(void)fprintf(stderr, "排序基准：contacts_order 失败\n");
+		free(buf);
+		return -1.0;
+	}
+	t0 = now_ms() - t0;
+
+	for (long i = 0; i + 1 < n; i++) {
+		if (strcmp(buf[i]->name, buf[i + 1]->name) >= 0) {
+			ok = 0;
+		}
+	}
+	if (!ok) {
+		(void)fprintf(stderr, "排序基准：结果不是严格递增\n");
+	}
+
+	free(buf);
+	return t0;
+}
+
 static double bench_save(contact_book *book) {
 	double t0 = now_ms();
 
@@ -137,6 +179,7 @@ typedef struct {
 	long                 loaded;
 	double               build;
 	double               find;
+	double               order;
 	double               save;
 	double               load;
 	contacts_index_stats stats;
@@ -252,6 +295,7 @@ int main(void) {
 			return 1;
 		}
 		r->find = bench_find(&book, r->n);
+		r->order = bench_order(&book, r->n);
 		r->save = bench_save(&book);
 		r->load = bench_load(&r->loaded);
 
@@ -266,14 +310,16 @@ int main(void) {
 	}
 
 	(void)printf("contacts %s 基准\n\n", CONTACTS_VERSION_STRING);
-	(void)printf("%8s %12s %12s %12s %12s %10s\n",
-	             "n", "build(ms)", "find(ms)", "save(ms)", "load(ms)", "loaded");
-	(void)printf("--------------------------------------------------------------------\n");
+	(void)printf("%8s %12s %12s %12s %12s %12s %10s\n",
+	             "n", "build(ms)", "find(ms)", "order(ms)", "save(ms)", "load(ms)",
+	             "loaded");
+	(void)printf("-----------------------------------------------------------------------------\n");
 	for (size_t k = 0; k < n_sizes; k++) {
 		const bench_row *r = &rows[k];
 
-		(void)printf("%8ld %12.1f %12.1f %12.1f %12.1f %10ld\n",
-		             r->n, r->build, r->find, r->save, r->load, r->loaded);
+		(void)printf("%8ld %12.1f %12.1f %12.1f %12.1f %12.1f %10ld\n",
+		             r->n, r->build, r->find, r->order, r->save, r->load,
+		             r->loaded);
 	}
 
 	(void)printf("\n%8s %9s %8s %9s %14s %9s %11s %8s\n",
@@ -310,6 +356,8 @@ int main(void) {
 
 	(void)printf("\nfind 一列做的是 2n 次查找（n 次命中 + n 次落空）。\n");
 	(void)printf("find(ns) 是单次查找平均耗时，包含命中的一次 strcmp。\n");
+	(void)printf("order 是 contacts_order 取 n 个指针并 qsort 的总耗时，"
+	             "含调用方的 malloc/free。\n");
 	(void)printf("load 是 entries/buckets 的装载因子；超过 1.0 说明扩容分配失败，处于降级状态。\n");
 	(void)printf("heap 是 glibc mallinfo2 的 uordblks，即已分配未释放的堆字节数；"
 	             "非 glibc 平台为 0。\n");

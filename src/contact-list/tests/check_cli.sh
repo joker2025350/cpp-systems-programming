@@ -7,6 +7,7 @@
 #   - list 的输出能不能直接当作输入文件（格式自洽）
 #   - 保存 → 读回 的内容是否逐字节相同（存取互逆）
 #   - 三份历史样例文件能否被正确读入
+#   - list --sort 的顺序，以及它与 list 只差顺序、不改文件
 #   - 各类错误路径的退出码
 #
 # 用法：sh tests/check_cli.sh [可执行文件] [testdata 目录]
@@ -203,6 +204,47 @@ done
 check_eq "删到 3 条后 count 为 3" "3" "$(stats_of "$WORK/bulk.txt" count)"
 check_eq "删到 3 条后桶数收缩到下限 16" "16" "$(stats_of "$WORK/bulk.txt" buckets)"
 check_eq "收缩后 entries 仍等于 count" "3" "$(stats_of "$WORK/bulk.txt" entries)"
+
+# ---------------------------------------------------------------- 8. 排序
+# 插入顺序故意与字节序不同：carol 先插入，alice 在中间，Zoe 最后插入。
+# 后者同时钉住"大写在小写之前"——按 ASCII 的 0x5A < 0x61，
+# 若实现改成大小写不敏感，这一条会先失败。
+SBOOK=$WORK/sort_book.txt
+"$CLI" -f "$SBOOK" add carol 13800003333 2>/dev/null
+"$CLI" -f "$SBOOK" add alice 13900001111 2>/dev/null
+"$CLI" -f "$SBOOK" add bob   13800002222 2>/dev/null
+"$CLI" -f "$SBOOK" add Zoe   13700000000 2>/dev/null
+
+expect='name: Zoe, phone: 13700000000
+name: alice, phone: 13900001111
+name: bob, phone: 13800002222
+name: carol, phone: 13800003333'
+
+check_eq "list --sort 按姓名升序" "$expect" \
+         "$("$CLI" -f "$SBOOK" list --sort 2>/dev/null)"
+
+# 独立对照：行首固定是 "name: "，姓名两两不同，所以"按整行做字节序排序"
+# 与"按姓名排序"等价。用 sort(1) 而不是再实现一遍排序，是为了让这条断言
+# 不依赖被测代码自己的比较函数。
+"$CLI" -f "$SBOOK" list > "$WORK/insertion.txt" 2>/dev/null
+check_eq "list --sort 与 LC_ALL=C sort 的结果一致" \
+         "$(LC_ALL=C sort "$WORK/insertion.txt")" \
+         "$("$CLI" -f "$SBOOK" list --sort 2>/dev/null)"
+
+# 排序只影响这一次输出，磁盘上的行序仍应是插入顺序
+check_eq "list --sort 不改工作文件" "$(cat "$WORK/insertion.txt")" "$(cat "$SBOOK")"
+check_eq "list --sort 之后数量不变" "4" "$("$CLI" -f "$SBOOK" count 2>/dev/null)"
+check_eq "find 不受排序影响" "name: bob, phone: 13800002222" \
+         "$("$CLI" -f "$SBOOK" find bob 2>/dev/null)"
+
+# 空表：不为 0 个元素分配，输出为空且退出码为 0
+check_eq "空表 list --sort 无输出" "" \
+         "$("$CLI" -f "$WORK/sort_empty.txt" list --sort 2>/dev/null)"
+"$CLI" -f "$WORK/sort_empty.txt" list --sort >/dev/null 2>&1
+check_rc "空表 list --sort 退出码为 0" 0 $?
+
+"$CLI" -f "$SBOOK" list --bogus >/dev/null 2>&1
+check_rc "list 未知选项退出码为 2" 2 $?
 
 # ---------------------------------------------------------------- 汇总
 echo

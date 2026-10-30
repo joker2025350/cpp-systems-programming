@@ -42,7 +42,7 @@ static void usage(FILE *out, const char *prog) {
 	    "  add <name> <phone>    添加联系人\n"
 	    "  del <name>            按姓名删除\n"
 	    "  find <name>           按姓名查找\n"
-		"  list                  列出全部联系人（顺序即插入顺序）\n"
+	    "  list [--sort]         列出全部联系人（默认插入顺序，--sort 按姓名升序）\n"
 		"  count                 输出联系人数量\n"
 		"  stats                 输出索引统计（桶数、装载因子、最长链）\n"
 	    "  save <file>           保存到文件\n"
@@ -178,12 +178,64 @@ static int cmd_find(app *a, int argc, char **argv) {
 	return 0;
 }
 
-static int cmd_list(app *a) {
-	const contact *item;
+/*
+ * list [--sort]
+ *
+ * 默认按插入顺序输出，那是链表本身的顺序，不需要额外内存。
+ * --sort 按姓名升序（字节序），走 contacts_order：模块只填指针，
+ * 数组由这里分配与释放，因此"内存不足"这条失败路径落在驱动层，
+ * 可以只报错而不影响书里的数据。
+ *
+ * 两条路径都不改工作文件：list 是只读命令，输出顺序与磁盘上的行序无关。
+ */
+static int cmd_list(app *a, int argc, char **argv) {
+	const contact  *item;
+	const contact **sorted;
+	contacts_status status;
+	size_t          n;
+	size_t          i;
+	int             want_sort = 0;
+	int             k;
 
-	for (item = contacts_first(&a->book); item != NULL; item = contacts_next(item)) {
-		print_contact(item);
+	for (k = 1; k < argc; k++) {
+		if (strcmp(argv[k], "--sort") == 0) {
+			want_sort = 1;
+		} else {
+			(void)fprintf(stderr, "contacts: list: 未知选项 %s\n", argv[k]);
+			return EXIT_USAGE;
+		}
 	}
+
+	if (!want_sort) {
+		for (item = contacts_first(&a->book); item != NULL; item = contacts_next(item)) {
+			print_contact(item);
+		}
+		return 0;
+	}
+
+	n = contacts_count(&a->book);
+	if (n == 0) {
+		return 0;                       /* 空表：不必为 0 个元素分配 */
+	}
+
+	sorted = (const contact **)malloc(n * sizeof *sorted);
+	if (sorted == NULL) {
+		print_status("list", CONTACTS_ERR_NOMEM);
+		return 1;
+	}
+
+	status = contacts_order(&a->book, sorted, n);
+	if (status != CONTACTS_OK) {
+		print_status("list", status);
+		free(sorted);
+		return 1;
+	}
+
+	for (i = 0; i < n; i++) {
+		print_contact(sorted[i]);
+	}
+
+	free(sorted);
 	return 0;
 }
 
@@ -407,7 +459,7 @@ static int cmd_menu(app *a, int argc, char **argv) {
 
 		switch (choice) {
 		case 1: menu_add(a);  break;
-		case 2: cmd_list(a);  break;
+		case 2: cmd_list(a, 0, NULL); break;
 		case 3: menu_del(a);  break;
 		case 4: menu_find(a); break;
 		case 5: menu_save(a); break;
@@ -486,7 +538,7 @@ int main(int argc, char *argv[]) {
 	} else if (strcmp(argv[i], "find") == 0) {
 		rc = cmd_find(&a, argc - i, argv + i);
 	} else if (strcmp(argv[i], "list") == 0) {
-		rc = cmd_list(&a);
+		rc = cmd_list(&a, argc - i, argv + i);
 	} else if (strcmp(argv[i], "count") == 0) {
 		rc = cmd_count(&a);
 	} else if (strcmp(argv[i], "stats") == 0) {

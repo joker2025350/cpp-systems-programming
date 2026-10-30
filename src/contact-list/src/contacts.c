@@ -795,6 +795,87 @@ contacts_status contacts_index_get(const contact_book *book,
 	return CONTACTS_OK;
 }
 
+/* ------------------------------------------------------------------
+ * 5. 排序
+ * ------------------------------------------------------------------ */
+
+/*
+ * qsort 的比较函数。
+ *
+ * 形参是"指向被比较元素的指针"：qsort 比较的是数组元素，而这里的元素
+ * 本身是 const contact *，所以 a、b 的类型是 const contact *const *。
+ * 写成两级指针不是笔误——少一级就会把节点的首字节当成指针读，
+ * 在 LP64 上表现为拿 name 的前 8 个字节当地址，崩溃点离出错处很远。
+ *
+ * 二级比较：先比姓名，相同再比电话。姓名是主键（见 contacts_add 的查重），
+ * 正常情况下走不到第二级。保留它是为了让比较函数成为全序：
+ * qsort 不保证相等元素的相对顺序，一旦不变量被破坏（例如有人直接改了
+ * 链表节点的 name），没有兜底键的话同样的输入可能给出不同顺序，
+ * "排序结果"就没法写成断言。
+ */
+static int cmp_by_name(const void *a, const void *b) {
+	const contact *const *pa = (const contact *const *)a;
+	const contact *const *pb = (const contact *const *)b;
+	int                   r;
+
+	r = strcmp((*pa)->name, (*pb)->name);
+	if (r != 0) {
+		return r;
+	}
+	return strcmp((*pa)->phone, (*pb)->phone);
+}
+
+contacts_status contacts_order(const contact_book *book,
+                               const contact **out, size_t cap) {
+	const contact *item;
+	size_t         i = 0;
+
+	if (book == NULL) {
+		return CONTACTS_ERR_PARAM;
+	}
+
+	/*
+	 * 先判容量再判 out：count 为 0 时调用方不必为一块空数组去 malloc，
+	 * 传 NULL 也合法。这条顺序写反了会让"空表查询"变成参数错误。
+	 */
+	if (cap < book->count) {
+		return CONTACTS_ERR_PARAM;
+	}
+	if (book->count == 0) {
+		return CONTACTS_OK;
+	}
+	if (out == NULL) {
+		return CONTACTS_ERR_PARAM;
+	}
+
+	/*
+	 * 遍历用的是 next 而不是索引的桶链：桶链的顺序是"同桶内最近插入在前、
+	 * 跨桶按下标"，与插入顺序、与字典序都没有关系，收进来排序只会更慢。
+	 *
+	 * 上界写 book->count 而不是"直到 next 为 NULL"：cap 只保证不小于 count，
+	 * 若链比 count 长（不变量被破坏），照 next 走会写出 out 的边界，
+	 * 那是 C11 6.5.6p8 意义上的未定义行为。宁可按上界截断，再由下面的
+	 * 长度核对把它暴露成错误。
+	 */
+	for (item = book->head; item != NULL && i < book->count; item = item->next) {
+		out[i] = item;
+		i++;
+	}
+
+	/*
+	 * 走到这里 count 与实际节点数应当相等。不等说明内存被非法改写、
+	 * 链表有环或节点被提前释放——这不是调用方的参数错误，
+	 * 而是内部不变量已经破坏，此时 out 的内容不可用，直接报错，
+	 * 不要把残缺的数组交给 qsort 之后的调用方。
+	 */
+	if (i != book->count) {
+		return CONTACTS_ERR_PARAM;
+	}
+
+	qsort(out, book->count, sizeof *out, cmp_by_name);
+	return CONTACTS_OK;
+}
+
 const char *contacts_status_string(contacts_status status) {
 	switch (status) {
 	case CONTACTS_OK:            return "success";
