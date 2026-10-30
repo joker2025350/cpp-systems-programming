@@ -281,7 +281,7 @@ const contact *contacts_next(const contact *c);
  *   CONTACTS_ERR_PARAM  book 为 NULL；cap 小于 contacts_count；
  *                       或者 count 大于 0 而 out 为 NULL
  * 空表（count 为 0）返回 OK，此时 out 可以是 NULL，cap 也不看。
- * 失败时不写 out 的任何元素。
+ * 参数类失败一个元素都不写，调用方看到的仍是调用前的值。
  *
  * 还有一个同样返回 PARAM 的情形：count 与实际遍历出的节点数不一致。
  * 参数并没有错，是模块内部不变量（见 contacts_index_get 的说明）被破坏，
