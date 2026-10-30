@@ -220,7 +220,11 @@ jobs:
             cat /tmp/ci-summary.txt 2>/dev/null || echo "(无汇总)"
             echo
             echo "== 基准 =="
-            tail -80 /tmp/bench.log 2>/dev/null || echo "(未跑)"
+            # 这里必须是完整日志，不能 tail：根 Makefile 按模块顺序跑 bench，
+            # 排在前面的模块（concurrent-lock、contact-list）的表格在开头，
+            # tail -80 只留得住最后两个模块。2026-10-30 要用 contact-list 的新增列
+            # 才发现数据被截掉了——报告"少了一段"比"没有报告"更难察觉。
+            cat /tmp/bench.log 2>/dev/null || echo "(未跑)"
           } > "/tmp/report/${GITHUB_SHA}.txt"
 
           cd /tmp/report
