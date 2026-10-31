@@ -1,0 +1,193 @@
+sha:      4c2fc892281b667e97efbbe471e2c3d7ba4ee7ae
+ref:      main
+run:      https://github.com/joker2025350/cpp-systems-programming/actions/runs/41204899350
+compiler: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+result:   success
+
+== 步骤 ==
+默认构建：0 条警告（make 退出码 0）
+==> concurrent-lock
+68 项检查，0 项失败
+==> contact-list
+242 项检查，0 项失败
+466 项检查，0 项失败
+20 项检查，0 项失败
+==> thread-pool
+检查项 109，失败 0
+==> word-count
+40 项检查，0 项失败
+==> contact-list
+全部通过（43 项检查）
+==> thread-pool
+检查项 30，失败 0
+==> word-count
+全部一致（2 个文件，6 项比对）
+全部一致（28 项比对）
+ASan+UBSan：0 条警告（make 退出码 0）
+==> concurrent-lock
+68 项检查，0 项失败
+==> contact-list
+242 项检查，0 项失败
+466 项检查，0 项失败
+20 项检查，0 项失败
+==> thread-pool
+检查项 109，失败 0
+==> word-count
+40 项检查，0 项失败
+TSan：0 条警告（make 退出码 0）
+==> concurrent-lock
+67 项检查，0 项失败
+==> thread-pool
+检查项 109，失败 0
+==> word-count
+40 项检查，0 项失败
+加严警告构建：12 条警告，其中 -Wcast-qual 12 条（不判定），其余 0 条（make 退出码 0）
+
+== 基准 ==
+
+==> concurrent-lock
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/concurrent-lock'
+
+threads=10  per-thread=1000000  rounds=3  sleep=off
+
+kind           expected          final  match       avg_ms     Mops/s
+--------------------------------------------------------------------------
+raw            10000000        2340096     NO        71.65     139.56
+mutex          10000000       10000000    yes       436.02      22.93
+spin           10000000       10000000    yes      1960.19       5.10
+atomic         10000000       10000000    yes       251.23      39.80
+asm            10000000       10000000    yes       261.40      38.26
+
+raw 一行的 final 小于 expected 是正常的：它按定义会丢更新。
+match 为 part 说明多轮里有时对有时错，也是 raw 的典型表现。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/concurrent-lock'
+
+==> contact-list
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/contact-list'
+cc -std=c11 -Wall -Wextra -Wconversion -O2 -g -Iinclude tests/bench_contacts.c bin/libcontacts.a -o bin/bench_contacts
+
+contacts 1.3.0 基准
+
+       n    build(ms)     find(ms)    order(ms)     save(ms)     load(ms)     loaded
+-----------------------------------------------------------------------------
+    1000          0.3          0.2          0.1          0.2          0.3       1000
+    4000          0.8          0.7          0.3          0.5          1.1       4000
+   16000          3.7          3.0          1.1          2.2          4.3      16000
+   64000         16.1         13.0          5.4          7.6         18.7      64000
+
+       n   buckets     load  maxchain   used/buckets  find(ns)   heap(KiB)  B/entry
+--------------------------------------------------------------------------------------
+    1000      1024     0.98         3            68%        86         170      174
+    4000      4096     0.98         7            57%        89         667      171
+   16000     16384     0.98         6            64%        95        2514      161
+   64000     65536     0.98         7            56%       102       10016      160
+
+收缩（n = 64000，删到 1024 条，再抖动 100000 轮）
+
+  桶数         建完 65536 -> 删完 4096 -> 抖动后 2048
+  装载因子     0.98 -> 0.25 -> 0.50
+  堆占用       10532 KiB -> 212 KiB
+  删除耗时     62976 次 contacts_remove 共 7.6 ms（单次 0.12 µs）
+  抖动         100000 次删一条加一条共 17.7 ms，桶表重分配 1 次（本轮）
+
+find 一列做的是 2n 次查找（n 次命中 + n 次落空）。
+find(ns) 是单次查找平均耗时，包含命中的一次 strcmp。
+order 是 contacts_order 取 n 个指针并 qsort 的总耗时，含调用方的 malloc/free。
+load 是 entries/buckets 的装载因子；超过 1.0 说明扩容分配失败，处于降级状态。
+heap 是 glibc mallinfo2 的 uordblks，即已分配未释放的堆字节数；非 glibc 平台为 0。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/contact-list'
+
+==> thread-pool
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/thread-pool'
+cc -std=c11 -Wall -Wextra -Wconversion -O2 -g -pthread -Iinclude -D_POSIX_C_SOURCE=200809L tests/bench_threadpool.c bin/libthreadpool.a -o bin/bench_threadpool
+
+线程池基准（单位：每任务纳秒，5 轮取最小值）
+========================================================================
+
+[1] 空任务：提交 → 调度 → 执行 → 回收
+  线程数    任务数    ns/任务     任务/秒
+  1              200000        197.2        5070750
+  2              200000        232.7        4296603
+  4              200000        605.3        1651945
+  8              200000        982.3        1018003
+
+[2] 对照：每个任务新建一个线程再 join
+  —             20000      37367.1          26762
+
+[3] 固定工作量：每任务忙等 100 µs，共 1000 个任务
+  线程数 总耗时(ms)    加速比         效率
+  1               100.2         1.00           100%
+  2                50.1         2.00           100%
+  4                25.2         3.98           100%
+  8                25.1         4.00            50%
+
+[4] 积压：1 个工作线程，每任务忙等 3 µs，提交 200000 个任务
+  队列       提交数 耗时(ms) 峰值深度 背压次数 RSS峰值(KiB)
+  无界         200000       10.3     196998          0       6916
+线程池基准（单位：每任务纳秒，5 轮取最小值）
+========================================================================
+
+[1] 空任务：提交 → 调度 → 执行 → 回收
+  线程数    任务数    ns/任务     任务/秒
+  1              200000        197.2        5070750
+  2              200000        232.7        4296603
+  4              200000        605.3        1651945
+  8              200000        982.3        1018003
+
+[2] 对照：每个任务新建一个线程再 join
+  —             20000      37367.1          26762
+
+[3] 固定工作量：每任务忙等 100 µs，共 1000 个任务
+  线程数 总耗时(ms)    加速比         效率
+  1               100.2         1.00           100%
+  2                50.1         2.00           100%
+  4                25.2         3.98           100%
+  8                25.1         4.00            50%
+
+[4] 积压：1 个工作线程，每任务忙等 3 µs，提交 200000 个任务
+  队列       提交数 耗时(ms) 峰值深度 背压次数 RSS峰值(KiB)
+  有界(64)     200000      902.2         64     102131        900
+线程池基准（单位：每任务纳秒，5 轮取最小值）
+========================================================================
+
+[1] 空任务：提交 → 调度 → 执行 → 回收
+  线程数    任务数    ns/任务     任务/秒
+  1              200000        197.2        5070750
+  2              200000        232.7        4296603
+  4              200000        605.3        1651945
+  8              200000        982.3        1018003
+
+[2] 对照：每个任务新建一个线程再 join
+  —             20000      37367.1          26762
+
+[3] 固定工作量：每任务忙等 100 µs，共 1000 个任务
+  线程数 总耗时(ms)    加速比         效率
+  1               100.2         1.00           100%
+  2                50.1         2.00           100%
+  4                25.2         3.98           100%
+  8                25.1         4.00            50%
+
+[4] 积压：1 个工作线程，每任务忙等 3 µs，提交 200000 个任务
+  队列       提交数 耗时(ms) 峰值深度 背压次数 RSS峰值(KiB)
+
+说明：加速比以 1 线程为基准；效率 = 加速比 / 线程数。
+      [4] 的两行来自两个独立的子进程（ru_maxrss 是进程级高水位，
+      同一进程内先跑一组再跑另一组，第二个数会包含第一个的峰值）。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/thread-pool'
+
+==> word-count
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/word-count'
+输入：bin/bench_input.txt，各跑 20 轮
+b256      761 ms
+b1k       747 ms
+b4k       735 ms
+b16k      699 ms
+b64k      693 ms
+
+并行度：8 个文件，合计 39528768 字节，各跑 5 轮
+  seq       548 ms（5 轮合计）
+  -j 1      549 ms（5 轮合计）
+  -j 2      280 ms（5 轮合计）
+  -j 4      193 ms（5 轮合计）
+  -j 8      210 ms（5 轮合计）
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/word-count'
