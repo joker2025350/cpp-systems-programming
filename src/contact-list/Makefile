@@ -6,6 +6,8 @@
 #   make lib        只构建静态库 bin/libcontacts.a
 #   make cli        只构建命令行工具 bin/contacts
 #   make test       构建并运行单元测试
+#   make test-alloc 只跑内存分配失败注入
+#   make test-save-fail 只跑保存失败的注入（目录不可写 / RLIMIT_FSIZE / rename 失败）
 #   make check      用命令行做端到端验证
 #   make sanitize   用 ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make bench      测量不同规模下的构建 / 查找 / 存取耗时
@@ -31,6 +33,7 @@ LIB      := $(OUT)/libcontacts.a
 CLI      := $(OUT)/contacts
 TESTBIN  := $(OUT)/test_contacts
 ALLOCBIN := $(OUT)/test_alloc
+SAVEBIN  := $(OUT)/test_save_fail
 BENCHBIN := $(OUT)/bench_contacts
 
 LIB_OBJ  := $(OUT)/contacts.o
@@ -41,7 +44,7 @@ CLI_OBJ  := $(OUT)/main.o
 # 里的 __wrap_*，libc 内部的分配不受影响。
 WRAPFLAGS := -Wl,--wrap=malloc -Wl,--wrap=calloc
 
-.PHONY: all lib cli test test-alloc check sanitize sanitize-run bench clean
+.PHONY: all lib cli test test-alloc test-save-fail check sanitize sanitize-run bench clean
 
 all: lib cli
 
@@ -70,18 +73,27 @@ $(TESTBIN): tests/test_contacts.c $(LIB) | $(OUT)
 $(ALLOCBIN): tests/test_alloc.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) $(WRAPFLAGS) -o $@
 
+$(SAVEBIN): tests/test_save_fail.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
 $(BENCHBIN): tests/bench_contacts.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
-test: $(TESTBIN) $(ALLOCBIN)
+test: $(TESTBIN) $(ALLOCBIN) $(SAVEBIN)
 	@echo
 	@$(TESTBIN) $(TESTDATA)
 	@echo
 	@$(ALLOCBIN)
+	@echo
+	@$(SAVEBIN)
 
 test-alloc: $(ALLOCBIN)
 	@echo
 	@$(ALLOCBIN)
+
+test-save-fail: $(SAVEBIN)
+	@echo
+	@$(SAVEBIN)
 
 check: $(CLI)
 	@sh tests/check_cli.sh $(CLI) $(TESTDATA)
@@ -92,11 +104,13 @@ sanitize:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
 		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' sanitize-run
 
-sanitize-run: all $(TESTBIN) $(ALLOCBIN)
+sanitize-run: all $(TESTBIN) $(ALLOCBIN) $(SAVEBIN)
 	@echo "\n--- 单元测试（ASan + UBSan）---"
 	@$(TESTBIN) $(TESTDATA)
 	@echo "\n--- 分配失败注入（ASan + UBSan）---"
 	@$(ALLOCBIN)
+	@echo "\n--- 保存失败注入（ASan + UBSan）---"
+	@$(SAVEBIN)
 	@echo "\n--- 命令行（ASan + UBSan）---"
 	@$(CLI) -f $(OUT)/asan_book.txt add alice 13900001111
 	@$(CLI) -f $(OUT)/asan_book.txt add bob 13800002222

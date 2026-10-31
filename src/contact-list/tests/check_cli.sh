@@ -109,6 +109,38 @@ check_rc "未知命令退出码为 2" 2 $?
 "$CLI" -f "$BOOK" load "$WORK/definitely_missing.txt" >/dev/null 2>&1
 check_rc "载入不存在的文件退出码为 1" 1 $?
 
+"$CLI" -f "$BOOK" save "$WORK/no_such_dir/x.txt" >/dev/null 2>&1
+check_rc "保存到不存在的目录退出码为 1" 1 $?
+
+# 保存到不可写的目录。注意权限位的语义：目录的写权限控制的是"在目录里
+# 建立或删除目录项"，不是"改写目录里已有文件的内容"。所以已经存在的
+# book.txt 仍然可写；真正失败的是那一步 fopen("book.txt.tmp") —— 临时
+# 文件必须新建，而新建目录项需要目录写权限。
+RO=$WORK/ro_save
+mkdir -p "$RO"
+printf 'name: keeper, phone: 13000000000\n' > "$RO/book.txt"
+
+if [ "$(id -u)" -ne 0 ]; then
+	"$CLI" -f "$WORK/ro_work.txt" add alice 13900001111 >/dev/null 2>&1
+	chmod 0500 "$RO"
+	err=$("$CLI" -f "$WORK/ro_work.txt" save "$RO/book.txt" 2>&1 >/dev/null)
+	rc=$?
+	chmod 0700 "$RO"
+
+	check_rc "保存到只读目录退出码为 1" 1 $rc
+
+	case "$err" in
+	*"cannot open file"*) got=OPEN ;;
+	*)                    got=$err ;;
+	esac
+	check_eq "保存失败时指出是打开临时文件失败" "OPEN" "$got"
+	check_eq "保存失败时目标文件未被改动" "name: keeper, phone: 13000000000" \
+	         "$(cat "$RO/book.txt")"
+	check_eq "保存失败时不留 .tmp" "" "$(ls "$RO"/*.tmp 2>/dev/null)"
+else
+	echo "skip  保存到只读目录（以 root 运行，权限位不生效）"
+fi
+
 # ---------------------------------------------------------------- 4. 存取互逆
 "$CLI" -f "$BOOK" save "$WORK/rt1.txt" 2>/dev/null
 
