@@ -433,7 +433,7 @@ make clean
 | 命令行检查 | `make check` | **47 项**，0 失败 |
 | ASan + UBSan + LSan | `make sanitize` | 0 条警告，167 项全过，无报告 |
 | ThreadSanitizer | `make tsan` | 0 条警告，167 项全过，无 data race 报告 |
-| 加严警告 | `CFLAGS` 加 `-Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow` | 非 `-Wcast-qual` 的 **0 条**；`-Wcast-qual` 6 条（5 个旧查询 + 1.2.0 新增的 `threadpool_timeouts`，都在查询函数的 `(threadpool *)p` 转型上），按 C11 6.7.3p6 良定义，见待办 |
+| 加严警告 | `CFLAGS` 加 `-Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes` | 非 `-Wcast-qual` 的 **0 条**；`-Wcast-qual` 全仓 14 条：`threadpool.c` 6 处转型（5 个旧查询 + 1.2.0 新增的 `threadpool_timeouts`）× 编译两次（本模块一次、`word-count` 的驱动依赖一次）= 12 条，另 2 条来自 `concurrent-lock`。都在查询函数的 `(threadpool *)p` 转型上，按 C11 6.7.3p6 良定义，见待办 |
 
 项数从 1.1.0 的 109 + 30 涨到 167 + 47：新增的 58 项单元断言与 17 项命令行检查
 全部围绕带截止时间的提交（子节"缺陷注入"给出这 58 项的检验能力证据）。

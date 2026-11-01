@@ -72,8 +72,9 @@
   `make test` **167 项** 0 失败、`make check` **47 项**全过（含 ASan 版与 TSan 版各跑一遍）；
   全仓单元 **945 → 1003 项** 0 失败（68 + 242 + 466 + 20 + 167 + 40），
   `make check` 全绿（43 / 47 / 6 + 28）；加严构建里非 `-Wcast-qual` 的警告 0 条，
-  `-Wcast-qual` 6 条全部是查询函数的 `(threadpool *)p` 转型（新增的
-  `threadpool_timeouts` 带来第 6 处），按 C11 6.7.3p6 良定义，见模块待办；
+  `-Wcast-qual` 全仓 14 条 = `threadpool.c` 的 6 处转型 × 编译两次（本模块一次、
+  `word-count` 的驱动依赖一次）+ `concurrent-lock` 的 2 条；新增的
+  `threadpool_timeouts` 带来第 6 处，按 C11 6.7.3p6 良定义，见模块待办；
   `testdata` 字节数未变。
 - 文档：模块 README 新增设计要点 9（六个子节，含两处时钟陷阱的实测现象）、
   性能新增"带截止时间的提交贵多少"、实现记录新增 1.2.0 两节（含基准缺陷）、
