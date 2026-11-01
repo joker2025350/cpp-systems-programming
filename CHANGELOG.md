@@ -12,6 +12,77 @@
 
 ---
 
+## 2026-11-01
+
+### thread-pool
+
+- 新增带截止时间的阻塞提交（1.2.0）：`threadpool_submit_wait_until(pool, fn, arg, deadline)`
+  在队列满时等到 `deadline` 这个 `CLOCK_MONOTONIC` **绝对时刻**，到点返回新状态码
+  `TPOOL_ERR_TIMEOUT`，任务不被接受、`arg` 仍归调用方。配套
+  `threadpool_deadline_after(&ts, ms)`（构造时刻）与 `threadpool_timeouts(pool)`
+  （放弃次数）。改的原因：1.1.0 的阻塞提交没有上界，消费端被一个永久阻塞的任务卡住时
+  提交方永远回不来，而容量与任务耗时只能给期望值、不构成上界。
+- 接口取绝对时刻而不是相对时长：`pthread_cond_wait` / `timedwait` 必须在循环里反复调用
+  （虚假唤醒、被 `destroy` 的 broadcast 唤醒都会返回），相对时长若在每次返回后重新换算，
+  等待总长就变成"唤醒次数 × 时长"，没有上界——压力小时完全看不出来。
+- `space` 条件变量改用 `pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)` 初始化。
+  `pthread_cond_timedwait` 按"条件变量自身的时钟"解释截止时间，而该时钟默认是
+  `CLOCK_REALTIME`（POSIX `pthread_condattr_getclock` 默认值）；两边不一致时
+  monotonic 的数值（开机时长）被当成 1970 年的时间点，每次调用都立即 `ETIMEDOUT`。
+  初始化失败时 `threadpool_create` 返回 `TPOOL_ERR_SYSTEM`，不降级成"默认时钟继续跑"——
+  那样 `create` 成功而 `submit_wait_until` 每次都立刻超时，两者自相矛盾。
+- 拿到 `ETIMEDOUT` 之后必须重查条件再放弃：超时与"工作线程恰好腾出空位"可以同时发生，
+  直接返回会偶发白丢一次本来能成功的提交。`closed` 优先于 `timeout`（池已停机比
+  "这次没等到"更根本，且任务绝不能入队，否则就是"静默丢工作"）。工作线程仍然不在
+  满队列上等待，与有没有截止时间无关——那是消除循环等待，不是"最多等多久"。
+- 两条阻塞路径合并成 `submit_wait_impl`（`deadline == NULL` 即 1.1.0 的行为），
+  避免两处"必须重查条件"的逻辑分叉；`threadpool_submit_wait` 的签名与语义不变，
+  句柄仍不透明，因此**没有 ABI 破坏**，`TPOOL_ERR_TIMEOUT` 位于枚举末尾、旧值不变。
+- 驱动新增 `timeout` 子命令（`-c 队列上限 -w 占住线程毫秒 -m 超时毫秒`）：先提交一个
+  忙等 `-w` 的任务占住唯一的工作线程，把队列填满，再用 `-m` 的截止时间提交第三个任务。
+  要求 `-m < -w`，于是"截止时间之前腾不出空位"是 FIFO 保证的事实而不是概率事件；
+  输出同时给出 `timeouts=`、`backpressure=` 与"排空后 completed=3，超时的任务从未执行"。
+- 测试 109 → **167** 项，`make check` 30 → **47** 项。新增 7 组用例：时刻构造
+  （NULL / 负数 / 1500 ms 的 `tv_nsec` 进位 / 与 `clock_gettime` 的区间对照）、
+  参数校验、空队列不等待、满队列等满 55 ms 以上才超时、过去时刻立即超时（< 50 ms）、
+  超时之后池仍可用且重新提交只执行一次、工作线程 0.001 ms 返回 `FULL`、
+  `destroy` 在 5 s 截止时间之前唤醒提交方并返回 `CLOSED`（实测等 1.1 ms）。
+- 测试里的截止时间用本地 `deadline_in()` 构造，不调被测的 `threadpool_deadline_after`：
+  辅助函数若把时钟写错，用它自己造输入去测它自己，两边错在同一处、测试一路通过。
+- 反向验证四处缺陷注入，全部被抓住：① `space` 用默认时钟 → 5 项失败，首条是
+  "确实等到了截止时间（>= 55 ms）实际 0"；② 醒来后不看 `closed` → 4 项失败
+  （`CLOSED` 变 `ok`，被拒绝的任务居然执行了）；③ 删掉 `timeouts++` → 2 项失败；
+  ④ `deadline_after` 改用 `CLOCK_REALTIME` → 3 项区间断言全灭，命令行表现为"永不超时"
+  （原本 30 ms 该超时的调用等到 100 ms 后返回成功）。①④ 说明状态码和耗时都抓不住
+  时钟错配，只有"等待时长"这个观察量能，因此 `check_cli.sh` 也从输出里取出毫秒数、
+  要求落在 20 ~ 500 ms。
+- 基准加第 5 组（同一套负载分别用 `submit_wait` 与 `submit_wait_until`，截止时间每次
+  重算到 300 s 之后）：三次运行里带截止时间的那一行都更慢，差 5.2 ~ 17.0 ms
+  （0.7% ~ 2.4%，折合每次提交 25 ~ 85 ns），与 `clock_gettime` + 一次超时判断的量级相符；
+  但同模式运行间波动 1.5%、两行的背压次数本来就不同，只能得出"没有数量级差别"。
+- 顺带修一个从 1.1.0 起就存在的基准缺陷：`bench_backlog` 在 `fork` 之前没有
+  `fflush(stdout)`，stdout 接管道时是全缓冲，子进程继承父进程缓冲区的副本，
+  `_exit` 前的一次 `fflush` 把"父进程已打印的内容 + 自己那一行"一起写出去——
+  子进程有几个就重复几次。实测修复前 95 行、表头与前三组各出现 4 次，修复后 31 行、
+  各 1 次，每行都合法、不报任何错。改成三行表格后才显形。
+  接终端时是行缓冲，不会复现，只有重定向到文件或管道时出现。
+- 验证（内网 Ubuntu，Linux 6.8.0-138 / gcc 11.4.0，Ryzen 7 5700X 8 核 16 线程）：
+  默认构建、加严警告（`-Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow`）、
+  ASan + UBSan + LSan、TSan 四种构建 **0 警告**，sanitizer 无报告；thread-pool
+  `make test` **167 项** 0 失败、`make check` **47 项**全过（含 ASan 版与 TSan 版各跑一遍）；
+  全仓单元 **945 → 1003 项** 0 失败（68 + 242 + 466 + 20 + 167 + 40），
+  `make check` 全绿（43 / 47 / 6 + 28）；加严构建里非 `-Wcast-qual` 的警告 0 条，
+  `-Wcast-qual` 6 条全部是查询函数的 `(threadpool *)p` 转型（新增的
+  `threadpool_timeouts` 带来第 6 处），按 C11 6.7.3p6 良定义，见模块待办；
+  `testdata` 字节数未变。
+- 文档：模块 README 新增设计要点 9（六个子节，含两处时钟陷阱的实测现象）、
+  性能新增"带截止时间的提交贵多少"、实现记录新增 1.2.0 两节（含基准缺陷）、
+  已知局限把"阻塞提交没有超时"换成四条更具体的限制（调用方给错时刻、精度是
+  "至少等到"、超时后不重试、不做优先级）、待办划掉该项并补上 `wait_until`；
+  根 README 模块表同步项数与描述。
+
+---
+
 ## 2026-10-31
 
 ### contact-list
