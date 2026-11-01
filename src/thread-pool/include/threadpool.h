@@ -18,9 +18,18 @@
  *                          上限只算尚未被取走的任务，不含正在执行的，因此在途任务
  *                          总数至多为 max_queued + nthreads。
  *   背压（backpressure）    生产速度高于消费速度时，让生产端承担等待，而不是让
- *                          队列与内存无限增长。本模块给出两种施加方式：立即失败
- *                          （threadpool_submit 返回 TPOOL_ERR_FULL）与阻塞等待
- *                          （threadpool_submit_wait）。
+ *                          队列与内存无限增长。本模块给出三种施加方式：立即失败
+ *                          （threadpool_submit 返回 TPOOL_ERR_FULL）、阻塞等待
+ *                          （threadpool_submit_wait）与有上界的等待
+ *                          （threadpool_submit_wait_until）。
+ *   截止时间（deadline）    一个**绝对时刻**，不是"还要等多久"的相对时长。
+ *                          对应的相对概念是超时（timeout），例如"最多等 30 ms"。
+ *                          接口用绝对时刻，是因为相对时长在每次被唤醒后都会被
+ *                          重新计时，等待总长会随唤醒次数漂移；绝对时刻不会。
+ *   单调时钟（monotonic clock）CLOCK_MONOTONIC：从某个不指定的起点（Linux 上是
+ *                          开机）单调递增的时钟，不受系统时间调整影响。
+ *                          本模块的截止时间一律按它解释。相对的 CLOCK_REALTIME
+ *                          会被 NTP 步进或手工改时间，把 30 ms 的等待变成任意长。
  *
  * 为什么用不透明句柄（opaque handle）而不是像 04/05 那样公开结构体：
  * 内部要放 pthread_mutex_t 与两个 pthread_cond_t。公开它们意味着头文件必须
@@ -52,16 +61,17 @@
 #define THREADPOOL_H
 
 #include <stddef.h>
+#include <time.h>   /* struct timespec：截止时间用 C 标准的时间点类型表达 */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define THREADPOOL_VERSION_MAJOR 1
-#define THREADPOOL_VERSION_MINOR 1
+#define THREADPOOL_VERSION_MINOR 2
 #define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "1.1.0"
+#define THREADPOOL_VERSION_STRING "1.2.0"
 
 /* ------------------------------------------------------------------
  * 状态码
@@ -74,7 +84,9 @@ typedef enum {
 	TPOOL_ERR_SYSTEM   = 3,  /* pthread_create / pthread_* 返回错误码 */
 	TPOOL_ERR_CLOSED   = 4,  /* 池已进入停机流程，不再接收新任务 */
 	TPOOL_ERR_BLOCKING = 5,  /* 该调用会永久阻塞当前线程，被拒绝执行 */
-	TPOOL_ERR_FULL     = 6   /* 有界池的队列已满，任务未被接受（仅 submit 会返回） */
+	TPOOL_ERR_FULL     = 6,  /* 有界池的队列已满，任务未被接受（仅 submit 会返回） */
+	TPOOL_ERR_TIMEOUT  = 7   /* 等到截止时间队列仍然满，任务未被接受
+	                          * （仅 submit_wait_until 会返回） */
 } tpool_status;
 
 /* ------------------------------------------------------------------
@@ -170,6 +182,54 @@ tpool_status threadpool_submit(threadpool *p, tpool_task_fn fn, void *arg);
 tpool_status threadpool_submit_wait(threadpool *p, tpool_task_fn fn, void *arg);
 
 /*
+ * 有上界的阻塞提交：等到出现空位，但最多等到 deadline 这个绝对时刻。
+ *
+ * deadline 是一个指向 struct timespec 的**绝对时刻**，按 CLOCK_MONOTONIC 解释，
+ * 由调用方给出；不是"还要等多少毫秒"的相对时长。用绝对时刻而不是相对时长，
+ * 是因为相对时长在实现上只能换算成"调用当前的时刻 + 时长"再交给
+ * pthread_cond_timedwait，而这个函数可能因为虚假唤醒被调用多次——每次重新
+ * 换算就会把等待总长变成"唤醒次数 × 时长"，没有上界。绝对时刻在多次唤醒之间
+ * 不变，因此等待总长有上界。
+ *
+ * 为什么由调用方给而不是模块内部取：只有调用方知道这次等多久；而且把"取当前
+ * 时间"放在模块内部，等于把时钟选择藏进库里，调用方无法在自己的时间预算里
+ * 扣掉前面几步已经花掉的时间。
+ *
+ * 构造这个时刻请用 threadpool_deadline_after，不要自己调 clock_gettime：
+ * 截止时间与条件变量的时钟必须一致，写错时钟的表现是"每次调用都立刻超时"，
+ * 没有任何编译期或运行期提示（见 README 设计要点 9.2）。
+ *
+ * 返回值：
+ *   TPOOL_OK            已被接受，保证执行一次
+ *   TPOOL_ERR_TIMEOUT   到截止时间队列仍然满，任务未被接受，arg 仍归调用方
+ *   TPOOL_ERR_CLOSED    等待期间池进入停机流程（优先于 TIMEOUT 上报：
+ *                       池已经不存在这件事与"这次没等到空位"相比更根本）
+ *   TPOOL_ERR_PARAM     p == NULL、fn == NULL 或 deadline == NULL
+ *   TPOOL_ERR_NOMEM     任务节点分配失败
+ *   TPOOL_ERR_FULL      工作线程调用且队列已满（原因同 threadpool_submit_wait）
+ *
+ * 无界池上它等价于 threadpool_submit：队列永不满，截止时间不会被用到。
+ *
+ * 超时**不是**错误状态下的失败：队列满是一个正常的流控结果，调用方可以重试、
+ * 可以降级、也可以放弃。库不做重试，因为重试间隔与放弃条件都是调用方的策略。
+ */
+tpool_status threadpool_submit_wait_until(threadpool *p, tpool_task_fn fn, void *arg,
+                                         const struct timespec *deadline);
+
+/*
+ * 把"从现在起 timeout_ms 毫秒之后"的 CLOCK_MONOTONIC 绝对时刻写入 *out。
+ *
+ * 存在的理由是让上面那个时钟约定只在一个地方实现。调用方自己写
+ * clock_gettime(CLOCK_MONOTONIC, &ts) 再手工加毫秒，容易漏掉 tv_nsec 进位
+ * （tv_nsec 允许的取值范围是 [0, 10^9)，超出属于非法 timespec），
+ * 也容易顺手写成 CLOCK_REALTIME。
+ *
+ * timeout_ms == 0 表示"时刻就是现在"，因此队列满时立即超时，队列有空位时照常
+ * 入队。timeout_ms < 0 或 out == NULL 返回 TPOOL_ERR_PARAM。
+ */
+tpool_status threadpool_deadline_after(struct timespec *out, long timeout_ms);
+
+/*
  * 屏障：阻塞到"任务队列为空且没有任务正在执行"。
  * 返回时，所有在此调用之前成功提交的任务都已经执行完毕。
  *
@@ -207,13 +267,23 @@ int threadpool_thread_count(const threadpool *p);
 size_t threadpool_capacity(const threadpool *p);
 
 /*
- * 累计"因队列已满而真正进入等待"的 submit_wait 次数。
+ * 累计"因队列已满而真正进入等待"的次数，两条阻塞提交路径都计入
+ * （submit_wait 与 submit_wait_until），不管最后等到了空位还是等到了截止时间。
  *
  * 它回答的问题是"背压有没有生效"，这是耗时与内存都答不了的问题：
  * 提交端阻塞了 3 ms 与"恰好每次都有空位、只是任务本身慢"，从外部看都是 3 ms。
  * 无界池上恒为 0。
  */
 unsigned long long threadpool_backpressure(const threadpool *p);
+
+/*
+ * 累计因到达截止时间而放弃的提交次数，只统计 threadpool_submit_wait_until。
+ *
+ * 与 backpressure 并列看才有意义：backpressure 里包含超时的那些次。
+ * 若 backpressure 高而 timeouts 为 0，说明容量偏小但预算够用；
+ * 两者一起涨说明容量对当前负载不够，提交端已经在丢任务。
+ */
+unsigned long long threadpool_timeouts(const threadpool *p);
 
 /* 状态码的英文短名，用于日志 */
 const char *threadpool_status_string(tpool_status status);

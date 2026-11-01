@@ -1,7 +1,7 @@
 /*
  * test_threadpool.c —— threadpool 模块的单元测试
  *
- * 覆盖七类行为：
+ * 覆盖八类行为：
  *   1. 参数校验与生命周期（含重复 create/destroy）
  *   2. 任务语义：每个提交的任务恰好执行一次，参数正确送达
  *   3. 队列语义：FIFO 顺序
@@ -9,6 +9,7 @@
  *   5. 同步语义：wait 的正确性、幂等性，以及工作线程调用 wait 被拒绝
  *   6. 停机语义：destroy 优雅停机（排空队列而不是丢弃）
  *   7. 有界队列与背压：容量约束、满即失败、阻塞提交、工作线程不等待空位
+ *   8. 带截止时间的提交：时刻构造、超时、过去时刻、closed 优先、工作线程拒绝
  *
  * 计数一律用 __atomic 内建函数。这些调用会被 ThreadSanitizer 识别为原子访问，
  * 因此测试本身在 TSan 下必须是干净的 —— 如果测试自己有数据竞争，
@@ -1217,6 +1218,483 @@ static void test_destroy_wakes_blocked_submitter(void) {
 }
 
 /* ---------------------------------------------------------------- */
+/* 8. 带截止时间的提交                                                */
+/* ---------------------------------------------------------------- */
+
+/*
+ * 本地构造一个"从现在起 ms 毫秒之后"的 CLOCK_MONOTONIC 绝对时刻。
+ *
+ * 刻意不用 threadpool_deadline_after 来造测试输入：被测模块的辅助函数若把时钟
+ * 写错，用它自己造出来的截止时间去测它自己，两边错在同一个地方，测试会一路通过。
+ * 这个函数与被测模块无调用关系，只在 deadline_after 那一条用例里被当成对照物。
+ */
+static void deadline_in(struct timespec *ts, long ms) {
+	(void)clock_gettime(CLOCK_MONOTONIC, ts);
+	ts->tv_sec  += ms / 1000;
+	ts->tv_nsec += (ms % 1000) * 1000000L;
+	if (ts->tv_nsec >= 1000000000L) {
+		ts->tv_sec  += 1;
+		ts->tv_nsec -= 1000000000L;
+	}
+}
+
+/* 两个 CLOCK_MONOTONIC 时刻之间相差多少毫秒（后者减前者） */
+static double ms_between(const struct timespec *from, const struct timespec *to) {
+	return ((double)to->tv_sec - (double)from->tv_sec) * 1000.0
+	     + ((double)to->tv_nsec - (double)from->tv_nsec) / 1e6;
+}
+
+/* 阻塞提交（带截止时间）：在独立线程里调用，主线程 join 之后读结果 */
+typedef struct {
+	threadpool     *pool;
+	slot           *s;
+	struct timespec deadline;
+	tpool_status    status;
+	double          wait_ms;
+} until_submit;
+
+static void *until_submit_main(void *arg) {
+	until_submit *b  = (until_submit *)arg;
+	double        t0 = now_ms();
+
+	b->status  = threadpool_submit_wait_until(b->pool, task_mark, b->s, &b->deadline);
+	b->wait_ms = now_ms() - t0;
+	return NULL;
+}
+
+/* 在工作线程里调用 submit_wait_until：满队列上必须立刻返回 FULL，不能等超时 */
+typedef struct {
+	threadpool     *pool;
+	gate           *go;
+	struct timespec deadline;
+	long            reached;
+	long            done;
+	tpool_status    status;
+	double          wait_ms;
+} until_probe;
+
+static void task_until_probe(void *arg) {
+	until_probe *w  = (until_probe *)arg;
+	double       t0;
+
+	(void)atomic_inc(&w->reached);
+	gate_wait(w->go, 2000);
+
+	t0 = now_ms();
+	w->status  = threadpool_submit_wait_until(w->pool, task_nop, NULL, &w->deadline);
+	w->wait_ms = now_ms() - t0;
+
+	atomic_store_release(&w->done, 1);
+}
+
+static void test_deadline_after_helper(void) {
+	struct timespec ts;
+	struct timespec now;
+	double          diff;
+
+	printf("\n--- 截止时间的构造 ---\n");
+
+	expect_status("deadline_after(NULL) 被拒绝",
+	              threadpool_deadline_after(NULL, 10), TPOOL_ERR_PARAM);
+	expect_status("deadline_after(-1 ms) 被拒绝",
+	              threadpool_deadline_after(&ts, -1), TPOOL_ERR_PARAM);
+
+	expect_status("deadline_after(&ts, 120) 成功",
+	              threadpool_deadline_after(&ts, 120), TPOOL_OK);
+	(void)clock_gettime(CLOCK_MONOTONIC, &now);
+	diff = ms_between(&now, &ts);
+	expect_true("结果在 115 ~ 1000 ms 之后（含调用开销）", diff >= 115.0 && diff <= 1000.0);
+	expect_true("tv_nsec 落在 [0, 10^9)", ts.tv_nsec >= 0 && ts.tv_nsec < 1000000000L);
+	printf("info  deadline_after(120) 实测领先 %.3f ms\n", diff);
+
+	/*
+	 * 1500 ms 是最容易暴露 tv_nsec 不进位的值：tv_nsec 加上 5×10^8 之后
+	 * 常常超过 10^9，若实现只写 tv_nsec 而不进位，得到一个非法 timespec，
+	 * pthread_cond_timedwait 会返回 EINVAL 而不是等待。
+	 */
+	expect_status("deadline_after(&ts, 1500) 成功",
+	              threadpool_deadline_after(&ts, 1500), TPOOL_OK);
+	(void)clock_gettime(CLOCK_MONOTONIC, &now);
+	diff = ms_between(&now, &ts);
+	expect_true("1500 ms 仍然落在 [1445, 2500]", diff >= 1445.0 && diff <= 2500.0);
+	expect_true("1500 ms 的 tv_nsec 合法", ts.tv_nsec >= 0 && ts.tv_nsec < 1000000000L);
+
+	expect_status("deadline_after(&ts, 0) 成功",
+	              threadpool_deadline_after(&ts, 0), TPOOL_OK);
+	(void)clock_gettime(CLOCK_MONOTONIC, &now);
+	diff = ms_between(&now, &ts);
+	expect_true("0 ms 就是此刻（|偏差| < 50 ms）", diff > -50.0 && diff < 50.0);
+}
+
+static void test_submit_wait_until_params(void) {
+	threadpool     *p = NULL;
+	slot            s;
+	struct timespec deadline;
+
+	printf("\n--- wait_until 的参数校验 ---\n");
+	(void)memset(&s, 0, sizeof s);
+	s.index = 0;
+	deadline_in(&deadline, 100);
+
+	expect_status("wait_until(NULL 池)",
+	              threadpool_submit_wait_until(NULL, task_mark, &s, &deadline),
+	              TPOOL_ERR_PARAM);
+	expect_status("wait_until(NULL 任务函数)",
+	              threadpool_submit_wait_until(NULL, NULL, &s, &deadline),
+	              TPOOL_ERR_PARAM);
+
+	if (threadpool_create(1, &p) != TPOOL_OK) {
+		expect_true("create(1)", 0);
+		return;
+	}
+
+	expect_status("wait_until(NULL 截止时间) 被拒绝",
+	              threadpool_submit_wait_until(p, task_mark, &s, NULL), TPOOL_ERR_PARAM);
+	expect_int("被拒绝的调用没有留下任务",
+	           (long long)threadpool_submitted(p), 0);
+	expect_int("被拒绝的调用不计入超时",
+	           (long long)threadpool_timeouts(p), 0);
+
+	threadpool_destroy(p);
+}
+
+static void test_submit_wait_until_no_wait(void) {
+	enum { CAP = 4 };
+	threadpool     *p = NULL;
+	slot            s;
+	struct timespec deadline;
+	tpool_status    st;
+	double          t0;
+
+	printf("\n--- wait_until：有空位时不等待 ---\n");
+	(void)memset(&s, 0, sizeof s);
+	s.index = 7;
+
+	if (threadpool_create_bounded(2, CAP, &p) != TPOOL_OK) {
+		expect_true("create_bounded(2, 4)", 0);
+		return;
+	}
+
+	/* 队列空着，截止时间给 2 s：应当立即入队，不应有"因为等到了截止时间"的行为 */
+	deadline_in(&deadline, 2000);
+	t0 = now_ms();
+	st = threadpool_submit_wait_until(p, task_mark, &s, &deadline);
+	printf("info  空队列上 wait_until 耗时 %.3f ms\n", now_ms() - t0);
+
+	expect_status("空队列上返回 TPOOL_OK", st, TPOOL_OK);
+	expect_true("没有等待（< 100 ms）", now_ms() - t0 < 100.0);
+	expect_int("没有进入等待，背压计数为 0",
+	           (long long)threadpool_backpressure(p), 0);
+	expect_int("超时计数为 0", (long long)threadpool_timeouts(p), 0);
+
+	(void)threadpool_wait(p);
+	expect_int("任务确实执行了一次", (long long)atomic_load(&s.hit), 1);
+	expect_int("结果正确", s.result, 14);
+
+	/* 无界池上截止时间用不到：等价于 submit */
+	threadpool_destroy(p);
+	if (threadpool_create(2, &p) != TPOOL_OK) {
+		expect_true("create(2)", 0);
+		return;
+	}
+	deadline_in(&deadline, 1);
+	expect_status("无界池上 wait_until 返回 TPOOL_OK",
+	              threadpool_submit_wait_until(p, task_mark, &s, &deadline), TPOOL_OK);
+	(void)threadpool_wait(p);
+	expect_int("无界池上任务执行两次", (long long)atomic_load(&s.hit), 2);
+
+	threadpool_destroy(p);
+}
+
+static void test_submit_wait_until_timeout(void) {
+	enum { CAP = 1, HOLD_MS = 3000, WAIT_MS = 60 };
+	threadpool     *p = NULL;
+	gate            g;
+	hold_job        h;
+	slot            fill;
+	slot            late;
+	struct timespec deadline;
+	struct timespec retry;
+	tpool_status    st;
+	double          t0;
+	double          waited;
+	long            hold_done = 0;
+
+	/*
+	 * 布局：1 个工作线程、容量 1。
+	 *   A 进闸门任务，占住工作线程，直到 gate_release；
+	 *   队列里放 1 个 filler，填满；
+	 *   主线程用 60 ms 的截止时间提交第三个任务。
+	 * 闸门不放行，队列在整个 60 ms 内不可能出现空位，因此必须超时。
+	 *
+	 * 这条用例同时是"时钟有没有配对"的检查：若 space 条件变量停在
+	 * CLOCK_REALTIME 而截止时间按 CLOCK_MONOTONIC 给，timedwait 会立刻返回
+	 * ETIMEDOUT——状态码仍然是 TIMEOUT，只有 waited 这个数值能区分。
+	 */
+	printf("\n--- wait_until：到截止时间仍未腾出空位 ---\n");
+	(void)memset(&fill, 0, sizeof fill);
+	(void)memset(&late, 0, sizeof late);
+	fill.index = 1;
+	late.index = 2;
+	gate_init(&g);
+	h.g      = &g;
+	h.done   = &hold_done;
+	h.max_ms = HOLD_MS;
+
+	if (threadpool_create_bounded(1, CAP, &p) != TPOOL_OK) {
+		expect_true("create_bounded(1, 1)", 0);
+		gate_destroy(&g);
+		return;
+	}
+
+	expect_int("工作线程已进入闸门任务",
+	           (threadpool_submit(p, task_hold, &h) == TPOOL_OK
+	            && wait_running(p, 1, 2000) == 0) ? 1 : 0, 1);
+	expect_status("把队列填到容量上限",
+	              threadpool_submit(p, task_mark, &fill), TPOOL_OK);
+	expect_int("队列已满（1/1）", (long long)threadpool_queued(p), CAP);
+
+	deadline_in(&deadline, WAIT_MS);
+	t0 = now_ms();
+	st = threadpool_submit_wait_until(p, task_mark, &late, &deadline);
+	waited = now_ms() - t0;
+	printf("info  截止时间 %d ms，实际等待 %.1f ms\n", WAIT_MS, waited);
+
+	expect_status("返回 TPOOL_ERR_TIMEOUT", st, TPOOL_ERR_TIMEOUT);
+	expect_true("确实等到了截止时间（>= 55 ms）", waited >= 55.0);
+	expect_true("没有等到离谱的时间（< 2 s）", waited < 2000.0);
+
+	/* 超时的任务没有被接受：计数、队列、执行痕迹三处都必须不变 */
+	expect_int("submitted 不变（只有闸门任务与 filler）",
+	           (long long)threadpool_submitted(p), 2);
+	expect_int("queued 仍是容量", (long long)threadpool_queued(p), CAP);
+	expect_int("超时的任务从未执行", (long long)atomic_load(&late.hit), 0);
+	expect_int("背压计数 +1（进入过等待）",
+	           (long long)threadpool_backpressure(p), 1);
+	expect_int("超时计数 +1", (long long)threadpool_timeouts(p), 1);
+
+	/* 放行之后池仍然可用：换一个新的截止时间，同一次调用应当成功 */
+	gate_release(&g);
+	deadline_in(&retry, 3000);
+	expect_status("放行后可以用新的截止时间重新提交",
+	              threadpool_submit_wait_until(p, task_mark, &late, &retry), TPOOL_OK);
+
+	(void)threadpool_wait(p);
+	expect_int("三个被接受的任务全部执行",
+	           (long long)threadpool_completed(p), 3);
+	expect_int("重新提交的那个任务只执行一次",
+	           (long long)atomic_load(&late.hit), 1);
+	expect_int("超时没有丢掉任何已接受的任务",
+	           (long long)atomic_load(&hold_done), 1);
+
+	threadpool_destroy(p);
+	gate_destroy(&g);
+}
+
+static void test_submit_wait_until_past_deadline(void) {
+	enum { CAP = 1 };
+	threadpool     *p = NULL;
+	gate            g;
+	hold_job        h;
+	slot            fill;
+	slot            late;
+	struct timespec past = { 0, 0 };
+	tpool_status    st;
+	double          t0;
+	long            hold_done = 0;
+
+	/*
+	 * 截止时间是 {0, 0}：按 CLOCK_MONOTONIC 解释就是"开机那一刻"，早已过去。
+	 * 满队列上应当立刻超时，而不是等一个负的剩余时间。
+	 *
+	 * 这条用例单独存在的理由是它不依赖等待时长：即使实现里的时钟写错，
+	 * {0, 0} 在 REALTIME 下同样是过去，所以它测的是"过去时刻的处理"，
+	 * 而"时钟配对"由前一条用例的 waited 负责。
+	 */
+	printf("\n--- wait_until：截止时间已经过去 ---\n");
+	(void)memset(&fill, 0, sizeof fill);
+	(void)memset(&late, 0, sizeof late);
+	gate_init(&g);
+	h.g      = &g;
+	h.done   = &hold_done;
+	h.max_ms = 3000;
+
+	if (threadpool_create_bounded(1, CAP, &p) != TPOOL_OK) {
+		expect_true("create_bounded(1, 1)", 0);
+		gate_destroy(&g);
+		return;
+	}
+
+	(void)threadpool_submit(p, task_hold, &h);
+	(void)wait_running(p, 1, 2000);
+	(void)threadpool_submit(p, task_mark, &fill);
+	expect_int("队列已满", (long long)threadpool_queued(p), CAP);
+
+	t0 = now_ms();
+	st  = threadpool_submit_wait_until(p, task_mark, &late, &past);
+	printf("info  过去时刻上耗时 %.3f ms\n", now_ms() - t0);
+
+	expect_status("返回 TPOOL_ERR_TIMEOUT", st, TPOOL_ERR_TIMEOUT);
+	expect_true("立即返回（< 50 ms）", now_ms() - t0 < 50.0);
+	expect_int("超时的任务从未执行", (long long)atomic_load(&late.hit), 0);
+	expect_int("超时计数 +1", (long long)threadpool_timeouts(p), 1);
+	expect_int("submitted 不变", (long long)threadpool_submitted(p), 2);
+
+	gate_release(&g);
+	(void)threadpool_wait(p);
+	threadpool_destroy(p);
+	gate_destroy(&g);
+}
+
+static void test_worker_submit_until_does_not_block(void) {
+	enum { MAX_HOLD_MS = 400 };
+	threadpool  *p = NULL;
+	gate         hold_gate;
+	gate         go_gate;
+	hold_job     h;
+	until_probe  w;
+	slot         filler;
+	long         hold_done = 0;
+
+	/*
+	 * 与 test_worker_submit_wait_does_not_block 同一套布局，只是把
+	 * submit_wait 换成 submit_wait_until，且截止时间给到 2 s。
+	 *
+	 * 若实现让工作线程也去等空位，它会一直等到 hold 的 400 ms 兜底超时——
+	 * 于是 status 变成 TIMEOUT、耗时接近 400 ms，两条断言同时失败。
+	 * 正确实现必须立刻返回 FULL，与 deadline 无关：这条规则是消除死锁，
+	 * 不是"最多等多久"的问题。
+	 */
+	printf("\n--- 工作线程在满队列上不等空位（wait_until）---\n");
+	gate_init(&hold_gate);
+	gate_init(&go_gate);
+	h.g      = &hold_gate;
+	h.done   = &hold_done;
+	h.max_ms = MAX_HOLD_MS;
+
+	w.pool    = NULL;
+	w.go      = &go_gate;
+	w.reached = 0;
+	w.done    = 0;
+	w.status  = TPOOL_ERR_CLOSED;   /* 哨兵：不是任何合法返回值 */
+	w.wait_ms = 0.0;
+	deadline_in(&w.deadline, 2000);
+	filler.index = 0;
+
+	if (threadpool_create_bounded(2, 1, &p) != TPOOL_OK) {
+		expect_true("create_bounded(2, 1)", 0);
+		gate_destroy(&hold_gate);
+		gate_destroy(&go_gate);
+		return;
+	}
+	w.pool = p;
+
+	expect_int("闸门任务占住一个工作线程",
+	           (threadpool_submit(p, task_hold, &h) == TPOOL_OK
+	            && wait_running(p, 1, 2000) == 0) ? 1 : 0, 1);
+	expect_status("探针任务被另一个工作线程取走",
+	              threadpool_submit(p, task_until_probe, &w), TPOOL_OK);
+	expect_int("探针已在工作线程内就绪",
+	           wait_for_count(&w.reached, 1, 2000) == 0 ? 1 : 0, 1);
+	expect_status("把队列填到容量上限",
+	              threadpool_submit(p, task_mark, &filler), TPOOL_OK);
+
+	gate_release(&go_gate);
+	expect_int("探针任务已返回", wait_for_count(&w.done, 1, 2000) == 0 ? 1 : 0, 1);
+
+	expect_status("工作线程调用 wait_until 返回 TPOOL_ERR_FULL",
+	              w.status, TPOOL_ERR_FULL);
+	expect_true("该调用没有等待（< 100 ms）", w.wait_ms < 100.0);
+	expect_int("工作线程的提交不计入超时",
+	           (long long)threadpool_timeouts(p), 0);
+	printf("info  工作线程上的 wait_until 耗时 %.3f ms\n", w.wait_ms);
+
+	gate_release(&hold_gate);
+	(void)threadpool_wait(p);
+	threadpool_destroy(p);
+	gate_destroy(&hold_gate);
+	gate_destroy(&go_gate);
+}
+
+static void test_destroy_wakes_until_submitter(void) {
+	enum { CAP = 2, HOLD_MS = 300, DEADLINE_MS = 5000 };
+	threadpool     *p = NULL;
+	gate            g;
+	hold_job        h;
+	until_submit    b;
+	slot            slots[CAP + 1];
+	pthread_t       tid;
+	long            hold_done = 0;
+	double          t0;
+	double          elapsed;
+
+	/*
+	 * 截止时间给到 5 s，而 destroy 在 30 ms 内就会发生：返回码必须是 CLOSED
+	 * 而不是 TIMEOUT。两者的区别不只是错误码——CLOSED 说明"被唤醒后重新检查了
+	 * closed"，TIMEOUT 说明实现把"被 broadcast 唤醒"当成了"到点了"。
+	 *
+	 * 同时验证 waiting 计数仍然有效：destroy 必须等这个提交方离开临界区才能
+	 * 释放池对象，否则对方会对已释放的互斥锁执行 unlock（C11 6.2.4p2），
+	 * 这类 use-after-free 只有 ASan 抓得到。
+	 */
+	printf("\n--- destroy 优先于超时 ---\n");
+	(void)memset(slots, 0, sizeof slots);
+	gate_init(&g);
+	h.g      = &g;
+	h.done   = &hold_done;
+	h.max_ms = HOLD_MS;
+
+	b.pool   = NULL;
+	b.s      = &slots[CAP];
+	b.status = TPOOL_ERR_PARAM;
+	b.wait_ms = 0.0;
+	deadline_in(&b.deadline, DEADLINE_MS);
+
+	if (threadpool_create_bounded(1, CAP, &p) != TPOOL_OK) {
+		expect_true("create_bounded(1, 2)", 0);
+		gate_destroy(&g);
+		return;
+	}
+	b.pool = p;
+
+	(void)threadpool_submit(p, task_hold, &h);
+	(void)wait_running(p, 1, 2000);
+	for (int i = 0; i < CAP; i++) {
+		slots[i].index = i;
+		(void)threadpool_submit(p, task_mark, &slots[i]);
+	}
+
+	if (pthread_create(&tid, NULL, until_submit_main, &b) != 0) {
+		expect_true("提交线程创建成功", 0);
+		gate_release(&g);
+		threadpool_destroy(p);
+		gate_destroy(&g);
+		return;
+	}
+
+	for (int i = 0; i < 200 && threadpool_backpressure(p) == 0; i++) {
+		sleep_ms(1);
+	}
+	expect_int("提交方已进入等待", (long long)threadpool_backpressure(p), 1);
+
+	t0 = now_ms();
+	threadpool_destroy(p);
+	elapsed = now_ms() - t0;
+	(void)pthread_join(tid, NULL);
+
+	expect_status("被唤醒的提交方返回 TPOOL_ERR_CLOSED", b.status, TPOOL_ERR_CLOSED);
+	expect_true("等待远小于截止时间（< 1000 ms）", b.wait_ms < 1000.0);
+	expect_int("destroy 前的已提交任务全部执行",
+	           (long long)hold_done + slots[0].hit + slots[1].hit, 3);
+	expect_int("被拒绝的任务从未执行", (long long)atomic_load(&slots[CAP].hit), 0);
+	expect_true("destroy 没有死锁（< 2 s）", elapsed < 2000.0);
+	printf("info  提交方等了 %.1f ms 后拿到 CLOSED（截止时间 %d ms）\n",
+	       b.wait_ms, DEADLINE_MS);
+
+	gate_destroy(&g);
+}
+
+/* ---------------------------------------------------------------- */
 
 int main(void) {
 	printf("threadpool %s —— 单元测试\n", THREADPOOL_VERSION_STRING);
@@ -1237,6 +1715,13 @@ int main(void) {
 	test_worker_submit_wait_does_not_block();
 	test_bounded_multi_producer();
 	test_destroy_wakes_blocked_submitter();
+	test_deadline_after_helper();
+	test_submit_wait_until_params();
+	test_submit_wait_until_no_wait();
+	test_submit_wait_until_timeout();
+	test_submit_wait_until_past_deadline();
+	test_worker_submit_until_does_not_block();
+	test_destroy_wakes_until_submitter();
 
 	printf("\n----------------------------------------\n");
 	printf("检查项 %d，失败 %d\n", g_checks, g_failures);

@@ -10,6 +10,10 @@
  *   4. 积压时的内存峰值：同一套负载分别用无界队列（非阻塞提交）与有界队列
  *      （阻塞提交）跑，比较队列深度与 RSS 峰值。这是背压唯一能给出的
  *      硬指标——墙钟时间与吞吐在两种模式下都可能相同。
+ *   5. 带截止时间的提交比不带贵多少：同样的有界队列与同样多的背压次数，
+ *      一次用 submit_wait、一次用 submit_wait_until（截止时间每次重算到 300 s
+ *      之后，永不触发）。两者的差值就是 pthread_cond_timedwait 加上一次
+ *      clock_gettime 的价格。选哪条路径要看这个差值有多大，不能凭直觉。
  *
  * 计时只用 CLOCK_MONOTONIC。单次测量噪声较大，因此前三组跑 REPEAT 轮取最小值：
  * 最小值最接近"没有别的进程干扰时"的真实成本，平均值会被偶发的调度抖动抬高。
@@ -171,15 +175,16 @@ static long rss_peak_kib(void) {
  * 提交数 × 任务耗时（秒级），而这一组关心的只是"积压期间"的内存。
  * 子进程直接 _exit 把整个地址空间交还给内核，不需要走优雅停机。
  */
-static void bench_backlog_child(int bounded, size_t cap, int ntasks) {
-	threadpool *p   = NULL;
-	size_t      peak = 0;
-	double      t0;
-	int         submitted = 0;
-	tpool_status st;
+static void bench_backlog_child(int mode, size_t cap, int ntasks) {
+	static const char *labels[] = { "无界", "有界(64)", "有界(64,截止)" };
+	threadpool     *p    = NULL;
+	size_t          peak = 0;
+	double          t0;
+	int             submitted = 0;
+	tpool_status    st;
 
-	st = bounded ? threadpool_create_bounded(1, cap, &p)
-	             : threadpool_create(1, &p);
+	st = (mode == 0) ? threadpool_create(1, &p)
+	                 : threadpool_create_bounded(1, cap, &p);
 	if (st != TPOOL_OK) {
 		printf("  创建失败：%s\n", threadpool_status_string(st));
 		(void)fflush(stdout);
@@ -188,10 +193,22 @@ static void bench_backlog_child(int bounded, size_t cap, int ntasks) {
 
 	t0 = now_ms();
 	for (int i = 0; i < ntasks; i++) {
-		st = bounded ? threadpool_submit_wait(p, task_busy_3us, NULL)
-		             : threadpool_submit(p, task_busy_3us, NULL);
+		if (mode == 0) {
+			st = threadpool_submit(p, task_busy_3us, NULL);
+		} else if (mode == 1) {
+			st = threadpool_submit_wait(p, task_busy_3us, NULL);
+		} else {
+			/*
+			 * 每次重算截止时间：这是调用方的真实做法（每次提交都从"现在"起算），
+			 * 因此这一行包含一次 clock_gettime。把截止时间只算一次会低估使用成本。
+			 */
+			struct timespec deadline;
+
+			(void)threadpool_deadline_after(&deadline, 300000);
+			st = threadpool_submit_wait_until(p, task_busy_3us, NULL, &deadline);
+		}
 		if (st != TPOOL_OK) {
-			break;   /* 两种模式下都不该发生，发生就如实报告提交数 */
+			break;   /* 三种模式下都不该发生（截止时间在 300 s 之后），发生就如实报告 */
 		}
 		submitted++;
 
@@ -213,12 +230,13 @@ static void bench_backlog_child(int bounded, size_t cap, int ntasks) {
 		}
 	}
 
-	printf("  %-12s %8d %10.1f %10zu %10llu %10ld\n",
-	       bounded ? "有界(64)" : "无界",
+	printf("  %-14s %8d %10.1f %10zu %8llu %8llu %10ld\n",
+	       labels[mode],
 	       submitted,
 	       now_ms() - t0,
 	       peak,
 	       threadpool_backpressure(p),
+	       threadpool_timeouts(p),
 	       rss_peak_kib());
 
 	(void)fflush(stdout);
@@ -226,11 +244,23 @@ static void bench_backlog_child(int bounded, size_t cap, int ntasks) {
 }
 
 static void bench_backlog(int ntasks) {
-	printf("\n[4] 积压：1 个工作线程，每任务忙等 3 µs，提交 %d 个任务\n", ntasks);
-	printf("  %-12s %8s %10s %10s %10s %10s\n",
-	       "队列", "提交数", "耗时(ms)", "峰值深度", "背压次数", "RSS峰值(KiB)");
+	printf("\n[4][5] 积压：1 个工作线程，每任务忙等 3 µs，提交 %d 个任务\n", ntasks);
+	printf("  %-14s %8s %10s %10s %8s %8s %10s\n",
+	       "队列", "提交数", "耗时(ms)", "峰值深度", "背压", "超时", "RSS峰值(KiB)");
 
-	for (int mode = 0; mode < 2; mode++) {
+	/*
+	 * fork 之前必须先把 stdout 刷干净。
+	 *
+	 * stdout 接到管道或文件时是全缓冲的，已经打印的内容还留在父进程的用户态
+	 * 缓冲区里。fork 之后子进程继承的是这份缓冲区的副本，子进程里任何一次
+	 * fflush（本函数在 _exit 之前会 fflush）都会把"父进程之前打印的内容 + 自己
+	 * 那一行"一起写出去——于是表头与前三组结果被重复打印 N 次，而每一行看起来
+	 * 都是合法的，不报任何错。这类重复输出只有在管道下才出现：接终端时是行缓冲，
+	 * printf 早就写出去了。
+	 */
+	(void)fflush(stdout);
+
+	for (int mode = 0; mode < 3; mode++) {
 		pid_t pid = fork();
 
 		if (pid == 0) {
@@ -242,6 +272,7 @@ static void bench_backlog(int ntasks) {
 			return;
 		}
 		(void)waitpid(pid, NULL, 0);
+		(void)fflush(stdout);
 	}
 }
 
@@ -302,7 +333,7 @@ int main(void) {
 	bench_backlog(200000);
 
 	printf("\n说明：加速比以 1 线程为基准；效率 = 加速比 / 线程数。\n");
-	printf("      [4] 的两行来自两个独立的子进程（ru_maxrss 是进程级高水位，\n");
-	printf("      同一进程内先跑一组再跑另一组，第二个数会包含第一个的峰值）。\n");
+	printf("      [4][5] 的三行来自三个独立的子进程（ru_maxrss 是进程级高水位，\n");
+	printf("      同一进程内先跑一组再跑另一组，后面的数会包含前面的峰值）。\n");
 	return 0;
 }

@@ -2,12 +2,12 @@
 
 预先创建 N 个工作线程，它们从一条共享的任务队列里取任务执行。
 对外是一个静态库：调用方提交任务函数和参数，其余的生命周期由线程池管理。
-队列可以无界，也可以给定容量上限；后者在队列满时提供两种背压方式
-（拒绝 或 阻塞），把"内存无限增长"提前变成一个可处理的返回值。
+队列可以无界，也可以给定容量上限；后者在队列满时提供三种背压方式
+（拒绝、阻塞、带截止时间的阻塞），把"内存无限增长"提前变成一个可处理的返回值。
 
 线程池解决的是线程创建的固定成本问题。`pthread_create` 要做线程栈、内核调度实体、
-TLS 块等一整套资源分配，实测在这台机器上"创建 + join"一个什么都不做的线程约 17 µs；
-而复用已有线程完成同样一次调度大约 0.12 µs。两者差两个数量级，
+TLS 块等一整套资源分配，实测在这台机器上"创建 + join"一个什么都不做的线程约 16 µs；
+而复用已有线程完成同样一次调度大约 0.11 µs。两者差两个数量级，
 所以任务量大而单个任务小时，复用是唯一可行的做法。
 
 ## 目录结构
@@ -15,14 +15,14 @@ TLS 块等一整套资源分配，实测在这台机器上"创建 + join"一个�
 ```
 thread-pool/
 ├── include/
-│   └── threadpool.h          公开接口：不透明句柄 + 14 个函数 + 7 个状态码
+│   └── threadpool.h          公开接口：不透明句柄 + 17 个函数 + 8 个状态码
 ├── src/
 │   ├── threadpool.c          实现：FIFO 队列、三个条件变量、工作线程主循环、停机流程
 │   └── main.c                命令行驱动，只链接 libthreadpool.a
 ├── tests/
-│   ├── test_threadpool.c     单元测试（含闸门构造的容量与背压用例）
+│   ├── test_threadpool.c     单元测试（含闸门构造的容量、背压与截止时间用例）
 │   ├── check_cli.sh          命令行端到端检查
-│   └── bench_threadpool.c    四组基准
+│   └── bench_threadpool.c    五组基准
 ├── notes/
 │   ├── threadpool_annotated.c   模块化之前的逐行注释版（历史材料，不参与构建）
 │   ├── threadpool_bug_demo.c    故意保留缺陷的演示版（历史材料，不参与构建）
@@ -48,18 +48,21 @@ thread-pool/
 | `threadpool_destroy(pool)` | 优雅停机：排空队列 → 唤醒等待中的提交方 → join 线程 → 释放 |
 | `threadpool_submit(pool, fn, arg)` | 提交任务；队列满时立即返回 `TPOOL_ERR_FULL` |
 | `threadpool_submit_wait(pool, fn, arg)` | 提交任务；队列满时等待空位（工作线程不会被阻塞，见下） |
+| `threadpool_submit_wait_until(pool, fn, arg, deadline)` | 同上，但最多等到 `deadline` 这个绝对时刻，到点返回 `TPOOL_ERR_TIMEOUT` |
+| `threadpool_deadline_after(&ts, ms)` | 把"从现在起 `ms` 毫秒之后"的 `CLOCK_MONOTONIC` 绝对时刻写进 `ts` |
 | `threadpool_wait(pool)` | 屏障：等到队列空且无人执行 |
 | `threadpool_queued(pool)` | 队列中待执行的任务数 |
 | `threadpool_running(pool)` | 正在执行的任务数 |
 | `threadpool_completed(pool)` | 累计执行完成数 |
 | `threadpool_submitted(pool)` | 累计提交成功数 |
 | `threadpool_capacity(pool)` | 队列容量上限；无界池返回 0 |
-| `threadpool_backpressure(pool)` | 累计"因队列满而真正进入等待"的提交次数 |
+| `threadpool_backpressure(pool)` | 累计"因队列满而真正进入等待"的提交次数（两条阻塞路径都计入） |
+| `threadpool_timeouts(pool)` | 累计"到截止时间仍无空位而放弃"的次数 |
 | `threadpool_thread_count(pool)` | 工作线程数 |
 | `threadpool_status_string(s)` | 状态码的英文短名 |
 
 状态码：`TPOOL_OK`、`TPOOL_ERR_PARAM`、`TPOOL_ERR_NOMEM`、`TPOOL_ERR_SYSTEM`、
-`TPOOL_ERR_CLOSED`、`TPOOL_ERR_BLOCKING`、`TPOOL_ERR_FULL`。
+`TPOOL_ERR_CLOSED`、`TPOOL_ERR_BLOCKING`、`TPOOL_ERR_FULL`、`TPOOL_ERR_TIMEOUT`。
 
 ### 所有权
 
@@ -75,9 +78,13 @@ thread-pool/
 ### 线程模型
 
 - `submit` / `wait` 可以从任意线程调用，包括工作线程内部（任务里再提交任务是允许的）。
-- `submit` 与 `submit_wait` 在有界池上行为不同：前者满即返回 `TPOOL_ERR_FULL`，
-  后者阻塞到出现空位。**唯一的例外是工作线程**：工作线程调用 `submit_wait`
-  时若队列已满，直接返回 `TPOOL_ERR_FULL`，不进入等待（理由见设计要点 8.4）。
+- 三个提交入口在有界池上行为不同：`submit` 满即返回 `TPOOL_ERR_FULL`，
+  `submit_wait` 阻塞到出现空位，`submit_wait_until` 阻塞到出现空位或到达截止时间。
+  **唯一的例外是工作线程**：工作线程调用后两者时若队列已满，一律直接返回
+  `TPOOL_ERR_FULL`，不进入等待、也不看截止时间（理由见设计要点 8.4 与 9.5）。
+- `submit_wait_until` 的 `deadline` 是 `CLOCK_MONOTONIC` 的**绝对时刻**，
+  由调用方给出（用 `threadpool_deadline_after` 构造），不是相对时长。
+  传 `NULL` 返回 `TPOOL_ERR_PARAM`——"无限等"由 `submit_wait` 表达。
 - `wait` **不能**由工作线程调用：它等的是"正在执行的任务数归零"，而调用者本身
   就是一个正在执行的任务。实现里用 `pthread_equal(pthread_self(), tids[i])` 检测
   并返回 `TPOOL_ERR_BLOCKING`，不进入等待。
@@ -190,10 +197,12 @@ POSIX 只规定 `pthread_t` 是"用于标识线程的不透明类型"，
 |---|---|---|
 | `threadpool_submit` | 立即返回 `TPOOL_ERR_FULL` | 有降级路径：丢任务、合并、写磁盘、给上游返回 429 |
 | `threadpool_submit_wait` | 阻塞到出现空位再入队 | 不能丢任务，且提交方不怕慢：批处理、文件导入 |
+| `threadpool_submit_wait_until` | 阻塞到出现空位或到达截止时间 | 不能丢任务，但调用方有响应时间预算：请求处理、交互式导入 |
 
-两种都提供，是因为它们对调用方的时间语义完全不同。库只给阻塞版，会把"想丢任务"
+三种都提供，是因为它们对调用方的时间语义完全不同。库只给阻塞版，会把"想丢任务"
 的调用方逼成"自己开一个线程池 + 一个中转队列"；只给拒绝版，则把重试循环
-（带退避、带超时、带放弃）的复杂度推给每个调用方。语义放在接口上，
+（带退避、带超时、带放弃）的复杂度推给每个调用方；只给无上界的阻塞版，
+则把"提交方可能永远回不来"这件事留给调用方自己去发现。语义放在接口上，
 调用点才是可读的。
 
 #### 8.2 容量只约束"排队"，不约束"执行中"
@@ -278,6 +287,100 @@ broadcast 唤醒），因此等待写成 `while (满 && !closed)`。循环退出
 这条任务留在队列里，没有任何线程会取它，`submit_wait` 却返回了 `TPOOL_OK`。
 仓库里对"静默丢工作"的一贯立场是：宁可返回错误，也不能返回成功却什么都不做。
 
+### 9 带截止时间的提交
+
+#### 9.1 截止时间是绝对时刻，不是"还要等多久"
+
+接口收 `struct timespec *deadline`，语义是"等到这个时刻为止"，而不是"最多等 N 毫秒"。
+
+相对时长在实现上只能换算成"进入函数时的当前时刻 + 时长"，再交给
+`pthread_cond_timedwait`。而 `pthread_cond_wait` / `timedwait` 必须在循环里反复调用
+（虚假唤醒、以及被 `destroy` 的 broadcast 唤醒都会让它们返回），每次返回后如果
+重新换算，等待总长就变成"唤醒次数 × 时长"，没有上界——这正是"带超时的等待"
+最容易被写错的地方，而且它在压力小的时候完全看不出来。
+
+绝对时刻在多次唤醒之间不变，长度固定，因此上界是真实的。代价是调用方要知道
+"现在几点"；为了不让每个调用点都自己算，模块提供 `threadpool_deadline_after`：
+
+```c
+struct timespec deadline;
+threadpool_deadline_after(&deadline, 30);          /* 30 ms 之后 */
+st = threadpool_submit_wait_until(p, fn, arg, &deadline);
+if (st == TPOOL_ERR_TIMEOUT) { /* 队列满且没等到空位，arg 仍归调用方 */ }
+```
+
+为什么由调用方给时刻而不是模块内部取：只有调用方知道这次能等多久，也只有调用方
+能在自己的预算里扣掉前面几步已经花掉的时间。库替调用方决定超时值，等于把策略
+藏进实现里。
+
+#### 9.2 条件变量的时钟必须与截止时间的时钟一致
+
+`pthread_cond_timedwait` 按"条件变量自身的时钟"解释截止时间，而这个时钟默认是
+`CLOCK_REALTIME`（POSIX 的 `pthread_condattr_getclock` 默认值）。所以 `space` 这个
+条件变量是用 `pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)` 初始化出来的。
+
+两边不一致的后果不是报错，而是**每次调用都立刻超时**：`CLOCK_MONOTONIC` 的值是
+"开机以来的时长"，例如 97000 秒；把它当成 `CLOCK_REALTIME`（1970 年起的秒数）看，
+对应 1970-01-02，永远在过去。
+
+这个缺陷第一次真跑就复现了，而且是缺陷注入验证抓到的：
+把 `init_space_cond` 改回默认时钟后，单元测试里"确实等到了截止时间（>= 55 ms）"
+实测 **0 ms**，另有 4 项连带失败（超时之后的重试、`destroy` 优先于超时）。
+值得注意的是**状态码仍然全部正确**——`TPOOL_ERR_TIMEOUT` 照常返回，
+只有等待时长这一个数字能区分"等满了 30 ms"与"立刻放弃"。所以
+`tests/check_cli.sh` 里也加了一条：从输出里取出等待毫秒数，要求它在 20 ~ 500 ms。
+
+反过来把截止时间改成 `CLOCK_REALTIME` 同样不行：系统时间被 NTP 步进或手工调整时，
+"30 ms 之后"可能变成几小时之后。把时钟改成 `CLOCK_REALTIME` 的注入也做了，
+表现是**永不超时**——`timedwait` 认为截止时间在几十年后，于是一直等到腾出空位为止
+（命令行实测：原本 30 ms 该超时的调用，等了 100 ms 之后返回成功）。
+
+初始化失败时 `threadpool_create` 返回 `TPOOL_ERR_SYSTEM`，不做"退回默认时钟继续跑"的
+降级：那样 `create` 返回成功、而 `submit_wait_until` 每次都立即超时，两者互相矛盾。
+
+#### 9.3 超时与"腾出空位"可以同时发生
+
+`pthread_cond_timedwait` 返回 `ETIMEDOUT` 只说明截止时间到了，不说明条件不成立。
+工作线程可能恰好在截止时间之后、本线程被唤醒之前出队。因此拿到 `ETIMEDOUT` 之后
+必须重新检查条件，条件已成立就照常入队：
+
+```c
+if (rc == ETIMEDOUT) {
+    if (p->queued < p->max_queued || p->closed) {
+        continue;        /* 交回 while 条件判断，不要在这里入队 */
+    }
+    timed_out = 1;
+    break;
+}
+```
+
+少了这次重查，表现是"偶发地白丢一次本来能成功的提交"——只在极窄的时间窗里发生，
+而且丢了也不报错，提交方会以为是自己超时。
+
+`timeouts` 计数器与"返回 `TPOOL_ERR_TIMEOUT`"在同一把锁内完成，两者不会互相矛盾
+（不会出现"计了超时但返回成功"）。
+
+#### 9.4 closed 优先于 timeout
+
+被唤醒之后先判断 `closed`，再判断 `timed_out`。池已经进入停机流程这件事比
+"这次没等到空位"更根本：重试没有意义，而且任务绝不能入队（否则就是 8.6 描述的
+静默丢工作）。用 5 秒截止时间 + `destroy` 的用例钉住这条：返回码必须是
+`TPOOL_ERR_CLOSED`，实测等待 1.1 ms 就返回。
+
+#### 9.5 工作线程仍然不等待，与截止时间无关
+
+`submit_wait_until` 在满队列上先判断调用者是不是本池的工作线程，是就返回
+`TPOOL_ERR_FULL`。不考虑"反正有截止时间，等一下也行"——8.4 那条规则是消除
+循环等待，不是"最多等多久"的问题：让消费者等生产者腾位置，等待的上界再小也还是死锁
+的前半段。用 2 秒截止时间的用例钉住：工作线程上的调用 0.001 ms 返回 `FULL`。
+
+#### 9.6 两条阻塞路径共用一份实现
+
+`submit_wait` 就是 `deadline == NULL` 的 `submit_wait_until`（`NULL` 只从内部传，
+公开入口拒绝 `NULL` deadline）。这段代码里有四处"必须重新判断条件"的地方，
+写两份的话，错的那一份表现为偶发丢任务或偶发死锁，都不报错。
+`threadpool_submit_wait` 保留为独立函数是为了保住 1.1.0 的 ABI/API，不新增调用点负担。
+
 ## 构建
 
 ```bash
@@ -285,7 +388,7 @@ cd src/thread-pool
 make            # libthreadpool.a + threadpool 命令行工具
 make test       # 单元测试
 make check      # 命令行端到端检查
-make bench      # 四组基准
+make bench      # 五组基准
 make sanitize   # ASan + UBSan，产物在 bin/sanitize/
 make tsan       # TSan，产物在 bin/tsan/
 make clean
@@ -297,6 +400,7 @@ make clean
 ./bin/threadpool run     -t 4 -n 1000 -w 0.05   # 4 个线程跑 1000 个任务，每个忙等 0.05 ms
 ./bin/threadpool bounded -t 4 -c 8 -n 1000 -w 0.05
                                                 # 队列上限 8，用阻塞提交，输出背压次数
+./bin/threadpool timeout -c 2 -w 100 -m 30      # 队列满时最多等 30 ms，演示超时
 ./bin/threadpool spawn   -n 1000 -w 0.05        # 对照组：每任务新建一个线程
 ./bin/threadpool help
 ```
@@ -307,22 +411,32 @@ make clean
 是"队列真的被卡住过"的唯一直接证据——只报耗时的话，
 "提交端被挡住"与"任务本身慢"无法区分。
 
+`timeout` 在这之上再回答"等到没有"：先提交一个忙等 `-w` 毫秒的任务占住唯一的
+工作线程，把队列填满，然后用 `-m` 毫秒的截止时间提交第三个任务。只要
+`-m < -w`，队列在截止时间之前不可能出现空位，超时是确定的结果而不是概率事件。
+输出里 `timeouts=1`、`backpressure=1` 与"排空后 completed=3，超时的任务从未执行"
+三行合起来才能说明"这次提交被拒绝了，而且它一个字节都没跑过"。
+
 变体构建（`sanitize` / `tsan`）落在独立目录。原因与其它模块相同：make 判断
 "要不要重建"只比较时间戳、不比较编译选项，共用 `bin/` 会留下插桩过的二进制。
 
 ## 测试与验证
 
-环境：GitHub Actions 的 `ubuntu-22.04`（gcc 11.4.0，4 vCPU），2026-10-29 实测。
-项数可以和 1.0.0 那张表比较，耗时不行——1.0.0 的耗时来自 8 核 Ryzen 7 5700X。
+环境：内网 Ubuntu，Linux 6.8.0-138 / gcc 11.4.0，AMD Ryzen 7 5700X（8 核 16 线程），
+2026-11-01 实测。1.0.0 那张表也来自这台机器，因此**只有 1.0.0 与 1.2.0 的耗时可以对比**；
+1.1.0 的耗时来自 CI 的 4 vCPU 运行器（见性能一节），不能混着比。
 
 | 项目 | 命令 | 结果 |
 |---|---|---|
 | 默认构建 | `make` | 0 条警告（`-std=c11 -Wall -Wextra -Wconversion -O2 -g`） |
-| 单元测试 | `make test` | 109 项，0 失败 |
-| 命令行检查 | `make check` | 30 项，0 失败 |
-| ASan + UBSan + LSan | `make sanitize` | 0 条警告，109 项全过，无报告 |
-| ThreadSanitizer | `make tsan` | 0 条警告，109 项全过，无 data race 报告 |
-| 加严警告 | `CFLAGS` 加 `-Wpedantic -Wcast-qual -Wshadow` 等 | 0 条；另有 12 条 `-Wcast-qual`（本模块 5 处 × 2 次编译，另 2 处来自 `concurrent-lock`），计入报告但不判定失败，见待办 |
+| 单元测试 | `make test` | **167 项**，0 失败 |
+| 命令行检查 | `make check` | **47 项**，0 失败 |
+| ASan + UBSan + LSan | `make sanitize` | 0 条警告，167 项全过，无报告 |
+| ThreadSanitizer | `make tsan` | 0 条警告，167 项全过，无 data race 报告 |
+| 加严警告 | `CFLAGS` 加 `-Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow` | 非 `-Wcast-qual` 的 **0 条**；`-Wcast-qual` 6 条（5 个旧查询 + 1.2.0 新增的 `threadpool_timeouts`，都在查询函数的 `(threadpool *)p` 转型上），按 C11 6.7.3p6 良定义，见待办 |
+
+项数从 1.1.0 的 109 + 30 涨到 167 + 47：新增的 58 项单元断言与 17 项命令行检查
+全部围绕带截止时间的提交（子节"缺陷注入"给出这 58 项的检验能力证据）。
 
 1.0.0 的数字（54 项单元 + 19 项命令行）是在内网 Ubuntu 上测的。1.1.0 的用例写完之后
 那台机器连不上，验证改为在 CI 里做，于是第一次真跑就抓到三处问题，全部在测试与
@@ -345,7 +459,7 @@ make clean
    （`tee`，恒为 0），不加 `set -o pipefail` 的话，测试失败而这一步报绿。第 1 条的
    11 项失败因此一度只体现在报告文字里，没有体现在运行结论上。
 
-单元测试覆盖的七类行为：
+单元测试覆盖的八类行为：
 
 | 类别 | 断言内容 |
 |---|---|
@@ -356,6 +470,25 @@ make clean
 | 同步语义 | `wait` 幂等（第二次 < 50 ms 返回）；`wait` 之后池可继续使用；工作线程调用 `wait` 返回 `TPOOL_ERR_BLOCKING` 且主线程不死锁 |
 | 停机语义 | 200 个 1 ms 任务提交后立即 destroy，200 个全部执行完；10 万个空任务的压力测试计数无丢失 |
 | 有界与背压 | 容量 0 被拒绝；队列满时 `submit` 返回 `FULL` 且被拒任务从未执行；`submit_wait` 在满队列上确实阻塞（背压计数 +1，等待 > 30 ms）并在出现空位后返回 `OK`；工作线程在满队列上不等待、直接 `FULL` 且耗时 < 100 ms；4 个生产者 × 500 个任务的采样队列深度不超过容量；`destroy` 唤醒阻塞中的提交方并返回 `CLOSED`，已接受的任务一个不丢 |
+| 带截止时间的提交 | `deadline_after` 的三种输入（NULL / 负数 / 1500 ms 的进位）与结果落在区间内；`wait_until(NULL deadline)` 被拒绝且不留任务；空队列上不等待、背压与超时都为 0；满队列上等满 55 ms 以上才返回 `TIMEOUT`，且 submitted / queued / 执行痕迹三处不变；过去时刻立即返回 `TIMEOUT`（< 50 ms）；超时之后池仍可用、重新提交只执行一次；工作线程在满队列上 0.001 ms 返回 `FULL`；`destroy` 在 5 s 截止时间之前唤醒提交方并返回 `CLOSED` |
+
+### 缺陷注入（反向验证）
+
+测试写了一堆断言，最容易出的问题不是"断言太少"，而是**断言测的东西和以为测的东西
+不是一回事**。所以每轮改动都往实现里注入缺陷，看测试是不是真的抓得住。1.2.0 注入了四处，
+全部被抓住，其中两处的观察值得抄在这里：
+
+| 注入的缺陷 | 结果 |
+|---|---|
+| `space` 用默认时钟（`CLOCK_REALTIME`）初始化 | 5 项失败，首条是"确实等到了截止时间（>= 55 ms）实际 0" |
+| 醒来后不重新检查 `closed` | 4 项失败，`CLOSED` 变成 `ok`，被拒绝的任务居然执行了 |
+| `p->timeouts++` 删掉 | 2 项失败（两条超时计数断言） |
+| `deadline_after` 改用 `CLOCK_REALTIME` | 3 项失败（三条区间断言全灭），命令行表现为"永不超时" |
+
+前两行说明**只有观察量选对了才抓得住**：第一种注入下状态码依然正确、第二种注入下
+耗时依然正常，靠返回码或耗时都发现不了。第三、四行说明辅助函数也要有独立的对照物——
+`deadline_after` 那三条断言拿 `clock_gettime(CLOCK_MONOTONIC)` 当参照，
+而不是拿被测模块自己算出来的值当参照。
 
 第一次跑 TSan 时报告了一处 data race，位置在**测试代码**：
 
@@ -376,21 +509,28 @@ WARNING: ThreadSanitizer: data race
 下面的两组数据来自两台不同的机器，不能混着比：一台是 8 核 Ryzen 7 5700X
 （1.0.0 时的内网验证机），一台是 CI 的 4 vCPU 运行器。同一组内 5 轮取最小值。
 
-### 8 核 Ryzen 7 5700X（1.0.0）
+### 8 核 Ryzen 7 5700X（1.0.0 与 1.2.0）
 
-**空任务（提交 → 调度 → 执行 → 回收），20 万个任务：**
+**空任务（提交 → 调度 → 执行 → 回收），20 万个任务，5 轮取最小值：**
 
-| 线程数 | ns/任务 | 任务/秒 |
-|---|---|---|
-| 1 | 121 ~ 131 | 7.6 ~ 8.2 M |
-| 2 | 146 ~ 154 | 6.5 ~ 6.8 M |
-| 4 | 290 ~ 305 | 3.3 ~ 3.5 M |
-| 8 | 637 ~ 654 | 1.5 ~ 1.6 M |
+| 线程数 | 1.0.0 ns/任务 | 1.2.0 ns/任务 | 1.2.0 任务/秒 |
+|---|---|---|---|
+| 1 | 121 ~ 131 | 113.6 | 8.8 M |
+| 2 | 146 ~ 154 | 139.7 | 7.2 M |
+| 4 | 290 ~ 305 | 270.0 | 3.7 M |
+| 8 | 637 ~ 654 | 552.2 | 1.8 M |
 
-**对照：每任务新建线程再 join，2 万个任务，约 16700 ~ 17130 ns/任务。**
+**对照：每任务新建线程再 join，2 万个任务，1.0.0 约 16700 ~ 17130 ns/任务，
+1.2.0 实测 16241 ns/任务。**
 
 也就是说单线程池的调度成本约为"新建+销毁一个线程"的 **1/140**。
 这个比值是线程池存在的全部理由；任务越短，比值的影响越大。
+
+1.2.0 的两列数字比 1.0.0 低 5%~15%，但**不能读成"变快了"**：本轮改的是提交侧的
+一条分支（`submit` 与工作线程主循环一行未改），差的这部分是同一台机器在不同时间
+的状态（后台进程、CPU 频率、THP 碎片）。证据是同一份 1.2.0 二进制在两次运行里
+也各有 ±5% 的波动。这里列出来只能说明一件事：**新增的截止时间逻辑没有让热路径变慢**，
+数量级没变；要断言"变快了"需要交替跑两版二进制做 A/B，本轮没做。
 
 **固定工作量：每任务忙等 100 µs，共 1000 个任务：**
 
@@ -445,6 +585,27 @@ WARNING: ThreadSanitizer: data race
 剩下的是 10 万次"入队 → 等空位 → 被唤醒"的往返。也就是说**背压不是免费的**：
 它把"内存无限增长"换成了"提交端排队"，两者都表现为变慢，区别在于前者会
 在某次 `malloc` 失败时突然终止，后者是可预测的延迟。选容量时要能接受这个延迟。
+
+### 带截止时间的提交贵多少（1.2.0，Ryzen 7 5700X）
+
+同一台机器、同一套负载（1 个工作线程、容量 64、每任务忙等 3 µs、20 万个任务），
+第三种模式把提交换成 `submit_wait_until`，截止时间每次重算到 300 s 之后（永不触发），
+因此这一行包含一次 `clock_gettime` 与一次 `pthread_cond_timedwait`。
+
+| 队列 | 提交耗时（3 次运行） | 峰值深度 | 超时 | RSS 峰值 |
+|---|---|---|---|---|
+| 无界 | 6.2 ms | 198056 | 0 | 7044 KiB |
+| 有界（64） | 713.6 / 723.5 / 724.6 ms | 64 | 0 | 896 ~ 900 KiB |
+| 有界（64，截止时间） | 730.6 / 730.9 / 729.8 ms | 64 | 0 | 896 ~ 900 KiB |
+
+三次运行里带截止时间的那一行都更慢，差值 5.2 ~ 17.0 ms（0.7% ~ 2.4%），
+折合每次提交 25 ~ 85 ns。这个量级与 `clock_gettime`（VDSO 路径）+ `timedwait`
+多出来的一次超时判断相符，**但不要当成精确结论**：同一模式在三次运行之间
+也有 1.5% 的波动，而"背压次数"本身逐次不同（182465 / 196258 / 195319，
+取决于提交端被挡住的次数），两行的往返次数并不完全一样。
+
+可以确定的只有一句：**代价没有数量级上的差别**，所以"要不要给等待加上界"这个决定
+不该由性能来做——该由"提交方有没有时间预算"来决定。
 
 ## 实现记录
 
@@ -527,6 +688,47 @@ WARNING: ThreadSanitizer: data race
   已经写进文档的"0 条警告"就不再成立于同一前提。真的换的时候，要么钉一个
   固定版本的镜像，要么把新编译器引入的警告当成本次改动的一部分处理掉。
 
+### 1.2.0 加带截止时间的提交
+
+1.1.0 的三条待办里排第一的就是它：`threadpool_submit_wait` 只有"等到出现空位"，
+一旦某个任务永久阻塞（比如在等一个不会到来的网络包），提交方会一直等下去。
+容量与任务耗时只能给出期望值，不构成上界。
+
+| 新增 | 作用 |
+|---|---|
+| `threadpool_submit_wait_until(pool, fn, arg, deadline)` | 满则等到 `deadline`，到点返回 `TPOOL_ERR_TIMEOUT` |
+| `threadpool_deadline_after(&ts, ms)` | 构造 `CLOCK_MONOTONIC` 绝对时刻 |
+| `TPOOL_ERR_TIMEOUT` | 新状态码，位于枚举末尾，已有数值不变 |
+| `threadpool_timeouts(pool)` | "被背压逼到放弃"的次数 |
+
+结构上的改动：`space` 条件变量改用带 `CLOCK_MONOTONIC` 的属性初始化、加一个
+`timeouts` 计数器、两条阻塞路径合并成 `submit_wait_impl`（`deadline == NULL` 即旧行为）。
+句柄仍然不透明，所以这次**没有 ABI 破坏**；`threadpool_submit_wait` 的签名与语义不变。
+
+四个坑，全部写进设计要点 9：时钟必须配对（9.2）、`ETIMEDOUT` 之后要重查条件（9.3）、
+`closed` 优先于超时（9.4）、工作线程不因为"有截止时间"就去等（9.5）。
+其中前两个的错误表现都是"没有错误"——状态码正确、耗时正常，只有专门的观察量能抓到。
+
+`timeouts` 计数器和 `backpressure` 的关系值得单说：`backpressure` 统计"进入过等待"
+的次数，包含最终超时的那些；`timeouts` 只统计放弃的那些。两者并列才能回答
+"容量是不是对当前负载不够"：`backpressure` 高而 `timeouts` 为 0 说明容量偏小但预算够用，
+两个一起涨说明提交端已经在丢任务了。
+
+### 1.2.0 顺带修掉的一个基准缺陷
+
+跑基准时发现的：`bench_backlog` 里 `fork` 之前没有 `fflush(stdout)`。
+stdout 接到管道时是全缓冲的，父进程已经打印的表头与前三组结果还留在用户态缓冲区里；
+`fork` 之后子进程继承这份缓冲区的**副本**，子进程在 `_exit` 之前的一次 `fflush`
+就把"父进程之前打印的内容 + 自己那一行"一起写出去。子进程有几个就重复几次
+（1.1.0 是两个，1.2.0 加到三个），实测修复前 95 行、表头与前三组各出现 4 次，
+修复后 31 行、各 1 次。每一行看起来都合法，不报任何错。
+
+这个缺陷从 1.1.0 起就在，因为报告里 `tail` 只留末尾几十行、`cat` 全文时人也容易
+只扫最后一张表，所以一直没被发现；改成三行表格之后重复的表头挤满屏幕才显形。
+修法是 `fork` 之前 `fflush(stdout)`，`waitpid` 之后再刷一次。**接终端时不会复现**
+（行缓冲会把内容直接写出去），只有重定向到文件或管道时才出现——这类"只在流水线里
+错"的缺陷，正是要把基准输出完整收进 CI 报告才能发现的。
+
 ### 与仓库其它模块的一致性
 
 - 目录、Makefile 目标集、README 节次与 `concurrent-lock` / `contact-list` / `word-count` 相同。
@@ -542,16 +744,22 @@ WARNING: ThreadSanitizer: data race
   消费速度时，队列与任务节点占用的内存线性增长，直到 `malloc` 失败。要背压必须
   显式用 `threadpool_create_bounded`；模块不替调用方决定容量，因为容量取决于
   任务耗时、可接受延迟与可接受内存，这三者只有调用方知道。
-- **阻塞提交没有超时。** `threadpool_submit_wait` 等到出现空位为止。若消费端被
-  一个永久阻塞的任务卡住（例如任务在等一个不会到来的网络包），提交方会一直等下去。
-  容量与任务耗时只能给出期望值，不构成上界；需要上界得调用方自己在外面套一层定时器
-  或改用 `threadpool_submit` 加重试预算。
-- **等待空位的唤醒顺序没有保证。** 多个提交方同时等 `space` 时，
-  `pthread_cond_signal` 唤醒哪一个由实现决定（POSIX 只说"至少唤醒一个"，
-  glibc 实践上偏向等待最久的，但不构成约定）。因此最坏情况下某个提交方会比其他
-  提交方多等若干轮。要严格公平需要显式的票据队列，代价是每个提交都要多一次入队。
+- **阻塞提交的上界依赖调用方给对时刻。** `submit_wait_until` 按 `CLOCK_MONOTONIC`
+  解释 `deadline`。若调用方用 `clock_gettime(CLOCK_REALTIME)` 构造它，monotonic 的
+  数值远小于 realtime，截止时间会被当成早已过去，于是每次都立即超时；反过来给的
+  时刻远在未来就等于没有上界。接口无法在运行期分辨这两种情况——数值上都是一个
+  `timespec`。用 `threadpool_deadline_after` 是唯一的正解，这也是它存在的原因。
+- **超时的精度是"至少等到"。** `pthread_cond_timedwait` 只保证不早于截止时间返回，
+  不保证准时返回：截止时间按内核时钟粒度向上取整，且被唤醒后还要重新竞争互斥锁，
+  在高负载下可能晚几毫秒。拿它做硬实时保证是不对的。
+- **超时之后不重试。** 库把任务还给调用方，重试间隔与放弃条件都是调用方的策略；
+  库不做退避重试，因为那是另一个需要参数的东西（退避曲线、最大尝试次数）。
+- **不做优先级区分。** 超时的提交方与普通提交方在 `space` 上是同一队列，
+  `pthread_cond_signal` 唤醒哪一个由实现决定（POSIX 只说"至少唤醒一个"）。
+  最坏情况下某个提交方会比其他提交方多等若干轮。要严格公平需要显式的票据队列，
+  代价是每次提交多一次入队。
 - **`destroy` 没有强制版本。** 它一定等队列排空；若某个任务永久阻塞，
-  `destroy` 就永久阻塞。没有超时参数，也没有"取消队列中剩余任务"的接口。
+  `destroy` 就永久阻塞。`submit_wait_until` 只给提交方加了上界，停机流程本身仍然没有。
 - **`destroy` 不能从任务函数里调用**，否则它在等 `running` 归零，而自己就是其中之一。
   这一点没有像 `wait` 那样做运行时检测（`destroy` 返回 `void`，无法上报错误）。
 - **`wait` 不是栅栏。** 它只保证"调用之前已提交的任务"都完成；返回之后
@@ -563,22 +771,19 @@ WARNING: ThreadSanitizer: data race
 ## 待办
 
 - [x] 有界队列与提交阻塞（背压），以及队列满时的返回码（1.1.0 完成）
-- [ ] `threadpool_submit_wait` 的超时版本：`submit_wait_until(pool, fn, arg, deadline)`，
-      超时返回一个新状态码；实现上把 `pthread_cond_wait` 换成
-      `pthread_cond_timedwait` 即可，难点在"绝对时间"要由调用方给
-      （`CLOCK_MONOTONIC` 的绝对时刻），否则内部取当前时间会把等待时间变成
-      "每次被唤醒就重新计时"。
-      **注意**：传 `CLOCK_MONOTONIC` 的绝对时刻之前，必须先用
-      `pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)` 初始化 `space` 这个
-      条件变量。否则 `timedwait` 仍按 `CLOCK_REALTIME` 解释截止时间，
-      monotonic 的时刻在它看来永远是过去，每次调用都立即返回 `ETIMEDOUT`。
-      1.1.0 的测试闸门正是栽在这个错配上，见"测试与验证"第 1 条。
+- [x] `threadpool_submit_wait` 的超时版本（1.2.0 完成）：
+      `submit_wait_until(pool, fn, arg, deadline)` + `threadpool_deadline_after`
+      + `TPOOL_ERR_TIMEOUT` + `threadpool_timeouts`。四处坑（时钟配对、超时后重查条件、
+      `closed` 优先、工作线程不等待）见设计要点 9。
+- [ ] `threadpool_wait` 也加一个截止时间版本（`wait_until`），让"等任务全部做完"
+      同样有上界。难点在语义：超时之后那些还没做完的任务仍然会被执行，
+      返回值必须能表达"屏障没到、但池仍健康"，而不是像 `destroy` 那样把状态搞乱。
 - [ ] 分片队列 + work stealing，与当前单队列做吞吐对比
 - [ ] `destroy` 的超时与强制中止版本
 - [ ] 让 `concurrent-lock` 的基准改用本模块提交任务，而不是自己 `pthread_create`：
       `word-count` 的 `-j` 已经在驱动层用上了本模块，基准还没迁移；
       迁移后"锁的实现差异"与"任务调度开销"可以在同一套代码路径上比较
 - [ ] 把互斥量与条件变量移出 `threadpool` 对象（改为指向单独分配的
-      `tp_sync`），消掉查询函数里的 5 处 `-Wcast-qual` 转型。
+      `tp_sync`），消掉查询函数里的 6 处 `-Wcast-qual` 转型。
       C 没有 `mutable`，让 `const threadpool *` 上的查询既能加锁、又不需要
       丢弃 const 的唯一办法，是让锁成为"指针指向的、本身非 const 的对象"。

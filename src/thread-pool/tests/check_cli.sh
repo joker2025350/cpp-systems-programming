@@ -51,6 +51,7 @@ OUT=$("$CLI" help 2>&1)
 check_exit "help 退出码 0" 0 $?
 check_contains "help 列出 run 子命令" "run" "$OUT"
 check_contains "help 列出 bounded 子命令" "bounded" "$OUT"
+check_contains "help 列出 timeout 子命令" "timeout" "$OUT"
 check_contains "help 列出 spawn 子命令" "spawn" "$OUT"
 
 # ------------------------------------------------------------
@@ -110,6 +111,55 @@ check_exit "bounded -c 0 被拒绝（退出码 2）" 2 $?
 
 "$CLI" bounded -t 2 -c 4 -n 0 >/dev/null 2>&1
 check_exit "bounded -n 0 被拒绝（退出码 2）" 2 $?
+
+# ------------------------------------------------------------
+# 有界队列 + 带截止时间的提交
+#
+# -w 100 让唯一的工作线程忙 100 ms，-m 30 让提交方最多等 30 ms：
+# 队列在 100 ms 内不可能腾出空位，因此超时是确定的结果，不是概率事件。
+
+OUT=$("$CLI" timeout -w 100 -m 30 2>&1)
+check_exit "timeout -w 100 -m 30 退出码 0" 0 $?
+check_contains "timeout 报告发生了超时" "后超时，任务未被接受" "$OUT"
+check_contains "timeout 报告队列上限 2" "队列上限 2" "$OUT"
+check_contains "timeout 报告 capacity=2" "capacity=2" "$OUT"
+check_contains "timeout 报告 timeouts=1" "timeouts=1" "$OUT"
+check_contains "timeout 报告背压 1 次" "backpressure=1" "$OUT"
+check_contains "超时的任务没有被计入 submitted" "submitted=3" "$OUT"
+check_contains "排空后 3 个任务全部执行" "completed=3" "$OUT"
+check_contains "超时的任务从未执行" "超时的任务 从未执行" "$OUT"
+
+# 等待时长必须接近 -m。返回码分不清"等满了 30 ms 才超时"与"条件变量的时钟
+# 与截止时间错配、每次都立即超时"——两种情况下状态码都是 TIMEOUT，
+# 只有这个数字能区分。2026-11-01 的缺陷注入正是靠这一条才被抓住的。
+WAITED=$(printf '%s\n' "$OUT" | sed -n 's/.*等待 \([0-9][0-9.]*\) ms 后超时.*/\1/p')
+CHECKS=$((CHECKS + 1))
+if [ -z "$WAITED" ]; then
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-44s 输出里取不到等待时长\n' "timeout 等满了 -m 才超时"
+elif awk -v w="$WAITED" 'BEGIN { exit !(w >= 15 && w <= 500) }'; then
+	printf 'ok    %s（%s ms）\n' "timeout 等满了 -m 才超时" "$WAITED"
+else
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-44s 实际 %s ms，期望 20 ~ 500\n' "timeout 等满了 -m 才超时" "$WAITED"
+fi
+
+# -m 0：截止时间就是"现在"，满队列上必须立即超时
+OUT=$("$CLI" timeout -c 1 -w 200 -m 0 2>&1)
+check_exit "timeout -m 0 退出码 0" 0 $?
+check_contains "timeout -m 0 也走超时分支" "后超时" "$OUT"
+
+"$CLI" timeout -w 30 -m 30 >/dev/null 2>&1
+check_exit "timeout 的 -m 不小于 -w 被拒绝（退出码 2）" 2 $?
+
+"$CLI" timeout -t 4 >/dev/null 2>&1
+check_exit "timeout 的 -t 4 被拒绝（退出码 2）" 2 $?
+
+"$CLI" timeout -c 0 >/dev/null 2>&1
+check_exit "timeout 的 -c 0 被拒绝（退出码 2）" 2 $?
+
+"$CLI" timeout -m -1 >/dev/null 2>&1
+check_exit "timeout 的 -m -1 被拒绝（退出码 2）" 2 $?
 
 # ------------------------------------------------------------
 
