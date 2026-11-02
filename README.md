@@ -9,7 +9,7 @@ build target — not a single-file exercise.
 
 | Module | What it covers | Public interface | Verification |
 |---|---|---|---|
-| [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly | `counter.h` | 68 checks · ASan/UBSan · TSan |
+| [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly; benchmarks driven either by threads the driver creates itself or by tasks submitted to `thread-pool` (`-p`), with per-task batch size and queue capacity as knobs | `counter.h` | 68 checks · 42 end-to-end · ASan/UBSan · TSan |
 | [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, a drain-on-destroy shutdown, and optional bounded queues with three backpressure modes: reject, block, or block until a monotonic deadline | `threadpool.h` | 167 checks · 47 end-to-end · ASan/UBSan · TSan |
 | [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 119 checks · 41 end-to-end · 50 live checks · 24 streaming checks · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list plus a hash index that grows and shrinks with the load factor; text format that round-trips byte for byte; byte-order sorting over a caller-supplied pointer array; save-failure injection (read-only dir, `RLIMIT_FSIZE`, failing `rename`) | `contacts.h` | 242 checks · 466 allocation-failure injections · 20 save-failure injections · 43 end-to-end · ASan/UBSan |
@@ -22,10 +22,19 @@ re-verified on every build. `mysql-client` goes one step further and keeps
 version; `mysql-client/tests/test_pure` links with no MySQL dependency at all and
 runs on machines that have no client library installed.
 
-`word-count` is also the one case where two modules are wired together: its CLI driver
-submits one task per file to `thread-pool`, while `libwordcount.a` itself keeps zero
-references to it — so a caller that only wants to count a file still needs neither
-pthread nor a worker pool.
+Two modules are wired together with `thread-pool`, and in both cases only the CLI
+driver depends on it — `libwordcount.a` and `libcounter.a` themselves keep zero
+references, so a caller that only wants to count a file or increment a counter
+needs neither pthread nor a worker pool:
+
+- `word-count` submits one task per file (`-j`).
+- `concurrent-lock` submits one task per batch of increments (`-p`). That second
+  consumer exists to answer a different question: how much of a throughput number
+  is the counter, and how much is the dispatch that carries it. Measured dispatch
+  cost is ~633 ns per task against ~11 ns per atomic increment, so at a
+  one-increment task the queue dominates and the five implementations become
+  indistinguishable; from ~64 increments per task upward the ranking from the
+  thread-driven benchmark comes back.
 
 ## Layout
 
