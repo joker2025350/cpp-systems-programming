@@ -11,7 +11,8 @@
  *   任务队列（task queue）  待执行任务构成的 FIFO 链表，由互斥锁保护的临界区维护。
  *   生产者（producer）      调用 threadpool_submit 的线程，通常是主线程。
  *   空闲线程（idle worker） 已从队列取不到任务、阻塞在条件变量上的工作线程。
- *   屏障（barrier）         threadpool_wait：阻塞到"队列空且无任务正在执行"为止。
+ *   屏障（barrier）         threadpool_wait / threadpool_wait_until：阻塞到
+ *                          "队列空且无任务正在执行"为止。后者给这个等待加了上界。
  *   优雅停机（graceful）    置位"不再接收新任务"后，把已提交任务全部执行完再退出线程，
  *                          与"立即丢弃队列并退出"相对。
  *   有界队列（bounded queue）队列里"待执行任务数"有一个上限 max_queued。
@@ -50,9 +51,10 @@
  * 线程模型：
  *   - threadpool_submit / threadpool_wait 可以从任意线程调用，包括工作线程
  *     内部（任务函数里再次提交任务）。
- *   - threadpool_wait 不能由工作线程调用：它在等"正在执行的任务数归零"，
- *     而调用它自己就算一个正在执行的任务，必然永久阻塞。本实现对这种调用
- *     返回 TPOOL_ERR_BLOCKING，不进入等待。
+ *   - threadpool_wait / threadpool_wait_until 不能由工作线程调用：它在等"正在
+ *     执行的任务数归零"，而调用它自己就算一个正在执行的任务，必然永久阻塞。
+ *     本实现对这种调用返回 TPOOL_ERR_BLOCKING，不进入等待（带截止时间的那个
+ *     也一样：等到截止时间才报错，等于把"必然死锁"换成"必然白等"）。
  *   - threadpool_destroy 必须由提交方线程调用，且调用时不能有工作线程仍在
  *     调用本模块的函数（否则就是在摧毁对方正在等待的同步原语，属未定义行为）。
  */
@@ -68,10 +70,10 @@ extern "C" {
 #endif
 
 #define THREADPOOL_VERSION_MAJOR 1
-#define THREADPOOL_VERSION_MINOR 2
+#define THREADPOOL_VERSION_MINOR 3
 #define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "1.2.0"
+#define THREADPOOL_VERSION_STRING "1.3.0"
 
 /* ------------------------------------------------------------------
  * 状态码
@@ -85,8 +87,9 @@ typedef enum {
 	TPOOL_ERR_CLOSED   = 4,  /* 池已进入停机流程，不再接收新任务 */
 	TPOOL_ERR_BLOCKING = 5,  /* 该调用会永久阻塞当前线程，被拒绝执行 */
 	TPOOL_ERR_FULL     = 6,  /* 有界池的队列已满，任务未被接受（仅 submit 会返回） */
-	TPOOL_ERR_TIMEOUT  = 7   /* 等到截止时间队列仍然满，任务未被接受
-	                          * （仅 submit_wait_until 会返回） */
+	TPOOL_ERR_TIMEOUT  = 7   /* 到截止时间条件仍未成立。两个入口都会返回它：
+	                          * submit_wait_until 表示"队列仍然满、任务未被接受"，
+	                          * wait_until 表示"还有任务没做完、屏障未到达"。 */
 } tpool_status;
 
 /* ------------------------------------------------------------------
@@ -241,6 +244,38 @@ tpool_status threadpool_deadline_after(struct timespec *out, long timeout_ms);
  */
 tpool_status threadpool_wait(threadpool *p);
 
+/*
+ * 有上界的屏障：阻塞到"队列空且无任务正在执行"，最多等到 deadline 这个
+ * CLOCK_MONOTONIC 绝对时刻。deadline 的构造约定与 threadpool_submit_wait_until
+ * 完全相同，请用 threadpool_deadline_after 生成。
+ *
+ * 为什么需要它：threadpool_wait 没有任何上界。若某个任务永久阻塞（等待一个
+ * 永远不会到达的事件、或者用户代码里的死循环），wait 就永久阻塞，而这条路径上
+ * 调用方通常还持有"必须在限定时间内回话"的责任。给屏障一个截止时间，把
+ * "等不到"变成一个可以被处理的返回值。
+ *
+ * 返回值：
+ *   TPOOL_OK            屏障已到达：此刻队列空、无任务在执行
+ *   TPOOL_ERR_TIMEOUT   到截止时间仍有任务没做完
+ *   TPOOL_ERR_PARAM     p == NULL 或 deadline == NULL
+ *   TPOOL_ERR_BLOCKING  由工作线程调用（原因同 threadpool_wait）
+ *   TPOOL_ERR_SYSTEM    等待期间 pthread_cond_timedwait 返回了 ETIMEDOUT
+ *                       之外的非零错误码
+ *
+ * TIMEOUT 的语义与 threadpool_submit_wait_until 的 TIMEOUT **正好相反**，这是
+ * 本接口最容易用错的一处：
+ *   - submit_wait_until 超时，任务根本没被接受，arg 的所有权仍在调用方手里；
+ *   - wait_until 超时，任务已经在队列里或正在执行，之后仍然会被执行。
+ * 因此超时之后调用方不能回收任何仍在被任务使用的 arg —— 它的生存期至少要
+ * 覆盖到下一次屏障到达（再调 wait_until，或 threadpool_wait / destroy 返回）。
+ * 库无法检测这种误用：释放之后任务再写一块已被 free 的内存，是 C11 6.2.4p2
+ * 意义上的未定义行为，只能靠调用方守约。
+ *
+ * 池没有被"弄坏"：超时只说明这一次没等到，池仍然可以继续提交任务，
+ * 也可以再次调用 wait_until（用一个更晚的截止时间）把同一批任务等完。
+ */
+tpool_status threadpool_wait_until(threadpool *p, const struct timespec *deadline);
+
 /* ------------------------------------------------------------------
  * 状态查询（都会加锁读取，可在任意时刻调用）
  * ------------------------------------------------------------------ */
@@ -284,6 +319,18 @@ unsigned long long threadpool_backpressure(const threadpool *p);
  * 两者一起涨说明容量对当前负载不够，提交端已经在丢任务。
  */
 unsigned long long threadpool_timeouts(const threadpool *p);
+
+/*
+ * 累计 threadpool_wait_until 因到达截止时间而返回 TPOOL_ERR_TIMEOUT 的次数。
+ *
+ * 与 threadpool_timeouts 分开计数，因为两者回答的是两个方向的问题：
+ * 前者是"提交端等不到空位"，后者是"屏障端等不到任务结束"。合成一个计数，
+ * 就只能看出"有东西超时了"，看不出是队列被堵死还是某个任务跑不完。
+ *
+ * 屏障连续超时是一个有用的信号：同一个截止时间下它一路涨，说明任务的实际
+ * 耗时与预期不符；而它停在 0 说明屏障从来都是按时到达的。
+ */
+unsigned long long threadpool_wait_timeouts(const threadpool *p);
 
 /* 状态码的英文短名，用于日志 */
 const char *threadpool_status_string(tpool_status status);

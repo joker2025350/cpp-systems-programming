@@ -52,6 +52,7 @@ check_exit "help 退出码 0" 0 $?
 check_contains "help 列出 run 子命令" "run" "$OUT"
 check_contains "help 列出 bounded 子命令" "bounded" "$OUT"
 check_contains "help 列出 timeout 子命令" "timeout" "$OUT"
+check_contains "help 列出 drain 子命令" "drain" "$OUT"
 check_contains "help 列出 spawn 子命令" "spawn" "$OUT"
 
 # ------------------------------------------------------------
@@ -160,6 +161,65 @@ check_exit "timeout 的 -c 0 被拒绝（退出码 2）" 2 $?
 
 "$CLI" timeout -m -1 >/dev/null 2>&1
 check_exit "timeout 的 -m -1 被拒绝（退出码 2）" 2 $?
+
+# ------------------------------------------------------------
+# 屏障 + 带截止时间的等待
+#
+# -w 100 让唯一的工作线程忙 100 ms，-m 50 让屏障最多等 50 ms：
+# 截止时间落进第一个任务执行期间，超时是构造出来的，不是概率事件。
+#
+# 这里必须同时看两件事：返回码（屏障到没到）与两组计数（超时那一刻还剩多少、
+# 排空之后做完多少）。只看返回码分不清"实现没等到就返回"与"任务真的没做完"。
+
+OUT=$("$CLI" drain -t 1 -n 4 -w 100 -m 50 2>&1)
+check_exit "drain -t 1 -n 4 -w 100 -m 50 退出码 0" 0 $?
+check_contains "drain 报告屏障未到达" "屏障未到达" "$OUT"
+check_contains "drain 后超时" "后超时" "$OUT"
+check_contains "超时时没有任务做完" "completed=0 queued=3 running=1" "$OUT"
+check_contains "drain 报告 wait_timeouts=1" "wait_timeouts=1" "$OUT"
+check_contains "排空后 4 个任务全部正确" "排空后：completed=4，4 个任务结果正确，0 个不正确" "$OUT"
+
+WAITED=$(printf '%s\n' "$OUT" | sed -n 's/.*等待 \([0-9][0-9.]*\) ms 后超时.*/\1/p')
+CHECKS=$((CHECKS + 1))
+if [ -z "$WAITED" ]; then
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-44s 输出里取不到等待时长\n' "drain 等满了 -m 才超时"
+elif awk -v w="$WAITED" 'BEGIN { exit !(w >= 30 && w <= 500) }'; then
+	printf 'ok    %s（%s ms）\n' "drain 等满了 -m 才超时" "$WAITED"
+else
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-44s 实际 %s ms，期望 30 ~ 500\n' "drain 等满了 -m 才超时" "$WAITED"
+fi
+
+# 截止时间远大于串行工作量：屏障必须由"任务做完"触发，而不是等到截止时间。
+# 返回码是 OK 只说明条件成立，waited 才能说明没有白等到 5 s。
+OUT=$("$CLI" drain -t 1 -n 4 -w 20 -m 5000 2>&1)
+check_exit "drain -w 20 -m 5000 退出码 0" 0 $?
+check_contains "drain 报告屏障已到达" "屏障已到达" "$OUT"
+check_contains "到达屏障时任务全部完成" "completed=4 queued=0 running=0" "$OUT"
+check_contains "没有计入等待超时" "wait_timeouts=0" "$OUT"
+check_contains "排空后结果仍然正确" "排空后：completed=4，4 个任务结果正确，0 个不正确" "$OUT"
+
+DRAIN_WAITED=$(printf '%s\n' "$OUT" | sed -n 's/.*屏障已到达，等待 \([0-9][0-9.]*\) ms.*/\1/p')
+CHECKS=$((CHECKS + 1))
+if [ -z "$DRAIN_WAITED" ]; then
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-44s 输出里取不到等待时长\n' "drain 排空即返回"
+elif awk -v w="$DRAIN_WAITED" 'BEGIN { exit !(w >= 0 && w <= 2000) }'; then
+	printf 'ok    %s（%s ms）\n' "drain 排空即返回" "$DRAIN_WAITED"
+else
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-44s 实际 %s ms，期望 0 ~ 2000\n' "drain 排空即返回" "$DRAIN_WAITED"
+fi
+
+"$CLI" drain -t 0 >/dev/null 2>&1
+check_exit "drain -t 0 被拒绝（退出码 2）" 2 $?
+
+"$CLI" drain -n 0 >/dev/null 2>&1
+check_exit "drain -n 0 被拒绝（退出码 2）" 2 $?
+
+"$CLI" drain -m -1 >/dev/null 2>&1
+check_exit "drain -m -1 被拒绝（退出码 2）" 2 $?
 
 # ------------------------------------------------------------
 

@@ -8,6 +8,7 @@
  *   run     [-t 线程数] [-n 任务数] [-w 每个任务的忙等毫秒]
  *   bounded [-t 线程数] [-c 队列上限] [-n 任务数] [-w 每个任务的忙等毫秒]
  *   timeout [-c 队列上限] [-w 占住线程毫秒] [-m 超时毫秒]
+ *   drain   [-t 线程数] [-n 任务数] [-w 每任务忙等毫秒] [-m 等待上限毫秒]
  *   spawn   [-n 任务数]        对照组：每个任务新建一个线程
  *   help
  *
@@ -16,6 +17,8 @@
  * 因此可以观察背压计数。
  * timeout 在 bounded 的基础上再给等待加一个截止时间，用来观察"等到不到"这个
  * 结果本身——它只能从返回码读出来，耗时分不清"等到了"与"等到放弃"。
+ * drain 把同样的截止时间用在屏障上（等任务全部做完），并打印返回瞬间与排空后的
+ * 两组计数：这两组相等说明屏障是真的到了，不等说明超时之后任务仍在继续执行。
  */
 
 #include "threadpool.h"
@@ -92,10 +95,12 @@ static void usage(const char *prog) {
 	printf("  run     [-t 线程数] [-n 任务数] [-w 每任务忙等毫秒]       用线程池执行\n");
 	printf("  bounded [-t 线程数] [-c 队列上限] [-n 任务数] [-w 毫秒]   有界队列 + 阻塞提交\n");
 	printf("  timeout [-c 队列上限] [-w 占住线程毫秒] [-m 超时毫秒]     有界队列 + 带截止时间的提交\n");
+	printf("  drain   [-t 线程数] [-n 任务数] [-w 毫秒] [-m 毫秒]       屏障 + 带截止时间的等待\n");
 	printf("  spawn   [-n 任务数] [-w 每任务忙等毫秒]                   每任务新建线程（对照）\n");
 	printf("  help                                                      显示本页\n\n");
 	printf("默认：-t 4 -c 8 -n 16 -w 0\n");
 	printf("timeout 的默认：-c 2 -w 100 -m 30（固定 1 个工作线程，要求 -m < -w）\n");
+	printf("drain 的默认：-t 1 -n 4 -w 100 -m 50（-m < -w，超时是确定的）\n");
 }
 
 static int parse_int(const char *s, int *out) {
@@ -415,6 +420,127 @@ done:
 	return rc;
 }
 
+/*
+ * 有上界的屏障：等所有已提交任务做完，但最多等到一个截止时间。
+ *
+ * 这个子命令要回答的问题是"等全部做完"有没有上界，以及超时之后那些任务
+ * 到底还算不算数。两个问题各有各的证据：
+ *   - 耗时答不了第一个：等了 50 ms 可能是等到了，也可能是白等到截止时间。
+ *   - completed 答不了第二个：超时那一刻的 completed 与排空之后的 completed
+ *     是两个不同的快照，只看最后一个看不出中途发生了什么。
+ * 所以这里同时打印返回码、等待时长、返回瞬间的三个计数，以及排空后的计数。
+ *
+ * 构造：1 个工作线程 + ntasks 个每任务忙等 work_ms 的任务，串行工作量是
+ * ntasks * work_ms。于是两种结果是可推导的，不看机器快慢：
+ *   -m < work_ms        截止时间落进第一个任务执行期间 → 必然超时；
+ *   -m > ntasks*work_ms 串行也做得完，且远早于截止时间 → 必然 OK。
+ * 介于两者之间的配置结果不确定，本子命令不做断言，如实打印。
+ */
+static int cmd_drain(int nthreads, int ntasks, double work_ms, int wait_ms) {
+	threadpool     *p = NULL;
+	job            *jobs = NULL;
+	struct timespec deadline;
+	tpool_status    st;
+	unsigned long long done_at_return;
+	size_t          queued_at_return;
+	size_t          running_at_return;
+	double          waited;
+	int             rc = 1;
+
+	if (threadpool_create(nthreads, &p) != TPOOL_OK) {
+		(void)fprintf(stderr, "threadpool_create 失败\n");
+		return 1;
+	}
+
+	jobs = (job *)calloc((size_t)ntasks, sizeof *jobs);
+	if (jobs == NULL) {
+		(void)fprintf(stderr, "calloc 失败\n");
+		threadpool_destroy(p);
+		return 1;
+	}
+
+	printf("线程池：%d 个工作线程，提交 %d 个任务，每任务忙等 %.2f ms\n",
+	       nthreads, ntasks, work_ms);
+	printf("屏障的截止时间 %d ms（串行工作量 %.1f ms）\n",
+	       wait_ms, (double)ntasks * work_ms);
+
+	for (int i = 0; i < ntasks; i++) {
+		jobs[i].index    = i;
+		jobs[i].work_ms  = work_ms;
+		jobs[i].checksum = -1;
+		if (threadpool_submit(p, job_entry, &jobs[i]) != TPOOL_OK) {
+			(void)fprintf(stderr, "第 %d 个任务提交失败\n", i);
+			goto done;
+		}
+	}
+
+	if (threadpool_deadline_after(&deadline, (long)wait_ms) != TPOOL_OK) {
+		(void)fprintf(stderr, "threadpool_deadline_after 失败\n");
+		goto done;
+	}
+
+	{
+		double t0 = now_ms();
+
+		st     = threadpool_wait_until(p, &deadline);
+		waited = now_ms() - t0;
+	}
+
+	/*
+	 * 三个计数在返回之后立刻取。它们是"屏障到没到"的直接读数：超时的情况下
+	 * running 至少是 1，或者队列里还有没被取走的任务。
+	 */
+	done_at_return    = threadpool_completed(p);
+	queued_at_return  = threadpool_queued(p);
+	running_at_return = threadpool_running(p);
+
+	if (st == TPOOL_ERR_TIMEOUT) {
+		printf("结果：屏障未到达，等待 %.1f ms 后超时（任务仍在执行，之后会做完）\n",
+		       waited);
+	} else if (st == TPOOL_OK) {
+		printf("结果：屏障已到达，等待 %.1f ms\n", waited);
+	} else {
+		printf("结果：%s（等待 %.1f ms）\n", threadpool_status_string(st), waited);
+	}
+	printf("返回时：completed=%llu queued=%zu running=%zu\n",
+	       done_at_return, queued_at_return, running_at_return);
+	printf("wait_timeouts=%llu\n", threadpool_wait_timeouts(p));
+
+	/*
+	 * 超时之后任务还在跑，此刻读 jobs[i].checksum 就是读一块正在被别的线程
+	 * 写入的内存（C11 5.1.2.4p25 的数据竞争）。必须等到下一次屏障到达才能读，
+	 * 这也是 wait_until 超时之后对调用方的要求：arg 的生存期要覆盖到那时。
+	 */
+	(void)threadpool_wait(p);
+
+	{
+		int bad = 0;
+
+		for (int i = 0; i < ntasks; i++) {
+			long long want = (long long)i * (long long)i + 1;
+
+			if (jobs[i].checksum != want) {
+				bad++;
+			}
+		}
+		printf("排空后：completed=%llu，%d 个任务结果正确，%d 个不正确\n",
+		       threadpool_completed(p), ntasks - bad, bad);
+		if (bad != 0) {
+			goto done;
+		}
+	}
+
+	/* OK 与 TIMEOUT 都是正常结果；只有别的状态码才是失败 */
+	if (st == TPOOL_OK || st == TPOOL_ERR_TIMEOUT) {
+		rc = 0;
+	}
+
+done:
+	threadpool_destroy(p);
+	free(jobs);
+	return rc;
+}
+
 /* 对照组：每个任务 pthread_create 一个线程，join 之后才算完成 */
 /*
  * pthread_create 要求入口是 void *(*)(void *)，而 job_entry 是 void (*)(void *)。
@@ -495,6 +621,17 @@ int main(int argc, char **argv) {
 		work_ms  = 100.0;
 	}
 
+	/*
+	 * drain 的默认值同样单独给：单工作线程 + 每任务 100 ms + 等待上限 50 ms，
+	 * 截止时间落在第一个任务执行期间，超时是构造出来的，不是概率。
+	 */
+	if (strcmp(cmd, "drain") == 0) {
+		nthreads   = 1;
+		ntasks     = 4;
+		work_ms    = 100.0;
+		timeout_ms = 50;
+	}
+
 	for (int i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
 			if (parse_int(argv[++i], &nthreads) != 0) {
@@ -567,6 +704,17 @@ int main(int argc, char **argv) {
 	}
 	if (strcmp(cmd, "spawn") == 0) {
 		return cmd_spawn(ntasks, work_ms);
+	}
+	if (strcmp(cmd, "drain") == 0) {
+		if (nthreads < 1) {
+			(void)fprintf(stderr, "-t 必须 >= 1\n");
+			return 2;
+		}
+		if (ntasks < 1) {
+			(void)fprintf(stderr, "-n 必须 >= 1\n");
+			return 2;
+		}
+		return cmd_drain(nthreads, ntasks, work_ms, timeout_ms);
 	}
 
 	(void)fprintf(stderr, "未知命令：%s\n\n", cmd);

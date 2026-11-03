@@ -12,6 +12,54 @@
 
 ---
 
+## 2026-11-03
+
+### thread-pool
+
+- 新增 `threadpool_wait_until(pool, deadline)`（1.3.0）：屏障"等到队列空且无人执行"
+  这件事从此有上界，等不到返回 `TPOOL_ERR_TIMEOUT`。改的是 1.2.0 已知局限里剩下的
+  那条：`threadpool_wait` 完全没有上界，某个任务永久阻塞时，等它的人就永久阻塞。
+  `deadline` 与提交侧同约定（`CLOCK_MONOTONIC` 绝对时刻，用 `threadpool_deadline_after`
+  构造），`threadpool_wait` 变成 `deadline == NULL` 的同一条实现。
+- 语义上最容易用错的一处写进了头文件与 README 10.1：两条路径都返回
+  `TPOOL_ERR_TIMEOUT`，含义相反。提交侧超时表示任务**没被接受**、`arg` 可以立刻回收；
+  屏障侧超时表示任务**仍在队列里或正在执行、之后一定会做完**，`arg` 的生存期必须覆盖
+  到下一次屏障到达。库检测不了"提前 free"，那按 C11 6.2.4p2 是未定义行为。
+- 新增 `threadpool_wait_timeouts(pool)`：只统计"屏障等到截止时间"的次数，与提交侧的
+  `threadpool_timeouts` 分开。混成一个数字就只能看出"有东西超时了"，看不出是队列被
+  堵死还是某个任务跑不完。
+- 第二个时钟陷阱：`idle` 现在也参与 `timedwait`，必须与 `space` 一样用
+  `pthread_condattr_setclock(CLOCK_MONOTONIC)` 初始化（原本只在 `space` 上做过）。
+  两处合成一个 `init_cond_monotonic`。漏掉的表现与 1.2.0 那次完全相同——每次
+  `timedwait` 立即返回 `ETIMEDOUT`，状态码照样是 `TIMEOUT`。
+- 顺带补一处一直存在的 use-after-free：`destroy` 与屏障等待方在同一把互斥锁上排队时，
+  若 `destroy` 先拿到锁，它会看到 `queued/running` 都是 0 就往下走，把还挂在 `idle`
+  上的等待方连着条件变量一起销毁并 `free`。加法与 `waiting` 同构——一个 `waiters`
+  计数进 `destroy` 的等待条件，屏障方离开时减到 0 并 broadcast 一次 `idle`。
+- 驱动新增 `drain` 子命令（`-t/-n/-w/-m`）：先打印超时那一刻的 `completed/queued/running`，
+  排空后再打印一次 `completed`。两组快照的差别就是"超时之后任务照样做完了"的直接证据，
+  只看最后一个数字看不出来。
+- 新增 `tests/stress_waiter_destroy.c`（`make stress`，ASan，300 轮 × 32 个等待方）。
+  **这条压力检查不是可选项**：把 `destroy` 条件里的 `waiters` 去掉之后，`make test`
+  202 项全过（一次也没撞到），而 `make stress` 立刻报
+  `heap-use-after-free`，读点在 `wait_impl`、释放点在 `threadpool_destroy`。
+  单个等待方醒来只走三四步，`destroy` 的收尾有十来步，前者几乎总是先跑完；
+  单轮 10 次 × 32 个等待方一次都没撞到，300 轮才稳定。所以这条竞态只能由压力检查
+  支撑，常规用例支撑不了——README 10.4 与"缺陷注入"两处都写明了这个边界。
+- 反向验证两处注入：`idle` 改回默认时钟 → 8 项失败（首条"等满了截止时间（>= 40 ms）
+  实际 0"，"排空即返回"变成 `TIMEOUT`，`completed=0 queued=6 running=2`）；
+  去掉 `waiters` → 见上。
+- 性能（Ryzen 7 5700X）：空闲池上 `wait` 9.9~10.1 ns/次、`wait_until` 9.7~9.9 ns/次
+  （差别在噪声内）；"提交 1 个空任务 + 屏障" 5.85~6.01 µs/轮 vs 5.64~8.30 µs/轮，
+  一轮的成本由 futex 唤醒决定，带不带截止时间不改变量级。
+- 验证（内网 Ubuntu，Linux 6.8.0-138 / gcc 11.4.0）：默认 / ASan+UBSan / TSan
+  三种构建 **0 警告**、无 sanitizer 报告；单元 167 → **202**、check 47 → **64**；
+  `make stress` 300 轮 × 32 个等待方无报告；全仓单元 1003 → **1038** 项 0 失败；
+  加严警告非 `-Wcast-qual` 的 **0 条**（`-Wcast-qual` 全仓 20 → **23** 条，
+  多出的 3 条是新查询函数在三个模块里各编一次）；`testdata` 字节数未变。
+
+---
+
 ## 2026-11-02
 
 ### concurrent-lock

@@ -8,6 +8,7 @@
 #   make test       构建并运行单元测试
 #   make check      命令行端到端检查
 #   make bench      三组基准（空任务 / 每任务建线程 / 固定工作量加速比）
+#   make stress     竞态压力：destroy 与屏障等待并发（ASan，300 轮）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make tsan       TSan 重新构建并跑测试（产物在 bin/tsan/）
 #   make clean      删除 bin/（含全部变体）
@@ -37,6 +38,7 @@ LIB      := $(OUT)/libthreadpool.a
 CLI      := $(OUT)/threadpool
 TESTBIN  := $(OUT)/test_threadpool
 BENCHBIN := $(OUT)/bench_threadpool
+STRESSBIN := $(OUT)/stress_waiter_destroy
 
 LIB_OBJ  := $(OUT)/threadpool.o
 CLI_OBJ  := $(OUT)/main.o
@@ -68,6 +70,9 @@ $(TESTBIN): tests/test_threadpool.c $(LIB) | $(OUT)
 $(BENCHBIN): tests/bench_threadpool.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
+$(STRESSBIN): tests/stress_waiter_destroy.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
 test: $(TESTBIN)
 	@echo
 	@$(TESTBIN)
@@ -79,6 +84,20 @@ check: $(CLI)
 bench: $(BENCHBIN)
 	@echo
 	@$(BENCHBIN)
+
+# 竞态压力检查：destroy 与屏障等待并发。默认就跑在 ASan 下——这段竞态的表现是
+# use-after-free，普通构建里它可能什么都不发生，"没有崩溃"不是证据。
+# 没有并进 test：单轮撞到的概率很低，300 轮才稳定，理由见 tests/stress_waiter_destroy.c。
+STRESS_ROUNDS  ?= 300
+STRESS_WAITERS ?= 32
+
+stress:
+	@$(MAKE) --no-print-directory OUT=$(OUT)/stress \
+		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' stress-run
+
+stress-run: $(STRESSBIN)
+	@echo "\n--- 竞态压力：destroy × 屏障等待（ASan）---"
+	@$(STRESSBIN) $(STRESS_ROUNDS) $(STRESS_WAITERS)
 
 # 变体构建：覆盖 OUT 与 CFLAGS 递归调用自身。
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1

@@ -46,10 +46,12 @@ struct threadpool {
 
 	/*
 	 * work：工作线程等"有新任务或需要退出"。
-	 * idle：threadpool_wait / threadpool_destroy 等"队列空且无人执行"。
-	 * space：有界池的提交方等"队列出现空位"。它的时钟被显式设为
-	 *        CLOCK_MONOTONIC（见 init_space_cond），因此 submit_wait_until
-	 *        的截止时间也必须按这个时钟给。
+	 * idle：threadpool_wait / threadpool_wait_until / threadpool_destroy 等
+	 *       "队列空且无人执行"。它的时钟也被设为 CLOCK_MONOTONIC（见
+	 *       init_cond_monotonic），因为 wait_until 要用 timedwait 挂在它上面——
+	 *       这是本模块第二个"时钟配错也不报错"的地方，错误表现与 space 上那次
+	 *       一样：每次 timedwait 都立即超时。
+	 * space：有界池的提交方等"队列出现空位"，同样是 CLOCK_MONOTONIC。
 	 */
 	pthread_cond_t  work;
 	pthread_cond_t  idle;
@@ -67,6 +69,10 @@ struct threadpool {
 	unsigned long long backpressure;/* 累计"因队列满而进入等待"的提交次数 */
 	unsigned long long timeouts;    /* 累计"等到截止时间仍无空位"的次数 */
 	size_t             waiting;     /* 此刻阻塞在 space 上的提交方数量 */
+
+	/* 屏障侧的对称计数：累计"等到截止时间屏障仍未到达"的次数 */
+	unsigned long long wait_timeouts;
+	size_t             waiters;     /* 此刻阻塞在 idle 上的屏障调用方数量 */
 
 	/*
 	 * 队列容量上限。0 表示无界 —— 这是内部表示，公开接口上容量 0 不合法
@@ -180,22 +186,23 @@ static void *worker_main(void *arg) {
  * ------------------------------------------------------------------ */
 
 /*
- * 初始化 space 条件变量，并把它的时钟设为 CLOCK_MONOTONIC。
+ * 初始化一个使用 CLOCK_MONOTONIC 的条件变量。
  *
  * 必须显式设时钟。pthread_cond_timedwait 按"条件变量自身的时钟"解释截止时间，
  * 而这个时钟默认是 CLOCK_REALTIME（POSIX 的 pthread_condattr_getclock 默认值）。
  * 若条件变量停在 REALTIME 而调用方按 CLOCK_MONOTONIC 给绝对时刻，两边量的不是
  * 同一条时间轴：monotonic 的值是"开机以来的时长"（例如 97000 秒，约 1970-01-02），
  * 当成 REALTIME 时间点看永远在过去，于是每次 timedwait 都立即返回 ETIMEDOUT。
- * 表现是 submit_wait_until 从不等待、每次都超时，且没有任何错误提示。
+ * 表现是 submit_wait_until / wait_until 从不等待、每次都超时，且没有任何错误提示。
  *
  * 反过来把截止时间定成 CLOCK_REALTIME 也不可取：系统时间被 NTP 步进或手工改动时，
  * 一个"30 ms 之后"的时刻可能变成几个小时之后（或者已经过去），等待时长失控。
  * CLOCK_MONOTONIC 单调递增，不受这些调整影响，适合表达"多久之后"。
  *
- * 只有 space 需要：另外两个条件变量只用不带超时的 cond_wait，与时钟无关。
+ * space 与 idle 都需要（两者都有人用 timedwait 挂上去），work 不需要：
+ * 只有工作线程在它上面做不带超时的 cond_wait，与时钟无关。
  */
-static tpool_status init_space_cond(pthread_cond_t *cv) {
+static tpool_status init_cond_monotonic(pthread_cond_t *cv) {
 	pthread_condattr_t attr;
 	int                rc;
 
@@ -269,8 +276,7 @@ static tpool_status create_impl(int nthreads, size_t max_queued, threadpool **ou
 		return TPOOL_ERR_SYSTEM;
 	}
 
-	rc = pthread_cond_init(&p->idle, NULL);
-	if (rc != 0) {
+	if (init_cond_monotonic(&p->idle) != TPOOL_OK) {
 		pthread_cond_destroy(&p->work);
 		pthread_mutex_destroy(&p->lock);
 		free(p->tids);
@@ -279,11 +285,11 @@ static tpool_status create_impl(int nthreads, size_t max_queued, threadpool **ou
 	}
 
 	/*
-	 * space 用带 CLOCK_MONOTONIC 的属性初始化（理由见 init_space_cond）。
+	 * space 同样用带 CLOCK_MONOTONIC 的属性初始化（理由见 init_cond_monotonic）。
 	 * 失败时按系统错误上报，不做"退回默认时钟继续跑"的降级：那样
 	 * submit_wait_until 会每次都立即超时，而 create 明明返回了成功。
 	 */
-	if (init_space_cond(&p->space) != TPOOL_OK) {
+	if (init_cond_monotonic(&p->space) != TPOOL_OK) {
 		pthread_cond_destroy(&p->idle);
 		pthread_cond_destroy(&p->work);
 		pthread_mutex_destroy(&p->lock);
@@ -371,8 +377,15 @@ void threadpool_destroy(threadpool *p) {
 	 *    它会在对方仍然拿着 p->lock 这个地址的时候销毁互斥锁并 free(p)，
 	 *    对方随后对这一块已释放内存执行 unlock —— 按 C11 6.2.4p2 对象的生存期
 	 *    已经结束，之后任何访问都是未定义行为。
+	 *
+	 *    waiters 同理，只是方向反过来：屏障等待方等的是"任务做完"，而 destroy
+	 *    自己也在这件事上等待。少了它，最后一个任务结束时 destroy 与屏障方会被
+	 *    同一次 broadcast 唤醒，若 destroy 先拿到锁，它看到的 queued / running
+	 *    都是 0 就往下走，把还挂在 idle 上的屏障方连着条件变量一起销毁并 free。
+	 *    加上之后 destroy 会等屏障方离开临界区（屏障方一到 0 会 broadcast 一次
+	 *    idle，所以这里不会漏唤醒）。
 	 */
-	while (p->queued > 0 || p->running > 0 || p->waiting > 0) {
+	while (p->queued > 0 || p->running > 0 || p->waiting > 0 || p->waiters > 0) {
 		pthread_cond_wait(&p->idle, &p->lock);
 	}
 
@@ -653,7 +666,19 @@ tpool_status threadpool_deadline_after(struct timespec *out, long timeout_ms) {
 	return TPOOL_OK;
 }
 
-tpool_status threadpool_wait(threadpool *p) {
+/*
+ * 两个屏障入口共用的实现。deadline == NULL 表示无上界（threadpool_wait），
+ * 否则是有上界的等待（threadpool_wait_until）。
+ *
+ * 合成一个函数而不是写两份，理由与 submit_wait_impl 相同：这段代码里有两处
+ * "必须先判条件再等、醒来后重新判"的地方，两份实现一旦分叉，错的那份表现为
+ * 偶发的死锁或偶发的提前返回，都不会报错。
+ */
+static tpool_status wait_impl(threadpool *p, const struct timespec *deadline) {
+	int          timed_out = 0;
+	tpool_status wait_err  = TPOOL_OK;
+	tpool_status st;
+
 	if (p == NULL) {
 		return TPOOL_ERR_PARAM;
 	}
@@ -667,19 +692,99 @@ tpool_status threadpool_wait(threadpool *p) {
 	 * 或结果错误。
 	 *
 	 * 不检测的后果是永久阻塞：本函数等的是 running == 0，而调用者自己
-	 * 正是一个 running 的任务，等式永远不成立，且没有任何超时机制能救。
+	 * 正是一个 running 的任务，等式永远不成立。带截止时间的那一版能"解开"
+	 * 这个阻塞，但只是把"永久阻塞"换成"必然白等到截止时间"，所以照样拒绝。
 	 */
 	if (is_worker(p, pthread_self())) {
 		pthread_mutex_unlock(&p->lock);
 		return TPOOL_ERR_BLOCKING;
 	}
 
+	/* 快速路径：池本来就空闲，不计数、不入等待队列 */
+	if (p->queued == 0 && p->running == 0) {
+		pthread_mutex_unlock(&p->lock);
+		return TPOOL_OK;
+	}
+
+	/*
+	 * waiters 与 space 上的 waiting 是同一种东西：告诉 destroy "还有人没离开
+	 * 临界区"。只在真的要进等待时才加，池本来就空闲的快速路径不加——否则每次
+	 * 调用都会在 0 → 1 → 0 上多 broadcast 一次 idle。
+	 */
+	p->waiters++;
+
 	while (p->queued > 0 || p->running > 0) {
-		pthread_cond_wait(&p->idle, &p->lock);
+		int rc;
+
+		if (deadline == NULL) {
+			rc = pthread_cond_wait(&p->idle, &p->lock);
+		} else {
+			/*
+			 * 截止时间是 CLOCK_MONOTONIC 的绝对时刻，必须与 idle 这个条件
+			 * 变量的时钟一致。两者错配时这里每次都立即返回 ETIMEDOUT，
+			 * 见 init_cond_monotonic。
+			 */
+			rc = pthread_cond_timedwait(&p->idle, &p->lock, deadline);
+		}
+
+		if (rc == ETIMEDOUT) {
+			/*
+			 * "到点了"与"最后一个任务恰好做完了"是两件独立的事，可以同时
+			 * 发生：工作线程可能在截止时间之后、本线程被唤醒之前把 running
+			 * 减到 0 并 broadcast。此时条件已经成立，报超时就是把一次成功的
+			 * 等待错记成失败。先重查条件，条件仍不成立才认超时。
+			 */
+			if (p->queued == 0 && p->running == 0) {
+				break;
+			}
+			timed_out = 1;
+			break;
+		}
+		if (rc != 0) {
+			/* 除 ETIMEDOUT 之外的错误（EINVAL 之类）按系统错误上报，
+			 * 不假装"等到了" */
+			wait_err = TPOOL_ERR_SYSTEM;
+			break;
+		}
+	}
+
+	p->waiters--;
+	if (p->waiters == 0) {
+		/*
+		 * 最后一个屏障方离开。destroy 的等待条件里含 waiters，它可能正睡在
+		 * idle 上，没有这次广播就要等到下一次无关的状态变化才会醒。
+		 */
+		pthread_cond_broadcast(&p->idle);
+	}
+
+	if (wait_err != TPOOL_OK) {
+		st = wait_err;
+	} else if (timed_out != 0) {
+		/* 计数与"返回 TIMEOUT"在同一把锁内完成，两者不会互相矛盾 */
+		p->wait_timeouts++;
+		st = TPOOL_ERR_TIMEOUT;
+	} else {
+		st = TPOOL_OK;
 	}
 
 	pthread_mutex_unlock(&p->lock);
-	return TPOOL_OK;
+	return st;
+}
+
+tpool_status threadpool_wait(threadpool *p) {
+	return wait_impl(p, NULL);
+}
+
+tpool_status threadpool_wait_until(threadpool *p, const struct timespec *deadline) {
+	if (deadline == NULL) {
+		/*
+		 * 与 submit_wait_until 同一取舍：不接受 NULL 表示"无限等"。
+		 * 那已经由 threadpool_wait 表达，同一个参数位承载两种语义，
+		 * 调用点读起来就是一个 NULL 与一个时刻，看不出差别在哪。
+		 */
+		return TPOOL_ERR_PARAM;
+	}
+	return wait_impl(p, deadline);
 }
 
 /* ------------------------------------------------------------------
@@ -771,6 +876,17 @@ unsigned long long threadpool_timeouts(const threadpool *p) {
 	return n;
 }
 
+unsigned long long threadpool_wait_timeouts(const threadpool *p) {
+	if (p == NULL) {
+		return 0;
+	}
+	threadpool *mp = (threadpool *)p;
+	pthread_mutex_lock(&mp->lock);
+	unsigned long long n = mp->wait_timeouts;
+	pthread_mutex_unlock(&mp->lock);
+	return n;
+}
+
 const char *threadpool_status_string(tpool_status status) {
 	switch (status) {
 	case TPOOL_OK:           return "ok";
@@ -780,7 +896,7 @@ const char *threadpool_status_string(tpool_status status) {
 	case TPOOL_ERR_CLOSED:   return "pool closed";
 	case TPOOL_ERR_BLOCKING: return "call would block forever";
 	case TPOOL_ERR_FULL:     return "queue full";
-	case TPOOL_ERR_TIMEOUT:  return "deadline reached while queue full";
+	case TPOOL_ERR_TIMEOUT:  return "deadline reached before the condition held";
 	}
 	return "unknown";
 }
