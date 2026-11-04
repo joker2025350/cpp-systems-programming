@@ -67,7 +67,7 @@ static double bench_build(contact_book *book, long n) {
 	char   name[CONTACT_NAME_MAX];
 	double t0;
 
-	contacts_init(book);
+	contacts_init_seeded(book, 0);
 	t0 = now_ms();
 	for (long i = 0; i < n; i++) {
 		make_name(name, sizeof name, i);
@@ -160,7 +160,7 @@ static double bench_load(long *count) {
 	contacts_load_result result = {0, 0, 0};
 	double               t0;
 
-	contacts_init(&dst);
+	contacts_init_seeded(&dst, 0);
 	t0 = now_ms();
 	if (contacts_load(&dst, BENCH_FILE, CONTACTS_LOAD_REPLACE, &result) != CONTACTS_OK) {
 		(void)fprintf(stderr, "载入失败\n");
@@ -209,7 +209,7 @@ static void bench_shrink(long n) {
 	const long           keep = 1024;
 	char                 name[CONTACT_NAME_MAX];
 
-	contacts_init(&book);
+	contacts_init_seeded(&book, 0);
 	for (long i = 0; i < n; i++) {
 		make_name(name, sizeof name, i);
 		if (contacts_add(&book, name, "13800000000") != CONTACTS_OK) {
@@ -309,7 +309,9 @@ int main(void) {
 		contacts_destroy(&book);
 	}
 
-	(void)printf("contacts %s 基准\n\n", CONTACTS_VERSION_STRING);
+	(void)printf("contacts %s 基准\n", CONTACTS_VERSION_STRING);
+	(void)printf("种子固定为 0：哈希不做随机化，桶分布与 1.3.0 逐字节相同，"
+	             "数字可与历史记录对照。\n\n");
 	(void)printf("%8s %12s %12s %12s %12s %12s %10s\n",
 	             "n", "build(ms)", "find(ms)", "order(ms)", "save(ms)", "load(ms)",
 	             "loaded");

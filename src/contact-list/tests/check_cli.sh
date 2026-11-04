@@ -278,6 +278,41 @@ check_rc "空表 list --sort 退出码为 0" 0 $?
 "$CLI" -f "$SBOOK" list --bogus >/dev/null 2>&1
 check_rc "list 未知选项退出码为 2" 2 $?
 
+# ---------------------------------------------------------------- 哈希种子
+# 种子只影响"姓名落到哪个桶"，不影响任何对外可见的结果（查找、排序、文件格式）。
+# 但 stats 会把它打印出来：没有这一行，"复现某次运行的桶分布"就只能靠猜。
+
+check_eq "-s 0：stats 报告种子为 0" "seed:      0x0000000000000000" \
+         "$("$CLI" -s 0 -f "$WORK/seed_zero.txt" stats 2>/dev/null | grep '^seed:')"
+
+check_eq "-s 0x1234：stats 原样报告种子" "seed:      0x0000000000001234" \
+         "$("$CLI" -s 0x1234 -f "$WORK/seed_hex.txt" stats 2>/dev/null | grep '^seed:')"
+
+# 同一颗种子 + 同一份数据 → 整份 stats 逐字节相同（含桶数与最长链）
+"$CLI" -s 7 -f "$WORK/seed_same.txt" load "$TESTDATA/b.txt" -r >/dev/null 2>&1
+check_eq "同一 -s 两次运行的 stats 完全相同" \
+         "$("$CLI" -s 7 -f "$WORK/seed_same.txt" stats 2>/dev/null)" \
+         "$("$CLI" -s 7 -f "$WORK/seed_same.txt" stats 2>/dev/null)"
+
+# 缺省启动取随机种子，两次应当不同（碰撞概率 2^-64，不作为稳定性风险）
+r1=$("$CLI" -f "$WORK/seed_rand1.txt" stats 2>/dev/null | grep '^seed:')
+r2=$("$CLI" -f "$WORK/seed_rand2.txt" stats 2>/dev/null | grep '^seed:')
+if [ "$r1" = "$r2" ]; then randsame=same; else randsame=different; fi
+check_eq "缺省启动两次的种子不同" "different" "$randsame"
+
+# 种子不影响对外结果：同一份数据、不同种子，list 输出必须一字不差
+"$CLI" -s 1 -f "$WORK/seed_l1.txt" load "$TESTDATA/b.txt" -r >/dev/null 2>&1
+"$CLI" -s 2 -f "$WORK/seed_l2.txt" load "$TESTDATA/b.txt" -r >/dev/null 2>&1
+check_eq "不同种子下 list 输出相同" \
+         "$("$CLI" -s 1 -f "$WORK/seed_l1.txt" list 2>/dev/null)" \
+         "$("$CLI" -s 2 -f "$WORK/seed_l2.txt" list 2>/dev/null)"
+
+# 错误路径：值不是整数、缺参数
+"$CLI" -s abc count >/dev/null 2>&1
+check_rc "-s 的值不是整数时退出码为 2" 2 $?
+"$CLI" -s >/dev/null 2>&1
+check_rc "-s 缺参数时退出码为 2" 2 $?
+
 # ---------------------------------------------------------------- 汇总
 echo
 if [ "$failed" -eq 0 ]; then

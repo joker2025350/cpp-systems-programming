@@ -16,6 +16,7 @@
 #include "contacts.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,8 +51,10 @@ static void usage(FILE *out, const char *prog) {
 	    "  menu                  交互式菜单\n"
 	    "  help                  显示本说明\n"
 	    "\n"
-	    "Options:\n"
-	    "  -f FILE   把 FILE 当作工作文件：启动时载入，改动后自动写回\n",
+		"Options:\n"
+	    "  -f FILE   把 FILE 当作工作文件：启动时载入，改动后自动写回\n"
+	    "  -s SEED   用固定哈希种子启动（0 表示不随机化，桶分布与 1.3.0 一致）；\n"
+	    "            缺省每次启动取随机种子，挡离线构造的哈希洪泛\n",
 	    prog);
 }
 
@@ -262,6 +265,8 @@ static int cmd_stats(app *a) {
 	}
 
 	(void)printf("count:     %lu\n", (unsigned long)contacts_count(&a->book));
+	(void)printf("seed:      0x%016llx\n",
+	             (unsigned long long)contacts_seed(&a->book));
 	(void)printf("buckets:   %lu\n", (unsigned long)st.buckets);
 	(void)printf("entries:   %lu\n", (unsigned long)st.entries);
 	(void)printf("used:      %lu\n", (unsigned long)st.used);
@@ -484,9 +489,12 @@ int main(int argc, char *argv[]) {
 	const char  *prog = argv[0];
 	int          i;
 	int          rc;
+	uint64_t     seed;
+	int          seed_set;
 
-	contacts_init(&a.book);
-	a.file = NULL;
+	a.file   = NULL;
+	seed     = 0;
+	seed_set = 0;
 
 	/* 全局选项必须在命令之前 */
 	i = 1;
@@ -499,6 +507,25 @@ int main(int argc, char *argv[]) {
 			}
 			a.file = argv[i + 1];
 			i += 2;
+		} else if (strcmp(argv[i], "-s") == 0) {
+			char              *end = NULL;
+			unsigned long long v;
+
+			if (i + 1 >= argc) {
+				(void)fprintf(stderr, "contacts: -s 需要一个整数种子\n");
+				usage(stderr, prog);
+				return EXIT_USAGE;
+			}
+			errno = 0;
+			v     = strtoull(argv[i + 1], &end, 0);
+			if (errno != 0 || end == argv[i + 1] || *end != '\0') {
+				(void)fprintf(stderr, "contacts: -s 的值不是整数：%s\n", argv[i + 1]);
+				usage(stderr, prog);
+				return EXIT_USAGE;
+			}
+			seed     = (uint64_t)v;
+			seed_set = 1;
+			i += 2;
 		} else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
 			usage(stdout, prog);
 			return 0;
@@ -507,6 +534,17 @@ int main(int argc, char *argv[]) {
 			usage(stderr, prog);
 			return EXIT_USAGE;
 		}
+	}
+
+	/*
+	 * 初始化放在选项解析之后：-s 只有在建索引之前生效才有意义。
+	 * 若先 init 再覆盖，虽然此时还没有节点、结果一样，但"先后无害"
+	 * 依赖"init 之后没有发生插入"这个隐含前提，不如把顺序写对。
+	 */
+	if (seed_set) {
+		contacts_init_seeded(&a.book, seed);
+	} else {
+		contacts_init(&a.book);
 	}
 
 	if (i >= argc) {

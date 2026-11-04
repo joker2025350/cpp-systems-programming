@@ -8,6 +8,7 @@
 #   make test       构建并运行单元测试
 #   make test-alloc 只跑内存分配失败注入
 #   make test-save-fail 只跑保存失败的注入（目录不可写 / RLIMIT_FSIZE / rename 失败）
+#   make test-seed  只跑哈希种子的可复现性与抗洪泛测试
 #   make check      用命令行做端到端验证
 #   make sanitize   用 ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make bench      测量不同规模下的构建 / 查找 / 存取耗时
@@ -34,6 +35,7 @@ CLI      := $(OUT)/contacts
 TESTBIN  := $(OUT)/test_contacts
 ALLOCBIN := $(OUT)/test_alloc
 SAVEBIN  := $(OUT)/test_save_fail
+SEEDBIN  := $(OUT)/test_seed
 BENCHBIN := $(OUT)/bench_contacts
 
 LIB_OBJ  := $(OUT)/contacts.o
@@ -44,7 +46,7 @@ CLI_OBJ  := $(OUT)/main.o
 # 里的 __wrap_*，libc 内部的分配不受影响。
 WRAPFLAGS := -Wl,--wrap=malloc -Wl,--wrap=calloc
 
-.PHONY: all lib cli test test-alloc test-save-fail check sanitize sanitize-run bench clean
+.PHONY: all lib cli test test-alloc test-save-fail test-seed check sanitize sanitize-run bench clean
 
 all: lib cli
 
@@ -76,16 +78,21 @@ $(ALLOCBIN): tests/test_alloc.c $(LIB) | $(OUT)
 $(SAVEBIN): tests/test_save_fail.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
+$(SEEDBIN): tests/test_seed.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
 $(BENCHBIN): tests/bench_contacts.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
-test: $(TESTBIN) $(ALLOCBIN) $(SAVEBIN)
+test: $(TESTBIN) $(ALLOCBIN) $(SAVEBIN) $(SEEDBIN)
 	@echo
 	@$(TESTBIN) $(TESTDATA)
 	@echo
 	@$(ALLOCBIN)
 	@echo
 	@$(SAVEBIN)
+	@echo
+	@$(SEEDBIN)
 
 test-alloc: $(ALLOCBIN)
 	@echo
@@ -94,6 +101,10 @@ test-alloc: $(ALLOCBIN)
 test-save-fail: $(SAVEBIN)
 	@echo
 	@$(SAVEBIN)
+
+test-seed: $(SEEDBIN)
+	@echo
+	@$(SEEDBIN)
 
 check: $(CLI)
 	@sh tests/check_cli.sh $(CLI) $(TESTDATA)
@@ -104,13 +115,15 @@ sanitize:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
 		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' sanitize-run
 
-sanitize-run: all $(TESTBIN) $(ALLOCBIN) $(SAVEBIN)
+sanitize-run: all $(TESTBIN) $(ALLOCBIN) $(SAVEBIN) $(SEEDBIN)
 	@echo "\n--- 单元测试（ASan + UBSan）---"
 	@$(TESTBIN) $(TESTDATA)
 	@echo "\n--- 分配失败注入（ASan + UBSan）---"
 	@$(ALLOCBIN)
 	@echo "\n--- 保存失败注入（ASan + UBSan）---"
 	@$(SAVEBIN)
+	@echo "\n--- 哈希种子（ASan + UBSan）---"
+	@$(SEEDBIN)
 	@echo "\n--- 命令行（ASan + UBSan）---"
 	@$(CLI) -f $(OUT)/asan_book.txt add alice 13900001111
 	@$(CLI) -f $(OUT)/asan_book.txt add bob 13800002222
@@ -119,6 +132,7 @@ sanitize-run: all $(TESTBIN) $(ALLOCBIN) $(SAVEBIN)
 	@$(CLI) -f $(OUT)/asan_book.txt stats
 	@$(CLI) -f $(OUT)/asan_book.txt del alice
 	@$(CLI) -f $(OUT)/asan_book.txt stats
+	@$(CLI) -s 0 -f $(OUT)/asan_book.txt stats
 	@$(CLI) -f $(OUT)/asan_book.txt load $(TESTDATA)/c.txt -r
 	@$(CLI) -f $(OUT)/asan_book.txt list
 	@echo "\n--- 错误路径 ---"

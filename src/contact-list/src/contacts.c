@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * 读文件时单行的缓冲区大小。
@@ -60,7 +61,7 @@
 #define CONTACTS_SHRINK_DIV ((size_t)4)
 
 /*
- * FNV-1a 64 位哈希。
+ * FNV-1a 64 位哈希，可选的随机化见下面的 hash_name。
  *
  * 定义（可独立复现）：h = 0xcbf29ce484222325，对输入字节流逐个执行
  *     h ^= byte;  h *= 0x100000001b3;   （乘数与偏移基都是 FNV 规范给的）
@@ -68,16 +69,19 @@
  * 选它的理由不是"最快"，而是三条实际约束：
  *   1. 逐字节处理，不需要预知长度，也不依赖对齐——姓名是 char[64]，
  *      长度随内容变化，逐字节循环不必先 strlen。
- *   2. 不引入运行期随机种子，因此同一批姓名每次都落在同一组桶里，
- *      测试与基准的结果可复现（代价见 README 9.7 的哈希洪泛）。
+ *   2. 实现短、常量固定，不依赖平台的字长与字节序，
+ *      同样的姓名在任何机器上算出同样的值（种子为 0 时）。
  *   3. 乘法每步都作用于 h 的全部 64 位，输入的低位变化会扩散到高位，
  *      因此下面用低若干位做桶下标不会丢掉熵。
  *
  * 注意 0x100000001b3 的低字节是 0xb3（奇数）。若乘数是偶数，
  * 每步乘法都会把 h 的最低位置 0，低位的熵会被逐位清空，
  * 用低 b 位取下标就会退化——这是选乘数时必须满足的整除性要求。
+ *
+ * 固定的乘数与偏移基意味着哈希值只取决于字节流，可以离线逆推出
+ * "哪些姓名落在同一个桶"。1.4.0 起用一个随机种子打散（见 hash_name）。
  */
-static uint64_t hash_name(const char *name) {
+static uint64_t fnv1a64(const char *name) {
 	const unsigned char *p = (const unsigned char *)name;
 	uint64_t             h = 0xcbf29ce484222325u;
 
@@ -89,9 +93,54 @@ static uint64_t hash_name(const char *name) {
 	return h;
 }
 
-/* 给定桶数求下标。nbuckets 必须是 2 的幂且非 0。 */
-static size_t bucket_index(size_t nbuckets, const char *name) {
-	return (size_t)(hash_name(name) & (uint64_t)(nbuckets - 1u));
+/*
+ * splitmix64 的收尾混合函数（Steele、Lea、Flood 在 2014 年给出的版本）。
+ *
+ * 三个"异或右移 + 乘奇数常量"的循环，作用是把输入的每一位扩散到全部 64 位：
+ * 若输出只有某个子集依赖输入的低位，那么用低 b 位取桶下标时，
+ * 种子就只能通过它的低 b 位起作用，可选的分布只有 2^b 种。
+ * 经过这一层之后，每一个输出位都依赖全部输入位。
+ *
+ * 两个乘数都是奇数，理由与 FNV 的乘数相同：奇数乘法在模 2^64 下可逆，
+ * 不会把低位的信息清零。
+ */
+static uint64_t mix64(uint64_t x) {
+	x ^= x >> 30;
+	x *= UINT64_C(0xbf58476d1ce4e5b9);
+	x ^= x >> 27;
+	x *= UINT64_C(0x94d049bb133111eb);
+	x ^= x >> 31;
+	return x;
+}
+
+/*
+ * 姓名 -> 桶下标所用的 64 位哈希值。
+ *
+ * seed 为 0 时就是纯 FNV-1a，与 1.3.0 的行为逐位相同，
+ * 这样历史基准的桶分布仍然可以复现（README 9.7 与 7 节）。
+ *
+ * seed 非 0 时先异或进哈希值再雪崩一次。异或而非相加，是因为
+ * 两个不同种子的低位若相同，相加会在高位产生进位、耦合相邻输入，
+ * 而异或是逐位独立的。
+ *
+ * 这一步挡住的是"离线构造"：构造者要做的事是解
+ *     mix64(fnv1a64(name) ^ seed) & (nbuckets-1) == 目标
+ * 而 seed 只有进程自己知道，离线算不出解。
+ * 它挡不住"在线自适应"——攻击者若能把姓名送进去并观察耗时，
+ * 可以逐步逼近同一桶。那种威胁模型需要 SipHash 这类带密钥的 PRF。
+ */
+static uint64_t hash_name(const char *name, uint64_t seed) {
+	uint64_t h = fnv1a64(name);
+
+	if (seed != 0) {
+		h = mix64(h ^ seed);
+	}
+	return h;
+}
+
+/* 给定桶数与种子求下标。nbuckets 必须是 2 的幂且非 0。 */
+static size_t bucket_index(uint64_t seed, size_t nbuckets, const char *name) {
+	return (size_t)(hash_name(name, seed) & (uint64_t)(nbuckets - 1u));
 }
 
 /*
@@ -129,7 +178,7 @@ static int index_rehash(contact_book *book, size_t want) {
 	}
 
 	for (item = book->head; item != NULL; item = item->next) {
-		size_t i = bucket_index(want, item->name);
+		size_t i = bucket_index(book->seed, want, item->name);
 
 		item->hash_next = fresh[i];
 		fresh[i] = item;
@@ -210,7 +259,61 @@ static void index_shrink(contact_book *book) {
 	}
 }
 
+/*
+ * 取一个哈希种子。
+ *
+ * 首选 /dev/urandom：Linux 上它总是存在，读 8 字节即完成，
+ * 内核的 CSPRNG 已经处理了"启动早期熵不足"的问题（阻塞直到初始化完成）。
+ * 更现代的接口是 getrandom(2)，能免掉打开文件描述符的开销，
+ * 也能在 chroot 里没有 /dev 时工作；但它的声明依赖 glibc 2.25 以上
+ * 与特性测试宏，为了保持本文件只依赖标准 C 与 POSIX 的少数接口，
+ * 这里用文件形式。
+ *
+ * 两条路径都失败时降级到"墙钟时间 + 栈地址"的混合值。
+ * 这里用 timespec_get（C11 7.27.2.5）而不是 clock()：clock() 返回的是
+ * 进程消耗的 CPU 时间，分辨率由 CLOCKS_PER_SEC 决定，在 Windows 上只有
+ * 毫秒级——同一毫秒内连续初始化两本书就会拿到同一个种子，而那正是
+ * "一次构造、同时命中多本书"的场合。timespec_get 给的是墙钟的秒 + 纳秒，
+ * 两次连续调用之间必然跨过至少一个时钟刻度。
+ *
+ * 这条路径的熵仍然有限：同一个调用点的栈地址固定，时间也是可猜的，
+ * 因此它只保证"不同进程、不同时刻大概率不同"，不构成安全边界。
+ * 拿不到随机源的系统本来也就没有安全边界可言，这里的取舍是不让
+ * "取不到随机数"变成"初始化失败"。
+ */
+static uint64_t seed_entropy(void) {
+	uint64_t s  = 0;
+	FILE    *fp = fopen("/dev/urandom", "rb");
+
+	if (fp != NULL) {
+		size_t got = fread(&s, sizeof s, 1, fp);
+
+		(void)fclose(fp);
+		if (got == 1 && s != 0) {
+			return s;
+		}
+	}
+
+	uint64_t        mixed = (uint64_t)(uintptr_t)&s << 7;
+	struct timespec ts;
+
+	if (timespec_get(&ts, TIME_UTC) == TIME_UTC) {
+		mixed ^= (uint64_t)ts.tv_sec;
+		mixed ^= (uint64_t)ts.tv_nsec << 21;
+	}
+
+	mixed = mix64(mixed);
+	return (mixed != 0) ? mixed : UINT64_C(1);
+}
+
 void contacts_init(contact_book *book) {
+	if (book == NULL) {
+		return;
+	}
+	contacts_init_seeded(book, seed_entropy());
+}
+
+void contacts_init_seeded(contact_book *book, uint64_t seed) {
 	if (book == NULL) {
 		return;
 	}
@@ -220,6 +323,11 @@ void contacts_init(contact_book *book) {
 	book->buckets  = NULL;
 	book->nbuckets = 0;
 	book->rehashes = 0;
+	book->seed     = seed;
+}
+
+uint64_t contacts_seed(const contact_book *book) {
+	return (book == NULL) ? UINT64_C(0) : book->seed;
 }
 
 void contacts_clear(contact_book *book) {
@@ -254,6 +362,12 @@ void contacts_clear(contact_book *book) {
 	book->head  = NULL;
 	book->tail  = NULL;
 	book->count = 0;
+
+	/*
+	 * 种子不重置：clear 的语义是"释放内容"，这本书的身份（种子）没变。
+	 * 重置种子会让"clear 前后同一批数据落在不同的桶里"，
+	 * 调试时看到的桶分布就无法和 clear 之前对照。
+	 */
 }
 
 void contacts_destroy(contact_book *book) {
@@ -293,7 +407,7 @@ const contact *contacts_find(const contact_book *book, const char *name) {
 		return NULL;
 	}
 
-	for (item = book->buckets[bucket_index(book->nbuckets, name)];
+	for (item = book->buckets[bucket_index(book->seed, book->nbuckets, name)];
 	     item != NULL;
 	     item = item->hash_next) {
 		if (strcmp(item->name, name) == 0) {
@@ -394,7 +508,7 @@ contacts_status contacts_add(contact_book *book, const char *name, const char *p
 	book->count++;
 
 	/* 头插进桶链：新节点成为链首，插入是 O(1) */
-	bucket = bucket_index(book->nbuckets, item->name);
+	bucket = bucket_index(book->seed, book->nbuckets, item->name);
 	item->hash_next = book->buckets[bucket];
 	book->buckets[bucket] = item;
 
@@ -425,7 +539,7 @@ contacts_status contacts_remove(contact_book *book, const char *name) {
 		 * 某一格，也可能是前驱的 hash_next。用二级指针拆链，
 		 * 链首与非链首两种情形就不需要各写一遍。
 		 */
-		link = &book->buckets[bucket_index(book->nbuckets, name)];
+		link = &book->buckets[bucket_index(book->seed, book->nbuckets, name)];
 
 		while ((item = *link) != NULL && strcmp(item->name, name) != 0) {
 			link = &item->hash_next;

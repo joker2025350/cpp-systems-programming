@@ -21,6 +21,7 @@
 #define CONTACTS_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #ifdef __cplusplus
@@ -39,12 +40,16 @@ extern "C" {
  * 1.3.0：新增 contacts_order（按姓名升序取指针数组）。
  *        只增加一个函数，结构体一个字节没动，因此 ABI 兼容；
  *        用旧的库配新的头文件编译出的程序仍然能跑（不要反过来）。
+ * 1.4.0：哈希加随机种子，contact_book 末尾多一个 uint64_t，ABI 不兼容
+ *        （contact_book 由调用方在栈上分配，库与调用方必须一起重编）。
+ *        新增 contacts_init_seeded / contacts_seed；contacts_init 改为取随机种子。
+ *        显式用种子 0 初始化等价于 1.3.0 的桶分布，用于与历史基准对照。
  */
 
 #define CONTACTS_VERSION_MAJOR 1
-#define CONTACTS_VERSION_MINOR 3
+#define CONTACTS_VERSION_MINOR 4
 #define CONTACTS_VERSION_PATCH 0
-#define CONTACTS_VERSION_STRING "1.3.0"
+#define CONTACTS_VERSION_STRING "1.4.0"
 
 /* ------------------------------------------------------------------
  * 字段容量
@@ -106,6 +111,7 @@ typedef struct {
 	contact **buckets;    /* 桶数组，长度是 2 的幂；NULL 表示还没有索引 */
 	size_t   nbuckets;    /* 桶数量，0 表示还没有索引 */
 	size_t   rehashes;    /* 桶表重分配次数（扩容 + 收缩），从 contacts_init 起累计 */
+	uint64_t seed;        /* 哈希种子；0 表示不做随机化（与 1.3.0 的桶分布一致） */
 } contact_book;
 
 /* ------------------------------------------------------------------
@@ -161,8 +167,38 @@ typedef struct {
 /*
  * 把通讯录初始化为空。contact_book 在栈上分配之后必须先调用它，
  * 否则 head/tail/count 是未初始化的值，后续操作会解引用野指针。
+ *
+ * 同时取一个哈希种子，用于把姓名到桶下标的映射随机化。
+ * 种子的来源按优先级依次尝试：/dev/urandom（Linux 与多数 Unix 都有）、
+ * 时间 + 时钟 + 栈地址的混合值。第一条正常时熵是充分的；
+ * 降级路径只保证"不同进程、不同时刻大概率不同"，不保证密码学强度。
+ *
+ * 取种子的目的是挡住"离线构造一批同桶姓名"的哈希洪泛（README 9.7）：
+ * 桶下标不只取决于姓名，还取决于进程才知道的种子，构造者无法离线算。
+ * 它挡不住在线自适应探测——攻击者能观察耗时并逐步逼近，那种情形需要
+ * 真正的 keyed PRF（如 SipHash），不在本模块范围内。
+ *
+ * 要用固定种子复现某次运行的桶分布，用 contacts_init_seeded。
  */
 void contacts_init(contact_book *book);
+
+/*
+ * 用指定的种子初始化。同一份数据 + 同一个种子，桶分布逐字节可复现；
+ * 这是基准与调试用的入口，正常使用应当用 contacts_init。
+ *
+ * seed 为 0 是特殊值：不做随机化，哈希退化为 1.3.0 的 FNV-1a，
+ * 因此桶分布与 1.3.0 完全一致，历史基准数字仍可对照。
+ * 0 之外的任何值都会经过一次雪崩混合再参与取桶。
+ *
+ * book 为 NULL 时什么都不做。
+ */
+void contacts_init_seeded(contact_book *book, uint64_t seed);
+
+/*
+ * 当前使用的种子。book 为 NULL 时返回 0。
+ * 用途是把种子打进日志或基准输出，使"这一次的桶分布"事后可以复现。
+ */
+uint64_t contacts_seed(const contact_book *book);
 
 /*
  * 释放全部节点与哈希索引的桶数组，回到空状态。可以重复调用。
