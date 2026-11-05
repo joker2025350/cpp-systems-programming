@@ -1,7 +1,7 @@
 /*
  * test_threadpool.c —— threadpool 模块的单元测试
  *
- * 覆盖九类行为：
+ * 覆盖十类行为：
  *   1. 参数校验与生命周期（含重复 create/destroy）
  *   2. 任务语义：每个提交的任务恰好执行一次，参数正确送达
  *   3. 队列语义：FIFO 顺序
@@ -11,6 +11,8 @@
  *   7. 有界队列与背压：容量约束、满即失败、阻塞提交、工作线程不等待空位
  *   8. 带截止时间的提交：时刻构造、超时、过去时刻、closed 优先、工作线程拒绝
  *   9. 带截止时间的屏障：排空即返回、超时之后任务仍会做完、与 destroy 并发
+ *  10. 只读接口的 const 承诺：九个查询都能经 const threadpool * 调用
+ *      （编译期断言，防止实现回头改用丢 const 的转型）
  *
  * 计数一律用 __atomic 内建函数。这些调用会被 ThreadSanitizer 识别为原子访问，
  * 因此测试本身在 TSan 下必须是干净的 —— 如果测试自己有数据竞争，
@@ -434,6 +436,22 @@ static int wait_running(threadpool *p, size_t want, int timeout_ms) {
 	return -1;
 }
 
+/*
+ * 等到 want 个屏障调用方进入临界区。与 wait_running 同构：
+ * 观测一个库自己维护的计数，而不是等一段猜测足够长的时间。
+ */
+static int wait_waiters(threadpool *p, size_t want, int timeout_ms) {
+	double end = now_ms() + (double)timeout_ms;
+
+	while (now_ms() < end) {
+		if (threadpool_waiters(p) >= want) {
+			return 0;
+		}
+		sleep_ms(1);
+	}
+	return -1;
+}
+
 /* ---------------------------------------------------------------- */
 /* 1. 参数校验与生命周期                                              */
 /* ---------------------------------------------------------------- */
@@ -500,6 +518,106 @@ static void test_single_task(void) {
 	expect_int("submitted == 1", (long long)threadpool_submitted(p), 1);
 	expect_int("queued == 0", (long long)threadpool_queued(p), 0);
 	expect_int("running == 0", (long long)threadpool_running(p), 0);
+
+	threadpool_destroy(p);
+}
+
+/* ---------------------------------------------------------------- */
+/* 2b. 只读接口的 const 承诺                                         */
+/* ---------------------------------------------------------------- */
+
+/*
+ * 九个查询函数必须能在"只拿得到 const threadpool *"的地方全部调用。
+ *
+ * 两种手段叠起来用，缺一不可：
+ *
+ *   1. 下面这组 _Static_assert 是硬保证。只靠"传一个 const 指针进去"不够：
+ *      把 const threadpool * 传给形参是 threadpool * 的函数，在 GCC 里只是
+ *      -Wdiscarded-qualifiers 警告（默认开启），构建照旧通过 —— 本仓库没有
+ *      用 -Werror。实测过：把 threadpool_queued 的形参改回 threadpool *，
+ *      make test 退出码仍是 0，只有一行警告。_Generic 比对的是函数指针的
+ *      完整类型，签名一变就直接是 error。
+ *
+ *   2. read_through_const 与下面的运行期对比：const 是类型系统里的事，
+ *      值不该因此改变。
+ *
+ * 之所以值得专门钉住：上一版实现的查询函数内部写 (threadpool *)p 转型，
+ * 编译能过、运行也对，但等于接口对外承诺 const、实现内部把承诺丢掉，
+ * 代价是每条查询一次 -Wcast-qual。
+ */
+#define ASSERT_CONST_QUERY(fn, ret)                                            \
+	_Static_assert(_Generic(&(fn), ret (*)(const threadpool *): 1, default: 0), \
+	               #fn " must take const threadpool *")
+
+ASSERT_CONST_QUERY(threadpool_queued, size_t);
+ASSERT_CONST_QUERY(threadpool_running, size_t);
+ASSERT_CONST_QUERY(threadpool_completed, unsigned long long);
+ASSERT_CONST_QUERY(threadpool_submitted, unsigned long long);
+ASSERT_CONST_QUERY(threadpool_backpressure, unsigned long long);
+ASSERT_CONST_QUERY(threadpool_timeouts, unsigned long long);
+ASSERT_CONST_QUERY(threadpool_wait_timeouts, unsigned long long);
+ASSERT_CONST_QUERY(threadpool_waiters, size_t);
+ASSERT_CONST_QUERY(threadpool_thread_count, int);
+ASSERT_CONST_QUERY(threadpool_capacity, size_t);
+
+typedef struct const_view {
+	size_t             queued;
+	size_t             running;
+	unsigned long long submitted;
+	unsigned long long completed;
+	unsigned long long backpressure;
+	unsigned long long timeouts;
+	unsigned long long wait_timeouts;
+	int                nthreads;
+	size_t             capacity;
+	size_t             waiters;
+} const_view;
+
+static const_view read_through_const(const threadpool *cp) {
+	const_view v;
+
+	v.queued        = threadpool_queued(cp);
+	v.running       = threadpool_running(cp);
+	v.submitted     = threadpool_submitted(cp);
+	v.completed     = threadpool_completed(cp);
+	v.backpressure  = threadpool_backpressure(cp);
+	v.timeouts      = threadpool_timeouts(cp);
+	v.wait_timeouts = threadpool_wait_timeouts(cp);
+	v.nthreads      = threadpool_thread_count(cp);
+	v.capacity      = threadpool_capacity(cp);
+	v.waiters       = threadpool_waiters(cp);
+	return v;
+}
+
+static void test_const_queries(void) {
+	threadpool       *p = NULL;
+	const threadpool *cp;
+	const_view        v;
+	slot              s;
+
+	printf("\n--- 只读接口经 const 指针调用 ---\n");
+	(void)memset(&s, 0, sizeof s);
+	expect_status("create_bounded(2, 4)", threadpool_create_bounded(2, 4, &p), TPOOL_OK);
+
+	expect_status("submit 一个任务", threadpool_submit(p, task_mark, &s), TPOOL_OK);
+	expect_status("wait 返回", threadpool_wait(p), TPOOL_OK);
+
+	cp = p;                      /* 普通指针隐式转成 const 指针 */
+	v  = read_through_const(cp); /* 九个查询都在这一行编过 */
+
+	expect_int("queued 与普通指针读到的一致",
+	           (long long)v.queued, (long long)threadpool_queued(p));
+	expect_int("running 与普通指针读到的一致",
+	           (long long)v.running, (long long)threadpool_running(p));
+	expect_int("submitted 与普通指针读到的一致",
+	           (long long)v.submitted, (long long)threadpool_submitted(p));
+	expect_int("completed == 1", (long long)v.completed, 1);
+	expect_int("backpressure == 0", (long long)v.backpressure, 0);
+	expect_int("timeouts == 0", (long long)v.timeouts, 0);
+	expect_int("wait_timeouts == 0", (long long)v.wait_timeouts, 0);
+	expect_int("thread_count == 2", v.nthreads, 2);
+	expect_int("capacity == 4", (long long)v.capacity, 4);
+	expect_int("waiters == 0", (long long)v.waiters, 0);
 
 	threadpool_destroy(p);
 }
@@ -2063,8 +2181,24 @@ static void test_destroy_with_concurrent_waiter(void) {
 		return;
 	}
 
-	/* 给屏障方一点时间真正进入等待，再去销毁；它进没进去不影响断言成立 */
-	sleep_ms(50);
+	/*
+	 * 等屏障方确实进了临界区（threadpool_waiters 报出 1）再起 destroy 线程。
+	 *
+	 * 原来这里是 sleep_ms(50) 然后赌它已经进去了。50 ms 在空载机器上够用，
+	 * 但它把"用例成立"建立在调度延迟上：破坏性更强的情形是等待方迟到，
+	 * destroy 先把池 free 掉，等待方随后才去取锁 —— 于是 ASan 报一条
+	 * use-after-free，看起来像库的竞态，实际是调用方违反了
+	 * "destroy 不得与正在进入模块的新调用并发"这条约定。
+	 * threadpool_waiters 让这一步变成可观测量，而不是时间。
+	 */
+	if (wait_waiters(p, 1, 2000) != 0) {
+		expect_true("屏障方在 2 s 内进入等待", 0);
+		gate_release(&g);
+		(void)pthread_join(wid, NULL);
+		threadpool_destroy(p);
+		gate_destroy(&g);
+		return;
+	}
 
 	if (pthread_create(&did, NULL, destroy_main, p) != 0) {
 		expect_true("destroy 线程创建成功", 0);
@@ -2106,6 +2240,7 @@ int main(void) {
 
 	test_param_checks();
 	test_single_task();
+	test_const_queries();
 	test_1000_tasks_once();
 	test_fifo_order();
 	test_multi_producer();

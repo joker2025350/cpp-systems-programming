@@ -33,7 +33,8 @@
  *                          会被 NTP 步进或手工改时间，把 30 ms 的等待变成任意长。
  *
  * 为什么用不透明句柄（opaque handle）而不是像 04/05 那样公开结构体：
- * 内部要放 pthread_mutex_t 与两个 pthread_cond_t。公开它们意味着头文件必须
+ * 内部要放 pthread_mutex_t 与三个 pthread_cond_t（1.4.0 起收在一个单独分配的
+ * tp_sync 里，但类型仍在公开接口之外）。公开它们意味着头文件必须
  * include <pthread.h>，把 pthread 的类型、宏和平台相关的结构体布局泄漏给每个
  * 调用方；而 pthread 同步原语的内部表示在标准里没有定义，是 ABI 细节。
  * 用不透明句柄，头文件只依赖 <stddef.h>，内部结构可以自由改动。
@@ -70,10 +71,10 @@ extern "C" {
 #endif
 
 #define THREADPOOL_VERSION_MAJOR 1
-#define THREADPOOL_VERSION_MINOR 3
+#define THREADPOOL_VERSION_MINOR 4
 #define THREADPOOL_VERSION_PATCH 0
 
-#define THREADPOOL_VERSION_STRING "1.3.0"
+#define THREADPOOL_VERSION_STRING "1.4.0"
 
 /* ------------------------------------------------------------------
  * 状态码
@@ -331,6 +332,23 @@ unsigned long long threadpool_timeouts(const threadpool *p);
  * 耗时与预期不符；而它停在 0 说明屏障从来都是按时到达的。
  */
 unsigned long long threadpool_wait_timeouts(const threadpool *p);
+
+/*
+ * 此刻阻塞在 idle 上的屏障调用方数量，即正卡在 threadpool_wait /
+ * threadpool_wait_until 里没返回的线程数。
+ *
+ * 这是一个瞬时量（gauge），与上面几个累加计数器不同：返回之后立刻可能变化，
+ * 因此不能当作判断条件用——要等"任务做完"请用屏障本身的返回值。它的用途是
+ * 观测与测试同步：想知道"屏障方到底进没进等待"，只有这一个可观测出口。
+ *
+ * 为什么需要它：destroy 与屏障方并发这段竞态，测试里必须先确认 N 个等待方
+ * 都已经进了临界区，再让 destroy 开始；否则迟到的等待方会在池被释放之后
+ * 才去取锁——那是调用方违反了"destroy 不得与正在进入模块的新调用并发"这条
+ * 约定（见 threadpool_destroy 的说明），与库的竞态无关，却会让压力检查
+ * 以大约 5% 的概率报出 use-after-free。本函数把"先睡一会儿再赌"换成
+ * "观测到 N 个再动手"。
+ */
+size_t threadpool_waiters(const threadpool *p);
 
 /* 状态码的英文短名，用于日志 */
 const char *threadpool_status_string(tpool_status status);

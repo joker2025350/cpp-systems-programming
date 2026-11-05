@@ -41,21 +41,51 @@ typedef struct task {
 	struct task  *next;
 } task;
 
-struct threadpool {
+/*
+ * 同步原语集合：一把互斥锁 + 三个条件变量。
+ *
+ * 为什么单独分配、并通过指针成员挂在 threadpool 上，而不是直接展开成成员：
+ *
+ *   查询函数（threadpool_queued 等）接收 const threadpool *。它们在语义上不改变
+ *   池的状态，但要读到一致的计数就必须进临界区，而加锁会写锁对象本身。
+ *   C 没有 C++ 的 mutable（可以在 const 成员函数里修改的成员），若锁直接是
+ *   threadpool 的成员，从 const threadpool * 上取地址得到的类型是
+ *   const pthread_mutex_t *，传给 POSIX 的 pthread_mutex_lock（形参是
+ *   pthread_mutex_t *）只能显式转型丢掉 const。这正是 -Wcast-qual 报的内容，
+ *   而"丢掉 const 再写"按 C11 6.7.3p6 只在被指对象本身不是 const 定义时才良定义
+ *   ——结论正确，但正确性依赖一个类型系统看不见的前提。
+ *
+ *   改成指针成员后，const 限定只作用在指针上：p->sync 的类型是 tp_sync *const，
+ *   它指向的 tp_sync 仍然可写。于是 const threadpool * 上加锁不需要任何转型，
+ *   const 的承诺与实现一致。
+ *
+ *   代价是每个池多一次分配、每次加锁多一次指针解引用（实测见 README 性能一节）。
+ *
+ * 为什么把三个条件变量也放进来：它们与互斥锁是同一个生命周期对象——一起
+ * 初始化、一起销毁、都在同一个临界区规则下使用。拆成两级分配只会多出
+ * "锁建好了但条件变量没建好"的中间状态。
+ *
+ * 字段说明：
+ *   lock  ：保护下面 threadpool 里的全部计数与队列指针。
+ *   work  ：工作线程等"有新任务或需要退出"。只有不带超时的 cond_wait
+ *           挂在它上面，因此时钟无关。
+ *   idle  ：threadpool_wait / wait_until / destroy 等"队列空且无人执行"。
+ *           时钟被设为 CLOCK_MONOTONIC（见 init_cond_monotonic），因为
+ *           wait_until 要用 timedwait 挂在它上面——这是本模块第二个
+ *           "时钟配错也不报错"的地方，错误表现与 space 上那次一样：
+ *           每次 timedwait 都立即超时。
+ *   space ：有界池的提交方等"队列出现空位"，同样是 CLOCK_MONOTONIC。
+ */
+typedef struct tp_sync {
 	pthread_mutex_t lock;
-
-	/*
-	 * work：工作线程等"有新任务或需要退出"。
-	 * idle：threadpool_wait / threadpool_wait_until / threadpool_destroy 等
-	 *       "队列空且无人执行"。它的时钟也被设为 CLOCK_MONOTONIC（见
-	 *       init_cond_monotonic），因为 wait_until 要用 timedwait 挂在它上面——
-	 *       这是本模块第二个"时钟配错也不报错"的地方，错误表现与 space 上那次
-	 *       一样：每次 timedwait 都立即超时。
-	 * space：有界池的提交方等"队列出现空位"，同样是 CLOCK_MONOTONIC。
-	 */
 	pthread_cond_t  work;
 	pthread_cond_t  idle;
 	pthread_cond_t  space;
+} tp_sync;
+
+struct threadpool {
+	/* 同步原语，独立分配，见上面 tp_sync 的说明 */
+	tp_sync *sync;
 
 	/* 任务队列，head 出队、tail 入队，构成 FIFO */
 	task  *head;
@@ -119,7 +149,7 @@ static int is_worker(const threadpool *p, pthread_t self) {
 static void *worker_main(void *arg) {
 	threadpool *p = (threadpool *)arg;
 
-	pthread_mutex_lock(&p->lock);
+	pthread_mutex_lock(&p->sync->lock);
 
 	for (;;) {
 		/*
@@ -129,7 +159,7 @@ static void *worker_main(void *arg) {
 		 * 让线程去取一个不存在的任务。
 		 */
 		while (p->head == NULL && !p->stop) {
-			pthread_cond_wait(&p->work, &p->lock);
+			pthread_cond_wait(&p->sync->work, &p->sync->lock);
 		}
 
 		/* 退出条件：停机标志已置位，且队列已排空 */
@@ -154,29 +184,29 @@ static void *worker_main(void *arg) {
 		 * 就够；被多唤醒的那些拿到锁后会重新检查条件，发现仍满就再睡回去。
 		 */
 		if (p->max_queued != 0) {
-			pthread_cond_signal(&p->space);
+			pthread_cond_signal(&p->sync->space);
 		}
 
 		/*
 		 * 执行阶段不持锁。若持锁执行，所有工作线程会串行化，
 		 * 线程池退化成"一个线程干活 + N-1 个线程排队等锁"。
 		 */
-		pthread_mutex_unlock(&p->lock);
+		pthread_mutex_unlock(&p->sync->lock);
 
 		t->fn(t->arg);
 		free(t);
 
-		pthread_mutex_lock(&p->lock);
+		pthread_mutex_lock(&p->sync->lock);
 		p->running--;
 		p->completed++;
 
 		/* 队列空且无人执行 —— 等待空闲的那一方可以醒了 */
 		if (p->head == NULL && p->running == 0) {
-			pthread_cond_broadcast(&p->idle);
+			pthread_cond_broadcast(&p->sync->idle);
 		}
 	}
 
-	pthread_mutex_unlock(&p->lock);
+	pthread_mutex_unlock(&p->sync->lock);
 
 	return NULL;
 }
@@ -223,12 +253,89 @@ static tpool_status init_cond_monotonic(pthread_cond_t *cv) {
 }
 
 /*
+ * 分配并初始化同步原语集合。成功时 *out 指向新对象，失败时 *out 为 NULL
+ * 且已初始化过的部分全部回滚——调用方只需要区分返回值，不需要关心
+ * "已经建到第几个原语"。
+ *
+ * 回滚顺序与初始化顺序相反，这是这类函数唯一不依赖记忆的写法：
+ * 每加一步初始化就在紧邻的位置加一步对称的销毁，漏掉哪一步都能一眼看出来。
+ * 旧实现把四段回滚摊在 create_impl 里，每段都要重抄前面几步的销毁代码，
+ * 加第五个条件变量时就得改四处。
+ */
+static tpool_status sync_create(tp_sync **out) {
+	tp_sync *s;
+
+	*out = NULL;
+
+	s = (tp_sync *)calloc(1, sizeof *s);
+	if (s == NULL) {
+		return TPOOL_ERR_NOMEM;
+	}
+
+	/*
+	 * 运行期初始化必须调用 init 函数，不能用 memcpy 复制
+	 * PTHREAD_MUTEX_INITIALIZER / PTHREAD_COND_INITIALIZER 的内部表示：
+	 * 这两个宏按 POSIX 只保证可用于静态初始化，其展开内容由实现决定。
+	 */
+	if (pthread_mutex_init(&s->lock, NULL) != 0) {
+		free(s);
+		return TPOOL_ERR_SYSTEM;
+	}
+
+	if (pthread_cond_init(&s->work, NULL) != 0) {
+		(void)pthread_mutex_destroy(&s->lock);
+		free(s);
+		return TPOOL_ERR_SYSTEM;
+	}
+
+	/*
+	 * idle 与 space 都用带 CLOCK_MONOTONIC 的属性初始化（理由见
+	 * init_cond_monotonic）。失败时按系统错误上报，不做"退回默认时钟继续跑"
+	 * 的降级：那样 submit_wait_until / wait_until 会每次都立即超时，
+	 * 而 create 明明返回了成功。
+	 */
+	if (init_cond_monotonic(&s->idle) != TPOOL_OK) {
+		(void)pthread_cond_destroy(&s->work);
+		(void)pthread_mutex_destroy(&s->lock);
+		free(s);
+		return TPOOL_ERR_SYSTEM;
+	}
+
+	if (init_cond_monotonic(&s->space) != TPOOL_OK) {
+		(void)pthread_cond_destroy(&s->idle);
+		(void)pthread_cond_destroy(&s->work);
+		(void)pthread_mutex_destroy(&s->lock);
+		free(s);
+		return TPOOL_ERR_SYSTEM;
+	}
+
+	*out = s;
+	return TPOOL_OK;
+}
+
+/*
+ * 销毁并释放同步原语集合。调用前必须保证没有任何线程还挂在它的条件变量或
+ * 互斥锁上——POSIX 对"销毁正在被使用的同步对象"没有定义行为。
+ */
+static void sync_destroy(tp_sync *s) {
+	if (s == NULL) {
+		return;
+	}
+	(void)pthread_cond_destroy(&s->space);
+	(void)pthread_cond_destroy(&s->idle);
+	(void)pthread_cond_destroy(&s->work);
+	(void)pthread_mutex_destroy(&s->lock);
+	free(s);
+}
+
+/*
  * 两个创建入口共用这一段。max_queued == 0 表示无界；合法性检查放在公开入口，
  * 因为两个入口的判据不同（无界入口根本不接受容量参数）。
  */
 static tpool_status create_impl(int nthreads, size_t max_queued, threadpool **out) {
 	threadpool *p;
-	int         rc;
+	tpool_status st;
+	int          rc;
 
 	if (out == NULL) {
 		return TPOOL_ERR_PARAM;
@@ -256,48 +363,18 @@ static tpool_status create_impl(int nthreads, size_t max_queued, threadpool **ou
 	p->nthreads   = nthreads;
 	p->max_queued = max_queued;
 
+	st = sync_create(&p->sync);
+	if (st != TPOOL_OK) {
+		free(p->tids);
+		free(p);
+		return st;
+	}
+
 	/*
 	 * 运行期初始化必须调用 init 函数，不能用 memcpy 复制
 	 * PTHREAD_MUTEX_INITIALIZER / PTHREAD_COND_INITIALIZER 的内部表示：
 	 * 这两个宏按 POSIX 只保证可用于静态初始化，其展开内容由实现决定。
 	 */
-	rc = pthread_mutex_init(&p->lock, NULL);
-	if (rc != 0) {
-		free(p->tids);
-		free(p);
-		return TPOOL_ERR_SYSTEM;
-	}
-
-	rc = pthread_cond_init(&p->work, NULL);
-	if (rc != 0) {
-		pthread_mutex_destroy(&p->lock);
-		free(p->tids);
-		free(p);
-		return TPOOL_ERR_SYSTEM;
-	}
-
-	if (init_cond_monotonic(&p->idle) != TPOOL_OK) {
-		pthread_cond_destroy(&p->work);
-		pthread_mutex_destroy(&p->lock);
-		free(p->tids);
-		free(p);
-		return TPOOL_ERR_SYSTEM;
-	}
-
-	/*
-	 * space 同样用带 CLOCK_MONOTONIC 的属性初始化（理由见 init_cond_monotonic）。
-	 * 失败时按系统错误上报，不做"退回默认时钟继续跑"的降级：那样
-	 * submit_wait_until 会每次都立即超时，而 create 明明返回了成功。
-	 */
-	if (init_cond_monotonic(&p->space) != TPOOL_OK) {
-		pthread_cond_destroy(&p->idle);
-		pthread_cond_destroy(&p->work);
-		pthread_mutex_destroy(&p->lock);
-		free(p->tids);
-		free(p);
-		return TPOOL_ERR_SYSTEM;
-	}
-
 	for (int i = 0; i < nthreads; i++) {
 		rc = pthread_create(&p->tids[i], NULL, worker_main, p);
 		if (rc != 0) {
@@ -310,19 +387,16 @@ static tpool_status create_impl(int nthreads, size_t max_queued, threadpool **ou
 			 * 再 join，最后才析构同步原语 —— 反过来的话，线程可能正在
 			 * 一个已销毁的条件变量上等待，属未定义行为。
 			 */
-			pthread_mutex_lock(&p->lock);
+			pthread_mutex_lock(&p->sync->lock);
 			p->stop = 1;
-			pthread_cond_broadcast(&p->work);
-			pthread_mutex_unlock(&p->lock);
+			pthread_cond_broadcast(&p->sync->work);
+			pthread_mutex_unlock(&p->sync->lock);
 
 			for (int j = 0; j < p->started; j++) {
 				pthread_join(p->tids[j], NULL);
 			}
 
-			pthread_cond_destroy(&p->space);
-			pthread_cond_destroy(&p->idle);
-			pthread_cond_destroy(&p->work);
-			pthread_mutex_destroy(&p->lock);
+			sync_destroy(p->sync);
 			free(p->tids);
 			free(p);
 			return TPOOL_ERR_SYSTEM;
@@ -353,7 +427,7 @@ void threadpool_destroy(threadpool *p) {
 		return;
 	}
 
-	pthread_mutex_lock(&p->lock);
+	pthread_mutex_lock(&p->sync->lock);
 
 	/* 1) 关门：此后 submit 一律返回 TPOOL_ERR_CLOSED */
 	p->closed = 1;
@@ -364,7 +438,7 @@ void threadpool_destroy(threadpool *p) {
 	 *      不会把任务塞进一个已经关门的池 —— 若少了这次 broadcast，它们会一直
 	 *      等到队列出现空位，而下面第 2 步正等着队列排空，双方互等。
 	 */
-	pthread_cond_broadcast(&p->space);
+	pthread_cond_broadcast(&p->sync->space);
 
 	/*
 	 * 2) 等已提交任务全部执行完。
@@ -374,9 +448,9 @@ void threadpool_destroy(threadpool *p) {
 	 *
 	 *    waiting 也在等待之列，这不是保守，而是必须：被唤醒的提交方还要
 	 *    重新取一次锁才能读到 closed 并返回。若 destroy 不看 waiting 就往下走，
-	 *    它会在对方仍然拿着 p->lock 这个地址的时候销毁互斥锁并 free(p)，
-	 *    对方随后对这一块已释放内存执行 unlock —— 按 C11 6.2.4p2 对象的生存期
-	 *    已经结束，之后任何访问都是未定义行为。
+	 *    它会在对方仍然挂在 sync 的互斥锁上的时候销毁这把锁、free 掉 sync
+	 *    并 free(p)，对方随后对这一块已释放内存执行 unlock —— 按 C11 6.2.4p2
+	 *    对象的生存期已经结束，之后任何访问都是未定义行为。
 	 *
 	 *    waiters 同理，只是方向反过来：屏障等待方等的是"任务做完"，而 destroy
 	 *    自己也在这件事上等待。少了它，最后一个任务结束时 destroy 与屏障方会被
@@ -386,13 +460,13 @@ void threadpool_destroy(threadpool *p) {
 	 *    idle，所以这里不会漏唤醒）。
 	 */
 	while (p->queued > 0 || p->running > 0 || p->waiting > 0 || p->waiters > 0) {
-		pthread_cond_wait(&p->idle, &p->lock);
+		pthread_cond_wait(&p->sync->idle, &p->sync->lock);
 	}
 
 	/* 3) 队列已空，通知工作线程退出 */
 	p->stop = 1;
-	pthread_cond_broadcast(&p->work);
-	pthread_mutex_unlock(&p->lock);
+	pthread_cond_broadcast(&p->sync->work);
+	pthread_mutex_unlock(&p->sync->lock);
 
 	/* 4) join 之后线程确实不再运行，才能析构它可能正在使用的同步原语 */
 	for (int i = 0; i < p->started; i++) {
@@ -411,10 +485,7 @@ void threadpool_destroy(threadpool *p) {
 		t = next;
 	}
 
-	pthread_cond_destroy(&p->space);
-	pthread_cond_destroy(&p->idle);
-	pthread_cond_destroy(&p->work);
-	pthread_mutex_destroy(&p->lock);
+	sync_destroy(p->sync);
 	free(p->tids);
 	free(p);
 }
@@ -444,7 +515,7 @@ static void enqueue_locked(threadpool *p, task *t) {
 	p->submitted++;
 
 	/* 只唤醒一个空闲线程：一个任务只需要一个消费者 */
-	pthread_cond_signal(&p->work);
+	pthread_cond_signal(&p->sync->work);
 }
 
 tpool_status threadpool_submit(threadpool *p, tpool_task_fn fn, void *arg) {
@@ -464,10 +535,10 @@ tpool_status threadpool_submit(threadpool *p, tpool_task_fn fn, void *arg) {
 	t->arg  = arg;
 	t->next = NULL;
 
-	pthread_mutex_lock(&p->lock);
+	pthread_mutex_lock(&p->sync->lock);
 
 	if (p->closed) {
-		pthread_mutex_unlock(&p->lock);
+		pthread_mutex_unlock(&p->sync->lock);
 		free(t);
 		return TPOOL_ERR_CLOSED;
 	}
@@ -482,14 +553,14 @@ tpool_status threadpool_submit(threadpool *p, tpool_task_fn fn, void *arg) {
 	 * 在这条路径更频繁的情况下更差。
 	 */
 	if (p->max_queued != 0 && p->queued >= p->max_queued) {
-		pthread_mutex_unlock(&p->lock);
+		pthread_mutex_unlock(&p->sync->lock);
 		free(t);
 		return TPOOL_ERR_FULL;
 	}
 
 	enqueue_locked(p, t);
 
-	pthread_mutex_unlock(&p->lock);
+	pthread_mutex_unlock(&p->sync->lock);
 
 	return TPOOL_OK;
 }
@@ -515,10 +586,10 @@ static tpool_status submit_wait_impl(threadpool *p, tpool_task_fn fn, void *arg,
 	t->arg  = arg;
 	t->next = NULL;
 
-	pthread_mutex_lock(&p->lock);
+	pthread_mutex_lock(&p->sync->lock);
 
 	if (p->closed) {
-		pthread_mutex_unlock(&p->lock);
+		pthread_mutex_unlock(&p->sync->lock);
 		free(t);
 		return TPOOL_ERR_CLOSED;
 	}
@@ -534,7 +605,7 @@ static tpool_status submit_wait_impl(threadpool *p, tpool_task_fn fn, void *arg,
 		 * 与 threadpool_submit 一致 —— 这是消除整类死锁，而不是保守。
 		 */
 		if (is_worker(p, pthread_self())) {
-			pthread_mutex_unlock(&p->lock);
+			pthread_mutex_unlock(&p->sync->lock);
 			free(t);
 			return TPOOL_ERR_FULL;
 		}
@@ -552,14 +623,14 @@ static tpool_status submit_wait_impl(threadpool *p, tpool_task_fn fn, void *arg,
 			int rc;
 
 			if (deadline == NULL) {
-				rc = pthread_cond_wait(&p->space, &p->lock);
+				rc = pthread_cond_wait(&p->sync->space, &p->sync->lock);
 			} else {
 				/*
 				 * 截止时间是 CLOCK_MONOTONIC 的绝对时刻，必须与 space 这个
 				 * 条件变量的时钟一致。两者错配时这里每次都立即返回 ETIMEDOUT，
 				 * 见 init_space_cond。
 				 */
-				rc = pthread_cond_timedwait(&p->space, &p->lock, deadline);
+				rc = pthread_cond_timedwait(&p->sync->space, &p->sync->lock, deadline);
 			}
 
 			if (rc == ETIMEDOUT) {
@@ -584,7 +655,7 @@ static tpool_status submit_wait_impl(threadpool *p, tpool_task_fn fn, void *arg,
 		}
 		p->waiting--;
 		if (p->waiting == 0) {
-			pthread_cond_broadcast(&p->idle);
+			pthread_cond_broadcast(&p->sync->idle);
 		}
 
 		/*
@@ -597,19 +668,19 @@ static tpool_status submit_wait_impl(threadpool *p, tpool_task_fn fn, void *arg,
 		 * "这次没等到空位"更根本，重试也没有意义。
 		 */
 		if (p->closed) {
-			pthread_mutex_unlock(&p->lock);
+			pthread_mutex_unlock(&p->sync->lock);
 			free(t);
 			return TPOOL_ERR_CLOSED;
 		}
 		if (wait_err != TPOOL_OK) {
-			pthread_mutex_unlock(&p->lock);
+			pthread_mutex_unlock(&p->sync->lock);
 			free(t);
 			return wait_err;
 		}
 		if (timed_out != 0) {
 			/* 计数与"返回 TIMEOUT"在同一把锁内完成，两者不会互相矛盾 */
 			p->timeouts++;
-			pthread_mutex_unlock(&p->lock);
+			pthread_mutex_unlock(&p->sync->lock);
 			free(t);
 			return TPOOL_ERR_TIMEOUT;
 		}
@@ -617,7 +688,7 @@ static tpool_status submit_wait_impl(threadpool *p, tpool_task_fn fn, void *arg,
 
 	enqueue_locked(p, t);
 
-	pthread_mutex_unlock(&p->lock);
+	pthread_mutex_unlock(&p->sync->lock);
 
 	return TPOOL_OK;
 }
@@ -683,7 +754,7 @@ static tpool_status wait_impl(threadpool *p, const struct timespec *deadline) {
 		return TPOOL_ERR_PARAM;
 	}
 
-	pthread_mutex_lock(&p->lock);
+	pthread_mutex_lock(&p->sync->lock);
 
 	/*
 	 * 拒绝工作线程调用。检测方式是拿 pthread_self 与 tids 数组逐个
@@ -696,13 +767,13 @@ static tpool_status wait_impl(threadpool *p, const struct timespec *deadline) {
 	 * 这个阻塞，但只是把"永久阻塞"换成"必然白等到截止时间"，所以照样拒绝。
 	 */
 	if (is_worker(p, pthread_self())) {
-		pthread_mutex_unlock(&p->lock);
+		pthread_mutex_unlock(&p->sync->lock);
 		return TPOOL_ERR_BLOCKING;
 	}
 
 	/* 快速路径：池本来就空闲，不计数、不入等待队列 */
 	if (p->queued == 0 && p->running == 0) {
-		pthread_mutex_unlock(&p->lock);
+		pthread_mutex_unlock(&p->sync->lock);
 		return TPOOL_OK;
 	}
 
@@ -717,14 +788,14 @@ static tpool_status wait_impl(threadpool *p, const struct timespec *deadline) {
 		int rc;
 
 		if (deadline == NULL) {
-			rc = pthread_cond_wait(&p->idle, &p->lock);
+			rc = pthread_cond_wait(&p->sync->idle, &p->sync->lock);
 		} else {
 			/*
 			 * 截止时间是 CLOCK_MONOTONIC 的绝对时刻，必须与 idle 这个条件
 			 * 变量的时钟一致。两者错配时这里每次都立即返回 ETIMEDOUT，
 			 * 见 init_cond_monotonic。
 			 */
-			rc = pthread_cond_timedwait(&p->idle, &p->lock, deadline);
+			rc = pthread_cond_timedwait(&p->sync->idle, &p->sync->lock, deadline);
 		}
 
 		if (rc == ETIMEDOUT) {
@@ -754,7 +825,7 @@ static tpool_status wait_impl(threadpool *p, const struct timespec *deadline) {
 		 * 最后一个屏障方离开。destroy 的等待条件里含 waiters，它可能正睡在
 		 * idle 上，没有这次广播就要等到下一次无关的状态变化才会醒。
 		 */
-		pthread_cond_broadcast(&p->idle);
+		pthread_cond_broadcast(&p->sync->idle);
 	}
 
 	if (wait_err != TPOOL_OK) {
@@ -767,7 +838,7 @@ static tpool_status wait_impl(threadpool *p, const struct timespec *deadline) {
 		st = TPOOL_OK;
 	}
 
-	pthread_mutex_unlock(&p->lock);
+	pthread_mutex_unlock(&p->sync->lock);
 	return st;
 }
 
@@ -792,18 +863,21 @@ tpool_status threadpool_wait_until(threadpool *p, const struct timespec *deadlin
  * ------------------------------------------------------------------ */
 
 /*
- * 查询函数接收 const 指针，但加锁需要可变指针（pthread_mutex_lock 的
- * 语义会修改锁对象）。const 在这里表达的是"不改变池的逻辑状态"，
- * 锁的内部状态变化不属于调用方可见的状态，因此转型是安全的。
+ * 查询函数接收 const threadpool *，语义上不改变池的状态；为了读到一致的计数
+ * 仍要进临界区，而加锁会写锁对象。
+ *
+ * 这里能同时做到"参数 const"与"加锁不丢 const"，靠的是锁挂在指针成员
+ * p->sync 上：const 限定的是 p 本身，不传递给 p->sync 指向的对象
+ * （详见文件开头 tp_sync 的说明）。上一版在这里写的是 (threadpool *)p 转型，
+ * 那是 C 没有 mutable 时的绕法，代价是每条查询都产生一条 -Wcast-qual。
  */
 size_t threadpool_queued(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	size_t n = mp->queued;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	size_t n = p->queued;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
@@ -811,10 +885,9 @@ size_t threadpool_running(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	size_t n = mp->running;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	size_t n = p->running;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
@@ -822,10 +895,9 @@ unsigned long long threadpool_completed(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	unsigned long long n = mp->completed;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	unsigned long long n = p->completed;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
@@ -833,10 +905,9 @@ unsigned long long threadpool_submitted(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	unsigned long long n = mp->submitted;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	unsigned long long n = p->submitted;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
@@ -858,10 +929,9 @@ unsigned long long threadpool_backpressure(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	unsigned long long n = mp->backpressure;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	unsigned long long n = p->backpressure;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
@@ -869,10 +939,9 @@ unsigned long long threadpool_timeouts(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	unsigned long long n = mp->timeouts;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	unsigned long long n = p->timeouts;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
@@ -880,10 +949,26 @@ unsigned long long threadpool_wait_timeouts(const threadpool *p) {
 	if (p == NULL) {
 		return 0;
 	}
-	threadpool *mp = (threadpool *)p;
-	pthread_mutex_lock(&mp->lock);
-	unsigned long long n = mp->wait_timeouts;
-	pthread_mutex_unlock(&mp->lock);
+	pthread_mutex_lock(&p->sync->lock);
+	unsigned long long n = p->wait_timeouts;
+	pthread_mutex_unlock(&p->sync->lock);
+	return n;
+}
+
+/*
+ * 此刻阻塞在 idle 上的屏障调用方数量。
+ *
+ * 与 queued / running 同一条规则：加锁读，读到的是一个"某一时刻成立"的值。
+ * waiters 的维护点是 wait_impl 的进等待前自增、离开时自减，两处都在 lock
+ * 保护下，所以这里读到的值与 destroy 的等待条件看的是同一个计数。
+ */
+size_t threadpool_waiters(const threadpool *p) {
+	if (p == NULL) {
+		return 0;
+	}
+	pthread_mutex_lock(&p->sync->lock);
+	size_t n = p->waiters;
+	pthread_mutex_unlock(&p->sync->lock);
 	return n;
 }
 
