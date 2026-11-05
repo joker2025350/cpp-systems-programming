@@ -12,6 +12,85 @@
 
 ---
 
+## 2026-11-05
+
+### thread-pool
+
+- 同步原语（一把互斥锁 + 三个条件变量）搬进单独分配的 `tp_sync`，`threadpool`
+  只持有一个指针（1.4.0）。要解决的是"接口承诺 `const`、实现把承诺丢掉"：
+  查询函数接收 `const threadpool *`，但加锁会写锁对象，而 C 没有 C++ 的
+  `mutable`，于是只能 `(threadpool *)p` 转型，每条产生一次 `-Wcast-qual`
+  （全仓 7 处 × 编译三次 = 21 条）。改成指针成员后，`const` 只限定指针本身，
+  它指向的锁仍可写，加锁不需要任何转型。按 C11 6.7.3p6 原来那种写法是良定义的
+  （对象本身不是 const 定义），但正确性依赖一个类型系统看不见的前提。
+- `create` 的四段失败回滚收进 `sync_create` / `sync_destroy` 一对函数：
+  每步 `init` 的紧邻位置放一步对称的 `destroy`，加第五个原语不用改四处。
+  `sizeof(struct threadpool)` 从 304 降到 128，同步原语是独立的 184 字节对象；
+  句柄不透明，**没有 ABI 破坏**。
+- 新增 `threadpool_waiters(pool)`（此刻阻塞在屏障上的调用方数量）。
+  它不是给调用方做判断用的（瞬时量），是给测试用的：见下一条。
+- `tests/stress_waiter_destroy.c` 重写为闸门 + 观测。原构造有两个毛病，
+  都在 20 次重复运行里露出来：① 创建完等待线程就立刻起 destroy 线程，
+  迟到的等待方在池被 `free` 之后才取锁，ASan 报的栈与真竞态一模一样
+  （20 次 1 次，调用方违反了头文件里"destroy 不得与正在进入模块的新调用并发"）；
+  ② 更隐蔽——占位任务是固定 2 ms 忙等，若 32 个线程没在 2 ms 内起来，每个
+  `wait_until` 都看到 `queued`/`running` 为 0、走快速路径直接返回 `OK`，
+  打印"9600 个等待方 0 个异常"，实际一条竞态路径都没走。现在占位任务改为
+  闸门（`running == 1` 可查），等待方用 `threadpool_waiters` 观测到 N 个就位
+  之后才起 destroy 线程。`make stress` 从 1.25 s 变 2.1 s，连跑 20 次 0 次失败。
+- 单元测试新增 `-- 只读接口经 const 指针调用 --`（12 项）：九个查询经
+  `const threadpool *` 调用并与普通指针读到的值逐项对比；配套 10 条
+  `_Static_assert(_Generic(&fn, ... (*)(const threadpool *): 1, default: 0), ...)`。
+  为什么不用"传个 const 指针进去"当断言：实测把 `threadpool_queued` 的形参
+  改回 `threadpool *`，`make test` 退出码仍是 0，只有一行
+  `-Wdiscarded-qualifiers` 警告（本仓库没有 `-Werror`）。`_Generic` 比对
+  完整函数类型，签名一变就是 error：退出码 2，
+  `error: static assertion failed: "threadpool_queued must take const threadpool *"`。
+- `destroy × 屏障等待` 用例里原来的 `sleep_ms(50)` 换成
+  `wait_waiters(p, 1, 2000)`，与 `wait_running` 同构：观测计数，不等时间。
+- 验证（内网 Ubuntu / Linux 6.8.0-138 / gcc 11.4.0 / Ryzen 7 5700X）：
+  默认、ASan+UBSan+LSan、TSan 三种构建 0 警告、无 sanitizer 报告；
+  单元 202 → **215**，check 64 不变；全仓单元 1081 → **1097** 项 0 失败；
+  加严构建 **0 条警告**（含 `-Wcast-qual`，1.3.0 时是 23 条）；testdata 未变。
+- 反向验证两处：去掉 `destroy` 等待条件里的 `waiters` → 某轮直接卡死
+  （等待方挂在已销毁的条件变量上，既不返回也不报错，20 s 后被 `timeout` 杀掉；
+  1.3.0 的旧构造下同一注入报的是 ASan heap-use-after-free）；把
+  `threadpool_queued` 形参改回非 const → 静态断言编译失败。
+- 性能：加锁路径 6.12~6.37 ns/次（1.3.0）对 6.20~6.41 ns/次（1.4.0），
+  多一次解引用约 0.1~0.2 ns（2% 量级，两组区间重叠）。任务级基准第 1 组
+  （空任务 20 万）两个版本轮流跑三轮：1 线程与 2 线程落在噪声内；
+  4/8 线程 1.4.0 反而快 7%~12%，方向与"只增加工作"的改动相反，
+  归因不了，因此不写进性能表。成因需要 `perf`，这台机器
+  `perf_event_paranoid = 4` 且没有 `perf`。
+
+### concurrent-lock
+
+- `counter` 的 mutex / spin 锁改为指针成员、单独分配（1.1.0），与 thread-pool
+  同一处改动、同一理由：`counter_get` 接收 `const counter *` 却要加锁。
+  全仓最后 2 条 `-Wcast-qual` 随之消失。`sizeof(struct counter)` 从 56 降到 24；
+  句柄不透明，**没有 ABI 破坏**。
+- spin 那一格用 `void *lock_mem` 而不是 `pthread_spinlock_t *`：glibc 把
+  `pthread_spinlock_t` 定义成 `volatile int` 的 typedef
+  （`bits/pthreadtypes.h:103`），直接 `free` 会丢 `volatile`，触发
+  `-Wdiscarded-qualifiers`（在 `-Wall` 里）。`void *` 保存 `malloc` 返回的块，
+  加锁时隐式转换，路径上没有限定符丢失。
+- `tests/test_counter.c` 新增 `test_const_get`（4 项，四种同步实现经 const 指针
+  读值）与一条 `_Static_assert(_Generic(&counter_get, ...))`；68 → **72** 项。
+- 验证：默认 / sanitize / tsan 构建 0 警告；72 项全过；加严 8 条 → **0 条**；
+  `check_pool.sh` 42 项全过。
+- 一次被推翻的假设：`mutex` 实现的吞吐比 1.0.0 高 20%（26.6/25.7/25.9 →
+  31.0/31.1/32.2 Mops/s）。第一版解释是"锁与被保护值落在同一条缓存行"，
+  于是做了对照实验：在锁与值之间插 32 字节填充，结果**更慢**（23.6 Mops/s），
+  假设不成立。成因未查清（需要 `perf stat`），所以不写进性能表，只记在
+  README 6.0 与 7.3。
+
+### CI
+
+- 加严警告构建取消 `-Wcast-qual` 的"只统计、不判定"例外，改为 0 条判定。
+  留着这个例外，将来新写的转型会静默通过；现在它没有存在的理由了。
+
+---
+
 ## 2026-11-04
 
 ### contact-list

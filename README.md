@@ -9,8 +9,8 @@ build target — not a single-file exercise.
 
 | Module | What it covers | Public interface | Verification |
 |---|---|---|---|
-| [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly; benchmarks driven either by threads the driver creates itself or by tasks submitted to `thread-pool` (`-p`), with per-task batch size and queue capacity as knobs | `counter.h` | 68 checks · 42 end-to-end · ASan/UBSan · TSan |
-| [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, a drain-on-destroy shutdown, and optional bounded queues with three backpressure modes: reject, block, or block until a monotonic deadline; both the submission and the drain barrier carry a deadline | `threadpool.h` | 202 checks · 64 end-to-end · race stress (destroy vs barrier waiter, ASan) · ASan/UBSan · TSan |
+| [`concurrent-lock`](src/concurrent-lock) | Five ways to increment a shared counter: unsynchronised, mutex, spinlock, `__atomic` builtins, and x86 inline assembly; benchmarks driven either by threads the driver creates itself or by tasks submitted to `thread-pool` (`-p`), with per-task batch size and queue capacity as knobs | `counter.h` | 72 checks · 42 end-to-end · ASan/UBSan · TSan |
+| [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, a drain-on-destroy shutdown, and optional bounded queues with three backpressure modes: reject, block, or block until a monotonic deadline; both the submission and the drain barrier carry a deadline; the mutex and the condition variables live in a separately allocated `tp_sync` so every `const` query locks without a cast | `threadpool.h` | 215 checks · 64 end-to-end · race stress (destroy vs barrier waiter, ASan) · ASan/UBSan · TSan |
 | [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 119 checks · 41 end-to-end · 50 live checks · 24 streaming checks · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list plus a hash index that grows and shrinks with the load factor; seeded hashing (`mix64(FNV-1a ^ seed)`, seed 0 keeps the pre-1.4 bucket layout) so a name-to-bucket mapping cannot be built offline; text format that round-trips byte for byte; byte-order sorting over a caller-supplied pointer array; save-failure injection (read-only dir, `RLIMIT_FSIZE`, failing `rename`) | `contacts.h` | 242 checks · 466 allocation-failure injections · 20 save-failure injections · 43 seed checks · 50 end-to-end · ASan/UBSan |
 | [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` | `wordcount.h` | 40 checks · 28 parallel-vs-sequential comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
@@ -115,13 +115,15 @@ counts, benchmark tables — to the `ci-reports` branch, one file per commit SHA
 branch exists because Actions logs need credentials to read while repository content
 does not, so `ci-reports` is the part of the build record anyone can inspect.
 
-`-Wcast-qual` is counted but not enforced. The `const` query functions in `counter` and
-`threadpool` have to lock a synchronisation primitive, and `pthread_mutex_lock` takes a
-non-`const` pointer. C11 6.7.3p6 makes casting away `const` well-defined as long as the
-object itself is not `const`-qualified, which holds for objects returned by `create`.
-Removing the casts properly means moving the primitives out of the object (C has no
-`mutable`) — a structural change, tracked in the module READMEs instead of being folded
-into an unrelated commit.
+The strict build is now zero-warning with no exceptions. Until 1.4.0 `-Wcast-qual` was
+counted but not enforced: the `const` query functions in `counter` and `threadpool` had
+to lock a synchronisation primitive, and `pthread_mutex_lock` takes a non-`const` pointer.
+Casting away `const` was well-defined under C11 6.7.3p6 (the objects are allocated by
+`create`, never `const`-qualified), but it left every query relying on a precondition the
+type system could not see. Both modules now keep the primitive behind a pointer member
+(`tp_sync` in `thread-pool`, `lock` / `lock_mem` in `counter`), so `const` stops at the
+pointer and no cast is needed. Keeping the exception would have let the next cast slip
+through silently.
 
 ## Requirements
 

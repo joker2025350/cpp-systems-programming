@@ -166,15 +166,16 @@ jobs:
       # 放在最后：它要先 make clean，否则共用 bin/ 时 make 只比时间戳、
       # 认为目标已是最新，一套新选项根本不会生效。
       #
-      # -Wcast-qual 是唯一不参与判定的旗标，单独计数并写进报告：
-      # 各模块的 const 查询函数内部要给同步原语加锁，而 pthread_mutex_lock
-      # 的形参是非 const 的 pthread_mutex_t *，实现里因此对锁成员取了
-      # 非 const 视图。按 C11 6.7.3p6，只要对象本身不是 const 限定的，
-      # 通过转型丢弃 const 再修改它是良定义的——counter 与 threadpool 都由
-      # create 分配、调用方持有非 const 句柄，所以这不是未定义行为，
-      # 只是"逻辑只读、物理上要同步"这个取舍的可见代价。
-      # 真要消掉它，得把同步原语放到对象之外（C 没有 mutable），
-      # 那是结构改动，记在各自 README 的待办里，不混进任何一次小改动。
+      # 从 2026-11-05 起这个目标要求 **0 条警告，没有任何例外**。
+      # 此前 -Wcast-qual 是"只统计、不判定"的：各模块的 const 查询函数内部
+      # 要给同步原语加锁，而 pthread_mutex_lock 的形参是非 const 的
+      # pthread_mutex_t *，实现里只能对锁成员取非 const 视图。按 C11 6.7.3p6
+      # 那样做是良定义的（对象本身不是 const 定义），但它把一个类型系统
+      # 看不见的前提写进了每条查询。
+      #
+      # 1.4.0 把同步原语挪到对象之外、由指针成员持有（thread-pool 的 tp_sync、
+      # counter 的 lock/lock_mem），const 只停在指针上，转型不再需要。
+      # 例外也就没有存在的理由：留着它，将来新写的转型会静默通过。
       - name: 加严警告构建
         run: |
           # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
@@ -185,20 +186,19 @@ jobs:
           make \
             CFLAGS='-std=c11 -Wall -Wextra -Wconversion -Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes -O2 -g -pthread' \
             2>&1 | tee /tmp/strict.log || rc=$?
-          total=$(grep -c 'warning:' /tmp/strict.log || true)
           # 只数"告警行里的 -Wcast-qual"。不能直接 grep -c 'Wcast-qual'：
           # make 会把每条编译命令回显出来，命令行里也含这个旗标，
           # 于是统计值比告警总数还大（实测 25 > 12）。
+          total=$(grep -c 'warning:' /tmp/strict.log || true)
           castq=$(grep 'warning:' /tmp/strict.log | grep -c 'Wcast-qual' || true)
-          other=$((total - castq))
-          echo "加严警告构建：$total 条警告，其中 -Wcast-qual $castq 条（不判定），其余 $other 条（make 退出码 $rc）" >> /tmp/ci-summary.txt
+          echo "加严警告构建：$total 条警告（其中 -Wcast-qual $castq 条，同样判定）（make 退出码 $rc）" >> /tmp/ci-summary.txt
           if [ $rc -ne 0 ]; then
             { echo "!! 加严警告构建失败，最后 60 行："; tail -60 /tmp/strict.log; } >> /tmp/ci-summary.txt
             exit $rc
           fi
-          if [ "$other" -ne 0 ]; then
-            { echo "!! 加严警告构建出现 $other 条 -Wcast-qual 之外的警告："
-              grep 'warning:' /tmp/strict.log | grep -v 'Wcast-qual' | head -20; } >> /tmp/ci-summary.txt
+          if [ "$total" -ne 0 ]; then
+            { echo "!! 加严警告构建出现 $total 条警告："
+              grep 'warning:' /tmp/strict.log | head -20; } >> /tmp/ci-summary.txt
             exit 1
           fi
 
