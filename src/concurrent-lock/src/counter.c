@@ -39,18 +39,40 @@
  *
  * 这是有意的取舍：省内存、并且避免"raw 与 mutex 同时被初始化"这种
  * 逻辑上不可能的状态被表示出来。
+ *
+ * 为什么 mutex / spinlock 是指针而不是直接展开成成员：counter_get 接收
+ * const counter *，它在语义上只读，但要读到一致的值必须加锁，而加锁会写
+ * 锁对象。C 没有 C++ 的 mutable，锁若直接是 union 的成员，从 const 指针上
+ * 取 &c->u.mtx.lock 得到的类型是 const pthread_mutex_t *，传给
+ * pthread_mutex_lock（形参 pthread_mutex_t *）只能显式转型丢掉 const。
+ * 那按 C11 6.7.3p6 只在对象本身不是 const 定义时才良定义——结论没错，
+ * 但正确性要靠类型系统之外的知识来保证，编译器只能给一条 -Wcast-qual。
+ * 改成指针成员后，const 只限定指针本身，它指向的锁仍然可写，
+ * 于是只读接口不需要任何转型。
+ *
+ * 代价是 mutex / spin 两种实现各多一次分配（每个 counter 一次，不在热路径上）。
  */
 struct counter {
 	counter_kind kind;
 	union {
 		long long raw;
 		struct {
-			pthread_mutex_t lock;
-			long long       value;
+			pthread_mutex_t *lock;   /* 单独分配，理由见上 */
+			long long        value;
 		} mtx;
 		struct {
-			pthread_spinlock_t lock;
-			long long          value;
+			/*
+			 * 用 void * 持有而不是 pthread_spinlock_t *：glibc 把
+			 * pthread_spinlock_t 定义成 `volatile int` 的 typedef
+			 * （bits/pthreadtypes.h:103），于是 pthread_spinlock_t *
+			 * 就是 volatile int *，直接传给 free 会丢 volatile 限定符，
+			 * 触发 -Wdiscarded-qualifiers（在 -Wall 里）。
+			 * 用 void * 保存 malloc 返回的块，加锁时再转成
+			 * pthread_spinlock_t *（void * 与对象指针之间的隐式转换
+			 * 在 C 里不需要转型），这条路径上就没有任何限定符丢失。
+			 */
+			void      *lock_mem;
+			long long  value;
 		} spin;
 	} u;
 };
@@ -123,27 +145,56 @@ counter_status counter_create(counter_kind kind, long long initial, counter **ou
 	c->kind = kind;
 
 	switch (kind) {
-	case COUNTER_KIND_MUTEX:
-		if (pthread_mutex_init(&c->u.mtx.lock, NULL) != 0) {
+	case COUNTER_KIND_MUTEX: {
+		/*
+		 * 锁先分配、再初始化。失败路径要按"分配成功但 init 失败"回滚：
+		 * 只 free(c) 会漏掉这块锁对象，只 free(lock) 会把 c 留在半初始化
+		 * 状态 —— 两者都不会立刻出错，前者是退出时的泄漏，后者是
+		 * destroy 时对一个未初始化的锁调 pthread_mutex_destroy。
+		 */
+		pthread_mutex_t *lock = (pthread_mutex_t *)malloc(sizeof *lock);
+
+		if (lock == NULL) {
 			free(c);
 			return COUNTER_ERR_NOMEM;
 		}
+		if (pthread_mutex_init(lock, NULL) != 0) {
+			free(lock);
+			free(c);
+			return COUNTER_ERR_NOMEM;
+		}
+		c->u.mtx.lock  = lock;
 		c->u.mtx.value = initial;
 		break;
+	}
 
-	case COUNTER_KIND_SPIN:
+	case COUNTER_KIND_SPIN: {
 		/*
 		 * 第二个参数是 pshared。这里用 PTHREAD_PROCESS_PRIVATE，
 		 * 因为计数器只在本进程的线程之间共享。
 		 * 若要用 PTHREAD_PROCESS_SHARED 放进共享内存给多进程用，
 		 * 锁本身还必须位于共享映射里——只把 flag 改成 SHARED 是不够的。
+		 *
+		 * 分配块用 void * 接住，理由见 struct counter 里 spin.lock_mem
+		 * 的注释（pthread_spinlock_t 是 volatile int 的 typedef）。
 		 */
-		if (pthread_spin_init(&c->u.spin.lock, PTHREAD_PROCESS_PRIVATE) != 0) {
+		void               *mem = malloc(sizeof(pthread_spinlock_t));
+		pthread_spinlock_t *lock;
+
+		if (mem == NULL) {
 			free(c);
 			return COUNTER_ERR_NOMEM;
 		}
-		c->u.spin.value = initial;
+		lock = mem;
+		if (pthread_spin_init(lock, PTHREAD_PROCESS_PRIVATE) != 0) {
+			free(mem);
+			free(c);
+			return COUNTER_ERR_NOMEM;
+		}
+		c->u.spin.lock_mem = mem;
+		c->u.spin.value    = initial;
 		break;
+	}
 
 	default:
 		/* raw / atomic / asm 共用一个 long long */
@@ -162,10 +213,18 @@ void counter_destroy(counter *c) {
 
 	switch (c->kind) {
 	case COUNTER_KIND_MUTEX:
-		(void)pthread_mutex_destroy(&c->u.mtx.lock);
+		(void)pthread_mutex_destroy(c->u.mtx.lock);
+		free(c->u.mtx.lock);
 		break;
 	case COUNTER_KIND_SPIN:
-		(void)pthread_spin_destroy(&c->u.spin.lock);
+		/*
+		 * 先销毁锁，再释放承载它的内存块：pthread_spin_destroy 之后
+		 * 这块内存就不能再被任何线程使用，但 free 之前它仍然存在。
+		 * 顺序反过来（先 free 再 destroy）是对已释放内存操作，
+		 * 按 C11 6.2.4p2 属于未定义行为。
+		 */
+		(void)pthread_spin_destroy((pthread_spinlock_t *)c->u.spin.lock_mem);
+		free(c->u.spin.lock_mem);
 		break;
 	default:
 		break;
@@ -181,21 +240,25 @@ void counter_destroy(counter *c) {
 long long counter_add(counter *c, long long delta) {
 	switch (c->kind) {
 	case COUNTER_KIND_MUTEX:
-		(void)pthread_mutex_lock(&c->u.mtx.lock);
+		(void)pthread_mutex_lock(c->u.mtx.lock);
 		c->u.mtx.value += delta;
 		{
 			long long value = c->u.mtx.value;
-			(void)pthread_mutex_unlock(&c->u.mtx.lock);
+			(void)pthread_mutex_unlock(c->u.mtx.lock);
 			return value;
 		}
 
 	case COUNTER_KIND_SPIN:
-		(void)pthread_spin_lock(&c->u.spin.lock);
-		c->u.spin.value += delta;
 		{
-			long long value = c->u.spin.value;
-			(void)pthread_spin_unlock(&c->u.spin.lock);
-			return value;
+			pthread_spinlock_t *lock = c->u.spin.lock_mem;
+
+			(void)pthread_spin_lock(lock);
+			c->u.spin.value += delta;
+			{
+				long long value = c->u.spin.value;
+				(void)pthread_spin_unlock(lock);
+				return value;
+			}
 		}
 
 	case COUNTER_KIND_ATOMIC:
@@ -233,14 +296,14 @@ long long counter_get(const counter *c) {
 	switch (c->kind) {
 	case COUNTER_KIND_MUTEX:
 		/*
-		 * pthread_mutex_lock 的参数是 pthread_mutex_t *，不是 const。
-		 * 接口上 counter_get 接受 const counter *，因为从语义上说
-		 * 它不改变计数器的逻辑状态；但为了读到一致的值，实现必须加锁。
-		 * 这里去掉 const 是 C 语言里"逻辑只读、物理上需要同步"的常见处理，
-		 * 代价是 const 的承诺比字面看起来弱一点。
+		 * 从 const counter * 上读 c->u.mtx.lock，得到的类型是
+		 * pthread_mutex_t *const（const 限定的是这个指针值，不是它指向的锁），
+		 * 拷进一个普通指针即可，不需要转型。上一版这里写的是
+		 * (pthread_mutex_t *)&c->u.mtx.lock —— 锁直接嵌在结构里时，只能靠
+		 * 丢 const 才能加锁，见 struct counter 上面的说明。
 		 */
 		{
-			pthread_mutex_t *lock = (pthread_mutex_t *)&c->u.mtx.lock;
+			pthread_mutex_t *lock = c->u.mtx.lock;
 			long long        value;
 
 			(void)pthread_mutex_lock(lock);
@@ -251,7 +314,7 @@ long long counter_get(const counter *c) {
 
 	case COUNTER_KIND_SPIN:
 		{
-			pthread_spinlock_t *lock = (pthread_spinlock_t *)&c->u.spin.lock;
+			pthread_spinlock_t *lock = c->u.spin.lock_mem;
 			long long           value;
 
 			(void)pthread_spin_lock(lock);

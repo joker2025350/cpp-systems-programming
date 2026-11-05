@@ -13,8 +13,9 @@
  *   asm     x86 内联汇编 lock; xaddq，仅在 x86 上可用
  *
  * 为什么用不透明句柄（opaque handle）而不像 04/05 那样公开结构体：
- * 内部要放 pthread_mutex_t 与 pthread_spinlock_t。公开它们意味着头文件
- * 必须 include <pthread.h>，把 pthread 的类型和宏泄漏给每一个调用方；
+ * 内部要放 pthread_mutex_t 与 pthread_spinlock_t（1.1.0 起改为指向它们的指针，
+ * 但类型仍在公开接口之外）。公开它们意味着头文件必须 include <pthread.h>，
+ * 把 pthread 的类型和宏泄漏给每一个调用方；
  * 还要固定住两种锁在结构体里的偏移，任何平台只要 pthread 内部布局不同
  * 就 ABI 不兼容。用不透明句柄，头文件只依赖 <stddef.h>，
  * 内部结构随便改，调用方不必重新编译。
@@ -37,10 +38,10 @@ extern "C" {
 #endif
 
 #define COUNTER_VERSION_MAJOR 1
-#define COUNTER_VERSION_MINOR 0
+#define COUNTER_VERSION_MINOR 1
 #define COUNTER_VERSION_PATCH 0
 
-#define COUNTER_VERSION_STRING "1.0.0"
+#define COUNTER_VERSION_STRING "1.1.0"
 
 /* ------------------------------------------------------------------
  * 实现种类

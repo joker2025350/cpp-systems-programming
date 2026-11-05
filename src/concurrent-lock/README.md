@@ -108,20 +108,37 @@ typedef struct counter counter;        /* 定义在 counter.c 里 */
 `counter_kind_supported` 存在的意义是让调用方**在创建之前**就知道能不能用，
 而不是把 `create` 的失败当成内存不足。
 
-### 2.4 `counter_get` 的 const 问题
+### 2.4 `counter_get` 的 const 承诺（1.1.0 改正）
 
 接口声明为 `long long counter_get(const counter *c)`，但实现内部要对
 mutex / spin 加锁——而 `pthread_mutex_lock` 的参数是 `pthread_mutex_t *`，
 不是 const。
 
-这里去掉了 const 重定向：
+1.0.0 的做法是把 const 丢掉：
 
 ```c
 pthread_mutex_t *lock = (pthread_mutex_t *)&c->u.mtx.lock;
 ```
 
-这是 C 语言里"逻辑上只读、物理上需要同步"的常见处理。const 的承诺比字面看起来弱一点，
-但比把接口改成非 const 要好：调用方拿到的语义仍然是"这个调用不会改变计数器的值"。
+结论本身是对的：对象是 `malloc` 出来的，不是 const 定义，按 C11 6.7.3p6
+通过转型后的指针写入是良定义的。但这是"类型系统看不见的正确性"，
+编译器只知道你丢了 `const`，于是每个这样的转型报一条 `-Wcast-qual`。
+
+1.1.0 把锁改成单独分配、由指针成员持有（见 3.2）。于是 `const counter *c` 上读
+`c->u.mtx.lock`，得到的类型是 `pthread_mutex_t *const`——const 限定的是这个指针值，
+**不是它指向的锁**，拷进普通指针后加锁不需要任何转型。
+
+测试里用一行 `_Static_assert` 把这个承诺钉住：
+
+```c
+_Static_assert(_Generic(&counter_get, long long (*)(const counter *): 1, default: 0),
+               "counter_get must take const counter *");
+```
+
+为什么不用"在测试里传一个 `const counter *` 进去"来当断言：那样只能得到一条
+`-Wdiscarded-qualifiers` **警告**（GCC 默认开启），本仓库没有 `-Werror`，
+构建照旧通过。实测过：把形参改回 `counter *`，`make test` 退出码仍是 0。
+`_Generic` 比对的是完整的函数类型，签名一变就是 error。
 
 ---
 
@@ -153,8 +170,8 @@ struct counter {
     counter_kind kind;
     union {
         long long raw;
-        struct { pthread_mutex_t lock;      long long value; } mtx;
-        struct { pthread_spinlock_t lock;   long long value; } spin;
+        struct { pthread_mutex_t *lock;     long long value; } mtx;
+        struct { void            *lock_mem; long long value; } spin;
     } u;
 };
 ```
@@ -162,8 +179,23 @@ struct counter {
 用 union 有两个好处：一个 `counter` 只占"最大那个实现"的空间；
 并且"raw 与 mutex 同时被初始化"这种逻辑上不可能的状态无法被表示出来。
 
-代价是三种实现的值不在同一个偏移上（`raw` 偏移 8，`mtx.value` 偏移 48），
+代价是三种实现的值不在同一个偏移上（`raw` 偏移 8，`mtx.value` 偏移 16），
 所以访问必须分情况写，没法用一个 `value_ptr()` 统一。这是有意的取舍。
+
+1.1.0 把锁从"嵌在结构里"改成"指针指向单独分配的对象"，两个原因：
+
+- **const。** 嵌在结构里时，从 `const counter *` 上取锁的地址只能靠丢 const 才能
+  加锁，见 2.4。指针成员让 const 只停在指针上。
+- **`pthread_spinlock_t` 是 `volatile int`。** glibc 在
+  `bits/pthreadtypes.h:103` 里写的是 `typedef volatile int pthread_spinlock_t;`，
+  于是 `pthread_spinlock_t *` 就是 `volatile int *`，直接传给 `free` 会丢 volatile
+  限定符、触发 `-Wdiscarded-qualifiers`（在 `-Wall` 里），而不是 `-Wcast-qual`。
+  所以 spin 那一格用 `void *lock_mem` 保存 `malloc` 返回的块，加锁时再隐式转成
+  `pthread_spinlock_t *`——`void *` 与对象指针之间的隐式转换在 C 里不需要转型，
+  这条路径上没有任何限定符丢失。
+
+代价是 mutex / spin 两种实现各多一次分配（每个 counter 一次，不在热路径上），
+`sizeof(struct counter)` 从 56 字节降到 24 字节。
 
 ### 3.3 数据竞争是未定义行为，不是"结果不确定"
 
@@ -352,13 +384,13 @@ cc -std=c11 -Wall -Wextra -O2 -pthread -Iinclude your_app.c bin/libcounter.a -o 
 | 默认 | **0 条** |
 | `make sanitize` | 0 条 |
 | `make tsan` | 0 条 |
-| 加严（CI 的选项，见 `.github/workflows/ci.yml`） | **8 条**，全是 `-Wcast-qual`；非 `-Wcast-qual` 0 条 |
+| 加严（CI 的选项，见 `.github/workflows/ci.yml`） | **0 条**（1.1.0 起；1.0.0 时是 8 条，全是 `-Wcast-qual`） |
 
-加严那一行不是 0：`counter_get` 里有两处 `(pthread_mutex_t *)&c->u.mtx.lock`
-这类转型，按 C11 6.7.3p6 是良定义的（对象由 `create` 分配，调用方持有非 const
-句柄），但 `-Wcast-qual` 一律会报。全仓口径下这一项从 14 条变成 20 条，
-多出来的 6 条来自 `threadpool.c`：它现在被三个模块各编译一次（自身、`word-count`、
-本模块），每次 6 条。CI 只把非 `-Wcast-qual` 的条数当失败条件。
+1.0.0 那 8 条来自两处：本模块 `counter_get` 里 2 条 `(pthread_mutex_t *)&c->u.mtx.lock`
+这类转型，加上 `threadpool.c` 的 6 条——它被三个模块各编译一次（自身、`word-count`、
+本模块），每次 6 条。1.1.0 两边一起改成"锁由指针成员持有"，全仓 `-Wcast-qual`
+从 23 条降到 0 条，CI 里那条"只统计、不判定"的例外也随之取消（见
+`.github/workflows/ci.yml`）。
 
 `make tsan` 这一行到 2026-10-29 才真正成立。TSan 构建用 `-DCOUNTER_TEST_SKIP_RAW`
 关掉了 raw 用例——它故意制造数据竞争，开着必然报错——但只关了 `main` 里的调用点，
@@ -371,10 +403,10 @@ CI 第一次跑全仓 `make tsan` 时才发现。修法是把两个定义也纳�
 
 ### 5.2 单元测试
 
-`make test`，68 项检查：
+`make test`，72 项检查：
 
 ```
-counter 1.0.0 单元测试
+counter 1.1.0 单元测试
 
 ok    创建 raw / mutex / spin / atomic / asm
 ok    创建后指针非空
@@ -400,8 +432,12 @@ ok    raw 不是原子的
 ok    mutex 是原子的
 ...
 ok    未知状态码
+ok    mutex：经 const 指针读到的值一致
+ok    spin：经 const 指针读到的值一致
+ok    atomic：经 const 指针读到的值一致
+ok    asm：经 const 指针读到的值一致
 
-68 项检查，0 项失败
+72 项检查，0 项失败
 ```
 
 三组用例值得单独说明：
@@ -545,6 +581,30 @@ SUMMARY: ThreadSanitizer: data race src/counter.c:227 in counter_add
 **4. `raw` 的"快"没有意义。** 它快是因为大部分工作根本不存在——
 180 Mops/s 对应的是"十次自增里只有 1.4 次真正生效"。把无效劳动算进吞吐
 是基准测试最常见的自欺方式，所以表格里专门留了 `final` 与 `match` 两列。
+
+### 6.0 1.1.0 把锁挪出对象之后：一次"方向不对"的测量
+
+上面那张表的 `mutex` 一行是 1.0.0 的数字。1.1.0 把锁改成单独分配之后，同一台机器、
+同样参数（10 线程 × 100 万次）交替跑，`mutex` 变成 **30.3 ~ 35.7 Mops/s**：
+
+| 版本 | 三次运行（Mops/s） |
+|---|---|
+| 1.0.0（锁嵌在 `struct counter` 里） | 26.6 / 25.7 / 25.9 |
+| 1.1.0（锁单独分配） | 31.0 / 31.1 / 32.2 |
+| 1.0.0 + 在锁与值之间插 32 字节填充 | 23.6 / 23.6 / 23.7 |
+
+这个方向与"多加一次指针解引用"正好相反，所以第一版解释是"锁与被保护的值落在同一条
+缓存行上，互相拖累"——1.0.0 里 `lock` 在偏移 8、`value` 在偏移 48，确实同处一条
+64 字节缓存行。**第三行是对这个解释的检验，结论是它不成立**：把两者拆到不同缓存行
+之后反而更慢（对象从 56 字节涨到 88 字节，缓存足迹变差）。
+
+所以这条差异的成因没有查清：可能是对象与锁各自的对齐位置变了、可能是代码布局的偶然，
+也可能是 malloc 给两块内存的实际相对位置。分辨这些需要 `perf stat` 看指令数、
+缓存缺失与分支失败，而这台机器上 `perf_event_paranoid = 4` 且没有装 `perf`。
+
+**结论：不把 1.1.0 的 `mutex` 更快写进上面那张表。** 那张表记的是"五种实现的量级关系"，
+把它跟一个未查清的 20% 混在一列里，等于让一个不可解释的数字冒充结论。
+这条与 1.3.0 那次 `bench_backlog` 重复表头一样，属于"数字看着对、但不知道自己在说什么"。
 
 ### 6.1 原始程序里的 `usleep(1)` 反而掩盖了竞态
 
@@ -701,6 +761,24 @@ flag 与实际不符不会立刻出错，但会在将来真的要放进 `mmap(MA
 `libcounter.a` 里没有任何对 `threadpool_*` 的引用。改的只有驱动、Makefile、
 测试，以及这份文档。依赖方向保持单向：驱动 → 池，库 → 无。
 
+### 7.3 1.1.0：把锁挪出对象，const 的承诺做实
+
+起因是 `thread-pool` 那一轮的同一个问题：只读查询接收 `const T *`，但实现要加锁。
+两边的处理方式一样——锁改成指针成员、单独分配（见 3.2）。
+
+| 改动 | 结果 |
+|---|---|
+| `mtx.lock` / `spin.lock` 改为指针，`counter_create` 分配、`counter_destroy` 释放 | `counter_get` 不再丢 const，两处 `-Wcast-qual` 消失 |
+| spin 那一格改用 `void *lock_mem` | 绕开 `pthread_spinlock_t` 是 `volatile int` 带来的 `-Wdiscarded-qualifiers` |
+| `tests/test_counter.c` 加 `_Static_assert(_Generic(...))` 与 4 项 const 读值断言 | 68 → 72 项；形参改回 `counter *` 会直接编不过 |
+
+`COUNTER_VERSION_*` 升到 1.1.0。句柄不透明，**没有 ABI 破坏**——
+`sizeof(struct counter)` 从 56 降到 24，调用方本来就看不到它。
+
+顺带记一条被推翻的假设：`mutex` 实现的吞吐比 1.0.0 高了 20%，我以为是
+"锁与被保护值共享缓存行"，做了插入 32 字节填充的对照实验，结果是**更慢**，
+假设不成立；成因未查清，因此不写进性能表（见 6.0）。
+
 ---
 
 ## 8 五种实现的取舍
@@ -794,12 +872,12 @@ ARMv8.1 的 `LDADD`；RISC-V 用 `amoadd`。指令形式完全不同，不能共
 - [ ] 把分派开销与自增开销分离：同一个 `-p` 配置下先用 `-b 0` 量分派，再用
       `-b N` 量总量，两者相减得到"每次自增的边际成本"。6.2 节里
       `(684.69 - 663.70) / 1048576 ≈ 20 ns` 是手算的，应该由驱动直接输出一列
-- [ ] 把 `mtx.lock` / `spin.lock` 移出 `counter` 对象（改为指向单独分配的
-      `sync` 块），消掉 `counter_get` 里两处 `-Wcast-qual` 转型。
+- [x] 把 `mtx.lock` / `spin.lock` 移出 `counter` 对象（改为指向单独分配的
+      `sync` 块），消掉 `counter_get` 里两处 `-Wcast-qual` 转型（1.1.0 完成）。
       C 没有 `mutable`，让 `const counter *` 上的读既能加锁、又不丢弃 `const`
-      的唯一办法，是让锁成为"指针指向的、本身非 const 的对象"。
-      目前那两处转型按 C11 6.7.3p6 是良定义的（对象由 `create` 分配、
-      调用方持有非 const 句柄），所以 CI 只计数不判定失败
+      的唯一办法，是让锁成为"指针指向的、本身非 const 的对象"。顺带发现
+      `pthread_spinlock_t` 是 `volatile int` 的 typedef，分配块要用 `void *` 持有。
+      全仓 `-Wcast-qual` 从 23 条降到 0 条，CI 的例外随之取消（见 6.0、7.3）。
 
 ---
 

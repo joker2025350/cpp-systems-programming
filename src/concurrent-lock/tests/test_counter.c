@@ -335,6 +335,52 @@ static void test_status_string(void) {
 	}
 }
 
+/*
+ * 只读接口的 const 承诺：counter_get 必须能在只拿得到 const counter * 的地方调用。
+ *
+ * mutex 与 spin 两种实现读值时要加锁，而加锁会写锁对象；锁若直接嵌在 counter 里，
+ * 实现只能在内部把 const 丢掉（上一版就是这样，代价是两条 -Wcast-qual）。
+ * 现在锁单独分配、由指针成员持有，const 只限定指针本身，加锁不需要任何转型。
+ *
+ * 下面这条 _Static_assert 是硬保证：它比对 counter_get 的完整函数类型。
+ * 只靠"传一个 const 指针进去"不够——把 const counter * 传给形参是 counter * 的
+ * 函数，在 GCC 里只是 -Wdiscarded-qualifiers 警告，本仓库没有 -Werror，
+ * 构建照旧通过。
+ */
+_Static_assert(_Generic(&counter_get, long long (*)(const counter *): 1, default: 0),
+               "counter_get must take const counter *");
+
+static void test_const_get(void) {
+	static const counter_kind kinds[] = {
+		COUNTER_KIND_MUTEX, COUNTER_KIND_SPIN,
+		COUNTER_KIND_ATOMIC, COUNTER_KIND_ASM
+	};
+
+	for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+		counter       *c  = NULL;
+		const counter *cc = NULL;
+		char           label[64];
+
+		if (!counter_kind_supported(kinds[i])) {
+			continue;
+		}
+		if (counter_create(kinds[i], 7, &c) != COUNTER_OK) {
+			(void)printf("FAIL  %-46s 创建失败\n", counter_kind_name(kinds[i]));
+			g_checks++;
+			g_failures++;
+			continue;
+		}
+
+		(void)counter_add(c, 35);      /* 走到 42，顺便证明写路径仍然可用 */
+		cc = c;                        /* 普通指针隐式转 const 指针 */
+
+		(void)snprintf(label, sizeof label, "%s：经 const 指针读到的值一致",
+		               counter_kind_name(kinds[i]));
+		expect_int(label, counter_get(cc), 42);
+		counter_destroy(c);
+	}
+}
+
 /* ---------------------------------------------------------------- */
 
 int main(void) {
@@ -357,6 +403,7 @@ int main(void) {
 
 	test_kind_helpers();
 	test_status_string();
+	test_const_get();
 
 	(void)printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);
 	return (g_failures == 0) ? 0 : 1;
