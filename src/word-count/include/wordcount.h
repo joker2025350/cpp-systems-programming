@@ -8,6 +8,12 @@
  * 线程模型：全部函数都是可重入的。只要不同的线程使用各自的
  * wc_counter 对象，并发调用是安全的（FILE * 自身的并发访问
  * 由调用方按 stdio 的约定负责）。
+ *
+ * 1.1.0 起多了一对面向"按区域切分"的函数（wc_count_fd_range /
+ * wc_align_chunk），它们用 pread 而不是 FILE *，因此同一 fd 上的
+ * 多个区域可以被不同线程同时统计：pread 不读写文件偏移量，
+ * 这一点是 POSIX 对 pread 的明文保证（"shall not change the file offset"）。
+ * 库本身仍然不引用 pthread，线程只出现在驱动层。
  */
 
 #ifndef WORDCOUNT_H
@@ -15,6 +21,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <sys/types.h>   /* off_t：wc_count_fd_range / wc_align_chunk 用它 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,9 +32,9 @@ extern "C" {
  * ------------------------------------------------------------------ */
 
 #define WC_VERSION_MAJOR 1
-#define WC_VERSION_MINOR 0
+#define WC_VERSION_MINOR 1
 #define WC_VERSION_PATCH 0
-#define WC_VERSION_STRING "1.0.0"
+#define WC_VERSION_STRING "1.1.0"
 
 /* ------------------------------------------------------------------
  * 统计结果
@@ -139,6 +146,60 @@ wc_status wc_count_stream(FILE *stream, wc_stat *out);
  * 这是本模块面向"直接拿来用"的一层封装。
  */
 wc_status wc_count_file(const char *path, wc_stat *out);
+
+/* ------------------------------------------------------------------
+ * 按区域切分：单文件并行的基础原语
+ * ------------------------------------------------------------------
+ * 这两个函数只做"数"与"找边界"，不创建线程，也不使用 FILE *。
+ * 要做的判断是：把 [0, size) 切成若干段、每段交给一个线程，
+ * 结果能否与整文件扫描逐字节一致。答案是能，但前提是每段的起点
+ * 落在分隔符上——否则段首那个词的左半截留在上一段、右半截算在本段，
+ * 单词数就会多算。边界怎么找，就是下面第一个函数。
+ *
+ * 二者都作用在文件描述符上，实现用 pread：它按绝对偏移读，
+ * 既不读写 fd 的文件偏移量，也不受其他线程的读影响，
+ * 因此同一 fd 可以被多个线程并发读不同的区域。
+ * 这依赖 POSIX（pread 的语义），Windows 上没有对应等价物。
+ */
+
+/*
+ * 把一个"建议切点"调整成"合法切点"。
+ *
+ * 从 from 开始逐字节向后找第一个分隔符，把它在文件中的偏移写进 *out。
+ * 若 [from, limit) 里一个分隔符都没有（例如整个区间落在某个超长单词内），
+ * *out 写成 limit，表示"这一段没有可用切点，切了就会破坏单词"。
+ *
+ * 返回 WC_OK 时 *out 落在 [from, limit] 闭区间内，且：
+ *   - *out == limit：区间内无切点，调用方应把这段并进上一段；
+ *   - 否则 data[*out] 一定是分隔符，以它为起点统计不会把词切开。
+ *
+ * fd 必须是可读的普通文件；from < 0 或 limit < from 返回 WC_ERR_PARAM。
+ * 读失败返回 WC_ERR_READ，errno 保留系统错误号。
+ *
+ * 开销说明：最坏情况下这个函数要读 [from, limit) 的全部内容（单词跨越
+ * 很长一段距离时）。正常文本里它只读几个字节——分隔符平均每 5~6 字节
+ * 出现一次。
+ */
+wc_status wc_align_chunk(int fd, off_t from, off_t limit, off_t *out);
+
+/*
+ * 统计 [from, to) 这段字节，等价于把这段内容整段交给 wc_counter_update。
+ *
+ * 调用方负责保证 from 为 0 或者是一个合法切点（wc_align_chunk 给出的偏移）。
+ * 只要满足这一点，把若干相邻区域的结果相加，就等于整文件统计的结果：
+ * 行数按 '\n' 计数与切点无关，字节数按长度相加，单词数因为每段都以
+ * 分隔符开头，段首不可能出现"某个词的右半截"。
+ *
+ * from == to 时写入全零并返回 WC_OK（空区域是合法输入：
+ * 切点比建议切点靠后时会出现）。
+ * fd < 0、out 为 NULL、from < 0、to < from 返回 WC_ERR_PARAM，
+ * 此时 *out 不被修改。
+ * 读失败、或者在读到 to 之前就遇到文件末尾（文件在统计期间被截短）
+ * 返回 WC_ERR_READ，*out 同样不被修改。后一种情况下 errno 为 0——
+ * 没有任何系统调用失败，只是输入比预期短，调用方不能拿 errno 去
+ * strerror。
+ */
+wc_status wc_count_fd_range(int fd, off_t from, off_t to, wc_stat *out);
 
 /*
  * 把状态码转成一句可读的英文描述。

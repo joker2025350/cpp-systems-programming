@@ -59,6 +59,7 @@ LDLIBS   += -pthread
 LIB      := $(OUT)/libwordcount.a
 CLI      := $(OUT)/wordcount
 TESTBIN  := $(OUT)/test_wordcount
+TESTSPLIT := $(OUT)/test_split
 
 LIB_OBJ  := $(OUT)/wordcount.o
 CLI_OBJ  := $(OUT)/main.o
@@ -97,14 +98,23 @@ $(CLI): $(CLI_OBJ) $(LIB) $(POOLLIB)
 $(TESTBIN): tests/test_wordcount.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
-test: $(TESTBIN)
+# 切分测试要写临时文件，因此链接的是 libc 的 mkstemp / write，
+# 不引入任何额外依赖；它同样只链接 libwordcount.a。
+$(TESTSPLIT): tests/test_split.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+test: $(TESTBIN) $(TESTSPLIT)
 	@echo
 	@$(TESTBIN)
+	@echo
+	@$(TESTSPLIT)
 
 check: $(CLI)
 	@sh tests/check_against_wc.sh $(CLI)
 	@echo
 	@sh tests/check_parallel.sh $(CLI)
+	@echo
+	@sh tests/check_split.sh $(CLI)
 
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1
 
@@ -112,13 +122,18 @@ sanitize:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
 		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' sanitize-run
 
-sanitize-run: all $(TESTBIN)
+sanitize-run: all $(TESTBIN) $(TESTSPLIT)
 	@echo "\n--- 单元测试（ASan + UBSan）---"
 	@$(TESTBIN)
+	@echo "\n--- 单文件切分测试（ASan + UBSan）---"
+	@$(TESTSPLIT)
 	@echo "\n--- 命令行工具（ASan + UBSan）---"
 	@$(CLI) testdata/a.txt testdata/b.txt
 	@echo "\n--- 并行路径（ASan + UBSan）---"
 	@$(CLI) -j 4 testdata/a.txt testdata/b.txt testdata/a.txt
+	@echo "\n--- 单文件切分（ASan + UBSan）---"
+	@i=0; while [ $$i -lt 4 ]; do cat testdata/b.txt; i=$$((i + 1)); done > $(OUT)/san_big.txt
+	@$(CLI) -j 4 $(OUT)/san_big.txt
 	@echo "\n--- 错误路径 ---"
 	@$(CLI) testdata/nonexistent.txt || true
 
@@ -129,11 +144,16 @@ tsan:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/tsan \
 		CFLAGS='$(CFLAGS) -fsanitize=thread -O1 -g' tsan-run
 
-tsan-run: all $(TESTBIN)
+tsan-run: all $(TESTBIN) $(TESTSPLIT)
 	@echo "\n--- 单元测试（ThreadSanitizer）---"
 	@setarch $$(uname -m) -R $(TESTBIN)
+	@echo "\n--- 单文件切分测试（ThreadSanitizer）---"
+	@setarch $$(uname -m) -R $(TESTSPLIT)
 	@echo "\n--- 并行驱动（ThreadSanitizer）---"
 	@setarch $$(uname -m) -R $(CLI) -j 4 testdata/a.txt testdata/b.txt testdata/a.txt testdata/b.txt
+	@echo "\n--- 单文件切分（ThreadSanitizer）---"
+	@i=0; while [ $$i -lt 4 ]; do cat testdata/b.txt; i=$$((i + 1)); done > $(OUT)/tsan_big.txt
+	@setarch $$(uname -m) -R $(CLI) -j 4 $(OUT)/tsan_big.txt
 	@echo "\n--- 并行驱动 + 不存在的文件（ThreadSanitizer）---"
 	@setarch $$(uname -m) -R $(CLI) -j 3 testdata/a.txt testdata/nonexistent.txt testdata/b.txt || true
 

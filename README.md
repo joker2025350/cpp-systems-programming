@@ -13,7 +13,7 @@ build target — not a single-file exercise.
 | [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, a drain-on-destroy shutdown, and optional bounded queues with three backpressure modes: reject, block, or block until a monotonic deadline; both the submission and the drain barrier carry a deadline; the mutex and the condition variables live in a separately allocated `tp_sync` so every `const` query locks without a cast | `threadpool.h` | 215 checks · 64 end-to-end · race stress (destroy vs barrier waiter, ASan) · ASan/UBSan · TSan |
 | [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 119 checks · 41 end-to-end · 50 live checks · 24 streaming checks · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list plus a hash index that grows and shrinks with the load factor; seeded hashing (`mix64(FNV-1a ^ seed)`, seed 0 keeps the pre-1.4 bucket layout) so a name-to-bucket mapping cannot be built offline; text format that round-trips byte for byte; byte-order sorting over a caller-supplied pointer array; save-failure injection (read-only dir, `RLIMIT_FSIZE`, failing `rename`) | `contacts.h` | 242 checks · 466 allocation-failure injections · 20 save-failure injections · 43 seed checks · 50 end-to-end · ASan/UBSan |
-| [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` | `wordcount.h` | 40 checks · 28 parallel-vs-sequential comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
+| [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` (one task per file, or separator-aligned chunks of a single file) | `wordcount.h` | 230 checks · 28 parallel-vs-sequential comparisons · 87 single-file-split comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
 
 All five modules are libraries: the CLI links against `lib*.a` and never
 recompiles the module sources, so "this module can be linked independently" is
@@ -27,7 +27,10 @@ driver depends on it — `libwordcount.a` and `libcounter.a` themselves keep zer
 references, so a caller that only wants to count a file or increment a counter
 needs neither pthread nor a worker pool:
 
-- `word-count` submits one task per file (`-j`).
+- `word-count` submits one task per file (`-j`); when there is only one regular file it
+  splits that file into byte ranges aligned to word separators, so a single 400 MB file
+  reaches 9.6× on 8 cores (`wc_align_chunk` + `wc_count_fd_range` in the library,
+  threading stays in the driver).
 - `concurrent-lock` submits one task per batch of increments (`-p`). That second
   consumer exists to answer a different question: how much of a throughput number
   is the counter, and how much is the dispatch that carries it. Measured dispatch

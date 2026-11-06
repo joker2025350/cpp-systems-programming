@@ -11,6 +11,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <unistd.h>   /* pread：POSIX，按绝对偏移读，不动机位 */
 
 /* 扫描状态：不在单词内 / 在单词内 */
 enum {
@@ -184,6 +185,111 @@ wc_status wc_count_file(const char *path, wc_stat *out) {
 	errno = saved;
 
 	return status;
+}
+
+/*
+ * pread 的包装：只处理 EINTR。
+ *
+ * pread 与 read 一样，在信号处理器返回后可能返回 -1 并把 errno 置为 EINTR，
+ * 这不是错误而是"这次没读到"。POSIX 允许实现这么做，调用方必须重试，
+ * 否则一次普通的信号就会让统计失败——而失败点与信号到达的时刻有关，
+ * 属于最难复现的那一类缺陷。
+ */
+static ssize_t wc_pread(int fd, void *buf, size_t size, off_t offset) {
+	for (;;) {
+		ssize_t n = pread(fd, buf, size, offset);
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		return n;
+	}
+}
+
+wc_status wc_align_chunk(int fd, off_t from, off_t limit, off_t *out) {
+	if (fd < 0 || out == NULL || from < 0 || limit < from) {
+		return WC_ERR_PARAM;
+	}
+
+	unsigned char buf[WC_BUFFER_SIZE];
+	off_t         pos = from;
+
+	while (pos < limit) {
+		off_t  remain = limit - pos;
+		size_t want   = sizeof buf;
+
+		/* 只读到 limit 为止：limit 之外的内容属于下一段，不能拿来做判断 */
+		if ((off_t)want > remain) {
+			want = (size_t)remain;
+		}
+
+		ssize_t n = wc_pread(fd, buf, want, pos);
+		if (n < 0) {
+			return WC_ERR_READ;
+		}
+		if (n == 0) {
+			/*
+			 * 还没到 limit 就读到文件末尾：文件比调用方以为的短。
+			 * 这不算系统调用失败，把 errno 显式清零，
+			 * 免得调用方拿上一个失败调用的残留值去 strerror。
+			 */
+			errno = 0;
+			return WC_ERR_READ;
+		}
+
+		for (ssize_t i = 0; i < n; i++) {
+			if (wc_is_separator(buf[i])) {
+				*out = pos + (off_t)i;
+				return WC_OK;
+			}
+		}
+
+		pos += (off_t)n;
+	}
+
+	/* [from, limit) 内没有分隔符：整段都在某个单词内部，没有可用切点 */
+	*out = limit;
+	return WC_OK;
+}
+
+wc_status wc_count_fd_range(int fd, off_t from, off_t to, wc_stat *out) {
+	if (fd < 0 || out == NULL || from < 0 || to < from) {
+		return WC_ERR_PARAM;
+	}
+
+	wc_counter c;
+	wc_counter_reset(&c);
+
+	unsigned char buf[WC_BUFFER_SIZE];
+	off_t         pos = from;
+
+	while (pos < to) {
+		off_t  remain = to - pos;
+		size_t want   = sizeof buf;
+
+		if ((off_t)want > remain) {
+			want = (size_t)remain;
+		}
+
+		ssize_t n = wc_pread(fd, buf, want, pos);
+		if (n < 0) {
+			return WC_ERR_READ;
+		}
+		if (n == 0) {
+			/* 文件在统计期间被截短，见头文件对 errno 为 0 的说明 */
+			errno = 0;
+			return WC_ERR_READ;
+		}
+
+		wc_status status = wc_counter_update(&c, buf, (size_t)n);
+		if (status != WC_OK) {
+			return status;
+		}
+
+		pos += (off_t)n;
+	}
+
+	*out = c.total;
+	return WC_OK;
 }
 
 const char *wc_status_string(wc_status status) {
