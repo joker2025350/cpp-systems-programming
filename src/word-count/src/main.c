@@ -5,14 +5,15 @@
  * 所有统计逻辑都在 wordcount 模块里。把这层单独分出来，
  * 是为了让模块可以被别的程序链接使用，而不必连带一个 main。
  *
- * 两种执行方式：
+ * 三档执行方式：
  *
  *   顺序（默认）  主线程按 argv 顺序逐个处理文件。
  *   并行（-j N）  每个文件作为一个任务提交给 thread-pool 的线程池，
  *                 由至多 N 个工作线程同时处理。
  *   单文件切分    只有一个文件且 -j N（N >= 2）时，把这个文件本身切成若干段，
  *                 每段一个任务。切点必须落在分隔符上，否则段首的词会被
- *                 切成两半、计两次；切点怎么找由 wc_align_chunk 负责。
+ *                 切成两半、计两次；切点怎么找由 wc_align_chunk 负责，
+ *                 每个切点只给 ALIGN_SCAN_BYTES 的读取预算。
  *
  * 三种方式共用同一套输出逻辑，因此三种方式的输出必须逐字节相同。
  * 这一点是 tests/check_split.sh 的判据。
@@ -49,7 +50,7 @@
 #define MAX_JOBS 256
 
 /*
- * 单文件切分的两个常量。
+ * 单文件切分的三个常量。
  *
  * MIN_CHUNK_BYTES 既是"要不要切"的门槛，也是每段的大小下限：
  * 建池、逐段 pread、切点对齐扫描都是固定开销，段太小就摊不平。
@@ -57,9 +58,23 @@
  *
  * CHUNKS_PER_WORKER 让段数多于线程数：各段耗时不可能完全均匀
  * （词长分布不同），段数只有线程数时，最慢的那段决定总时长。
+ *
+ * ALIGN_SCAN_BYTES 是**每个**建议切点的对齐读取预算。
+ *
+ * wc_align_chunk 从建议切点往后逐字节找第一个分隔符，找不到就一直在读，
+ * 直到它收到的 limit。若把 limit 传成文件末尾，那么当整段内容落在同一个
+ * 超长单词里时（基因序列、单行 minified JSON），每个建议切点都会读到文件
+ * 末尾才放弃：nchunks-1 个切点合计读 (nchunks-1) 遍文件，之后还要顺序再读
+ * 一遍。这不是"读两遍"——-j 16 时是 30 遍（见 README 6.5 的实测）。
+ *
+ * 所以每次对齐只给 1 MiB 的预算：预算内没有分隔符就放弃这个切点。
+ * 取 1 MiB 与 MIN_CHUNK_BYTES 同值——一个"单词"长到 1 MiB 的输入本来就不该
+ * 在它内部切，为它多读几十兆字节没有意义。放弃切点不影响正确性：被接受的
+ * 边界仍然是"≥ 建议切点的第一个分隔符"，因此两两单调，只是段数变少（3.7 节）。
  */
 #define MIN_CHUNK_BYTES   (1024 * 1024)
 #define CHUNKS_PER_WORKER 4
+#define ALIGN_SCAN_BYTES  (1024 * 1024)
 
 /*
  * 一个文件的处理槽位。
@@ -256,7 +271,7 @@ enum split_result {
 /*
  * 把单个文件切成若干段并行统计。
  *
- * 只在"普通文件、大小不小于 2 MiB、且切出的段数不少于 2"时才真的并行；
+ * 只在"普通文件、大小不小于 2 MiB、且筛出的段数不少于 2"时才真的并行；
  * 其它情况返回 SPLIT_SKIP，由调用方走顺序路径。管道与终端不可定位，
  * 目录与设备文件的大小没有"统计开始时"这个确定值（fstat 的 st_size
  * 对目录的含义是实现相关的），对它们做定长切分没有意义。
@@ -268,6 +283,9 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	int         nchunks;
 	int         workers;
 	int         ntasks;
+	int         nb         = 1;   /* 已接受的边界个数，bounds[0 .. nb-1] 有效 */
+	int         skipped    = 0;   /* 预算内找不到分隔符而放弃的建议切点个数 */
+	long long   align_read = 0;   /* 对齐扫描总共读掉的字节数 */
 	int         failed = 0;
 	off_t      *bounds = NULL;
 	chunk_slot *slots  = NULL;
@@ -320,19 +338,33 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		goto done;
 	}
 
-	bounds[0]       = 0;
-	bounds[nchunks] = size;
+	bounds[0] = 0;
 
+	/*
+	 * 边界是"筛"出来的，不是"按下标填"的：被放弃的建议切点不占位置，
+	 * 所以用 nb 记已接受的个数，最后才写右端点。nb 最多等于 nchunks-1，
+	 * 因此 bounds 的 nchunks+1 个格子永远够用。
+	 */
 	/*
 	 * 先除后乘：size * k 在超大文件上可能溢出 off_t（有符号 64 位的上限
 	 * 是 8 EiB，虽然现在没有这种盘，但溢出是未定义行为，不该留在这里）。
 	 */
 	for (int k = 1; k < nchunks; k++) {
 		off_t     suggested = (size / nchunks) * k;
-		off_t     aligned   = size;
+		off_t     scan_to;
+		off_t     aligned = size;
 		wc_status st;
 
-		st = wc_align_chunk(fd, suggested, size, &aligned);
+		/*
+		 * 预算终点用减法算，不写 suggested + ALIGN_SCAN_BYTES：
+		 * 后者在 suggested 接近 off_t 上限时会进位成负数（C11 6.5p5，
+		 * 有符号整数溢出是未定义行为），而 size - suggested 恒不为负。
+		 */
+		scan_to = (size - suggested > ALIGN_SCAN_BYTES)
+		              ? suggested + ALIGN_SCAN_BYTES
+		              : size;
+
+		st = wc_align_chunk(fd, suggested, scan_to, &aligned);
 		if (st != WC_OK) {
 			int saved = errno;
 			(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
@@ -342,17 +374,34 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		}
 
 		/*
-		 * 这里不需要"对齐结果必须大于上一段起点"的夹紧。wc_align_chunk 返回的是
-		 * "≥ 给定偏移的第一个分隔符"，这个函数对参数单调不减，因此
-		 * aligned_k >= aligned_{k-1} 恒成立，边界不会交叉、内容不会被数两次。
-		 * 两个建议切点落进同一个超长单词时，两者都会对齐到那个词的结尾，
-		 * 于是中间那些段长度为 0——空段在下面被跳过。
+		 * 对齐扫描读掉的就是 aligned - suggested：wc_align_chunk 从 suggested
+		 * 开始逐字节往后找，找到分隔符就停，没找到就停在 limit。
+		 * 这个量在测试里是可断言的（预算的界），比拿耗时当判据稳。
 		 */
-		bounds[k] = aligned;
+		align_read += (long long)(aligned - suggested);
+
+		/*
+		 * aligned == scan_to 表示 [suggested, scan_to) 里一个分隔符都没有。
+		 * scan_to == size 时是"一直到文件末尾都没有切点"，scan_to < size 时
+		 * 是"预算用完"，两种情况的处理相同：放弃这个切点，它所在的那一段
+		 * 并进前一段，右边界由下一个被接受的切点或文件末尾给出。
+		 *
+		 * 这里不能改成"把 aligned 夹紧到上一个边界"：那会造出一个零长度段，
+		 * 看上去无害，却把"库返回了 limit"这个事实抹掉了，与 3.7 节拒绝
+		 * 夹紧是同一个理由——错误必须暴露，不能被就地修正。
+		 */
+		if (aligned == scan_to) {
+			skipped++;
+			continue;
+		}
+
+		bounds[nb++] = aligned;
 	}
 
+	bounds[nb] = size;
+
 	ntasks = 0;
-	for (int k = 0; k < nchunks; k++) {
+	for (int k = 0; k < nb; k++) {
 		slots[k].fd   = fd;
 		slots[k].from = bounds[k];
 		slots[k].to   = bounds[k + 1];
@@ -369,14 +418,21 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	 * 顺序路径）。不把"切了几段"变成可观测量，测试就会在什么都没测到的
 	 * 情况下报绿。不加命令行选项是避免污染正常输出契约：默认情况下
 	 * 三种方式的 stdout 与 stderr 仍然完全一致。
+	 *
+	 * 第五轮起多打三项：建议切点个数、被放弃的个数、对齐扫描读了多少字节。
+	 * 理由同上一段——"预算生效了"也必须是可观测的，否则 check_align_budget.sh
+	 * 只能断言输出正确，而加不加预算输出都正确。
 	 */
 	if (getenv("WORDCOUNT_TRACE_SPLIT") != NULL) {
-		(void)fprintf(stderr, "wordcount: 切分 %s：%d 段，%d 个工作线程\n",
-		              path, ntasks, (jobs < ntasks) ? jobs : ntasks);
+		(void)fprintf(stderr,
+		              "wordcount: 切分 %s：%d 段（建议切点 %d 个，接受 %d 个，"
+		              "放弃 %d 个），对齐扫描读 %lld 字节，%d 个工作线程\n",
+		              path, ntasks, nchunks - 1, nb - 1, skipped, align_read,
+		              (jobs < ntasks) ? jobs : ntasks);
 	}
 
 	/*
-	 * 所有切点都被同一个单词吃掉时只有一段，切了也没有并行度。
+	 * 所有切点都被放弃时只有一段，切了也没有并行度。
 	 * 这时退回顺序路径：结果一样，但少建一次池。
 	 */
 	if (ntasks < 2) {
@@ -396,7 +452,7 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		goto done;
 	}
 
-	for (int k = 0; k < nchunks; k++) {
+	for (int k = 0; k < nb; k++) {
 		/* 空段不提交：任务函数什么都不做，但分派本身要约 600 ns */
 		if (slots[k].from >= slots[k].to) {
 			continue;
@@ -415,7 +471,7 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	(void)threadpool_wait(pool);
 
 	if (!failed) {
-		for (int k = 0; k < nchunks; k++) {
+		for (int k = 0; k < nb; k++) {
 			if (!slots[k].submitted) {
 				continue;
 			}
@@ -500,7 +556,8 @@ static void usage(FILE *out, const char *prog) {
 	    "  -j JOBS   用至多 JOBS 个线程并行统计（1..%d）。\n"
 	    "            多个文件：每个文件一个任务，工作线程数取 min(JOBS, 文件数)。\n"
 	    "            单个文件：把这个普通文件按分隔符对齐切成若干段并行（需 >= 2 MiB），\n"
-	    "            切点若落在词中间会退到下一个分隔符，单词不会被切开。\n"
+	    "            切点若落在词中间会退到下一个分隔符，单词不会被切开；\n"
+	    "            一个切点往后 1 MiB 内都找不到分隔符时放弃该切点（那一段并进前一段）。\n"
 	    "  -h        显示本说明\n"
 	    "\n"
 	    "没有 FILE 参数时读标准输入。多个文件时末尾补一行 total。\n"

@@ -1,0 +1,243 @@
+#!/bin/sh
+# check_align_budget.sh —— 验证"切点对齐有读取预算"这条策略真的生效
+#
+# 要回答的问题：单个大文件切段时，切点对齐扫描读了多少字节？
+#
+# 为什么必须单独测这件事——只看"输出与顺序一致"是不够的，因为：
+#
+#   1. 对齐扫描（wc_align_chunk）找不到分隔符时会一直往后读，直到它收到的
+#      limit。把 limit 传成文件末尾时，一个"整段内容是一个超长单词"的文件
+#      （基因序列、单行 minified JSON）会让每个建议切点都读到末尾才放弃，
+#      (nchunks-1) 个切点合计读约 (nchunks-1)/2 遍文件，之后还要顺序再读一遍。
+#      结果完全正确，只是慢——这类退化不会让任何断言失败。
+#   2. 预算生效与不生效，输出都逐字节相同。所以 ASSERT 输出一致测不出预算。
+#
+# 因此这里断言三件事，全部来自 WORDCOUNT_TRACE_SPLIT 打出的可观测量：
+#
+#   · 全字母文件：每个切点都必须被放弃，段数退化成 1（切分被跳过）；
+#   · 中段有超长单词的文件：被放弃的只是一部分切点，剩下的仍能切，段数 >= 2，
+#     且结果与顺序一致——这是"放弃切点"这条策略唯一可能出错的地方（漏数/重数）；
+#   · 对齐扫描读掉的字节数 <= 建议切点个数 x 1 MiB。
+#
+# 最后一条是预算的定义。1 MiB 与驱动层的 ALIGN_SCAN_BYTES 同值，
+# 改那个常量必须同步改这里的 CAP。
+#
+# 另附一条耗时比值（只作佐证，阈值放得很宽）：不加预算时全字母文件要读
+# 数倍于文件大小的字节，-j 4 的耗时会明显高于顺序路径；加了预算后两者接近。
+#
+# 用法：sh tests/check_align_budget.sh [可执行文件路径]
+# 默认使用 bin/wordcount。
+
+set -u
+
+CLI=${1:-bin/wordcount}
+
+LC_ALL=C
+export LC_ALL
+
+if [ ! -x "$CLI" ]; then
+	echo "找不到可执行文件：$CLI（先执行 make）" >&2
+	exit 1
+fi
+
+# 与 src/main.c 的 ALIGN_SCAN_BYTES 必须一致
+CAP=1048576
+
+# 全字母文件的大小。要 >= 2 MiB 才会进切分路径；取 32 MiB 是为了让
+# "-j 4 vs 顺序"的耗时差在页缓存内也足够明显（见文件末尾）。
+ONEWORD_BYTES=33554432
+
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT INT TERM
+
+checked=0
+failed=0
+
+pass() {
+	printf '  %-46s 正确    %s\n' "$1" "$2"
+	checked=$((checked + 1))
+}
+
+fail() {
+	echo "  $1：$2"
+	failed=$((failed + 1))
+	checked=$((checked + 1))
+}
+
+capture() {
+	prefix=$1
+	shift
+	"$CLI" "$@" > "$work/$prefix.out" 2> "$work/$prefix.err"
+	echo $? > "$work/$prefix.rc"
+}
+
+check_triple() {
+	label=$1
+	base=$2
+	cand=$3
+	bad=0
+
+	if ! cmp -s "$work/$base.out" "$work/$cand.out"; then
+		echo "  $label：stdout 不一致"
+		diff "$work/$base.out" "$work/$cand.out" | head -6
+		bad=1
+	fi
+	if ! cmp -s "$work/$base.err" "$work/$cand.err"; then
+		echo "  $label：stderr 不一致"
+		diff "$work/$base.err" "$work/$cand.err" | head -6
+		bad=1
+	fi
+	if [ "$(cat "$work/$base.rc")" != "$(cat "$work/$cand.rc")" ]; then
+		echo "  $label：退出码不一致（基线 $(cat "$work/$base.rc")，"\
+		     "待测 $(cat "$work/$cand.rc")）"
+		bad=1
+	fi
+
+	if [ $bad -eq 0 ]; then
+		printf '  %-46s 一致    %s\n' "$label · stdout/stderr/退出码" "逐字节相同"
+	else
+		failed=$((failed + 1))
+	fi
+	checked=$((checked + 1))
+}
+
+# trace_of <文件> <线程数>：把驱动打到 stderr 的切分记录取出来
+trace_of() {
+	WORDCOUNT_TRACE_SPLIT=1 "$CLI" -j "$2" "$1" 2>&1 >/dev/null | tr -d '\r'
+}
+
+# field_of <trace> <标签> <单位>：取 "标签 N 单位" 里的 N
+field_of() {
+	printf '%s\n' "$1" | sed -n "s/.*$2 \([0-9][0-9]*\) $3.*/\1/p"
+}
+
+# ---------------------------------------------------------------- 造输入
+
+# 1) 32 MiB 全是字母：一个词贯穿整个文件，没有任何可用切点
+head -c "$ONEWORD_BYTES" /dev/zero | tr '\0' 'a' > "$work/oneword.txt"
+
+# 2) 1 MiB 正常文本 + 4 MiB 单个词 + 1 MiB 正常文本：
+#    中间那几个建议切点必须被放弃，两端的可以接受。
+#    这是"放弃一部分切点"的唯一实战形态，漏数/重数都会在这里暴露。
+cat testdata/b.txt testdata/b.txt > "$work/text2.txt"
+head -c 1048576 "$work/text2.txt" > "$work/longword.txt"
+head -c 4194304 /dev/zero | tr '\0' 'a' >> "$work/longword.txt"
+head -c 1048576 "$work/text2.txt" >> "$work/longword.txt"
+
+# 3) 8 MiB 正常文本：分隔符密集，对齐应该只读几十字节
+cat testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
+    testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
+    testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
+    testdata/b.txt testdata/b.txt > "$work/mixed.txt"
+
+echo "切点对齐的读取预算"
+echo "---------------------------------------------------------------"
+
+# ---------------------------------------------------------------- 一致性
+
+for name in oneword longword mixed; do
+	f="$work/$name.txt"
+	capture "$name-seq" "$f"
+
+	for j in 2 4 8; do
+		capture "$name-j$j" -j "$j" "$f"
+		check_triple "$name · -j $j" "$name-seq" "$name-j$j"
+	done
+done
+
+# ---------------------------------------------------------------- 预算
+
+# 三个文件都单独断言，判据不同：全字母文件应当一个切点都留不下，
+# 中段有超长词的文件应当只放弃一部分，正常文本一个都不该放弃。
+for name in oneword longword mixed; do
+	f="$work/$name.txt"
+	t=$(trace_of "$f" 4)
+
+	segs=$(printf '%s\n' "$t" | sed -n 's/.*：\([0-9][0-9]*\) 段.*/\1/p')
+	pts=$(field_of "$t" '建议切点' '个')
+	skp=$(field_of "$t" '放弃' '个')
+	rd=$(field_of "$t" '对齐扫描读' '字节')
+
+	if [ -z "$segs" ] || [ -z "$pts" ] || [ -z "$skp" ] || [ -z "$rd" ]; then
+		fail "$name · 切分记录不完整" "$t"
+		continue
+	fi
+
+	case $name in
+	oneword)
+		if [ "$segs" = "1" ] && [ "$skp" = "$pts" ]; then
+			pass "$name · 全部切点被放弃" "$pts 个建议切点全部放弃，退化为 1 段"
+		else
+			fail "$name · 应放弃全部切点" \
+			     "段数 $segs，建议切点 $pts，放弃 $skp"
+		fi
+		;;
+	longword)
+		if [ "$segs" -ge 2 ] && [ "$skp" -ge 1 ] && [ "$skp" -lt "$pts" ]; then
+			pass "$name · 只放弃超长词内的切点" \
+			     "$pts 个建议切点放弃 $skp 个，仍切出 $segs 段"
+		else
+			fail "$name · 应只放弃一部分切点" \
+			     "段数 $segs，建议切点 $pts，放弃 $skp"
+		fi
+		;;
+	mixed)
+		if [ "$segs" -ge 2 ] && [ "$skp" = "0" ]; then
+			pass "$name · 正常文本不放弃切点" "$pts 个建议切点全部接受，$segs 段"
+		else
+			fail "$name · 正常文本不该放弃切点" \
+			     "段数 $segs，建议切点 $pts，放弃 $skp"
+		fi
+		;;
+	esac
+
+	# 预算的定义：每个建议切点最多读 CAP 字节
+	limit=$((pts * CAP))
+	if [ "$rd" -le "$limit" ]; then
+		pass "$name · 对齐读取在预算内" "$rd 字节 <= $pts x $CAP"
+	else
+		fail "$name · 对齐读取超出预算" "$rd 字节 > $pts x $CAP"
+	fi
+done
+
+# 正常文本的读取量应当远小于预算：分隔符平均每几字节一个，
+# 每个切点读不到 1 KiB。这条判据能发现"对齐改成逐块读整个区间"这类退化。
+t=$(trace_of "$work/mixed.txt" 4)
+rd=$(field_of "$t" '对齐扫描读' '字节')
+
+if [ -n "$rd" ] && [ "$rd" -le 65536 ]; then
+	pass "mixed · 正常文本对齐开销可忽略" "$rd 字节"
+else
+	fail "mixed · 正常文本对齐读了 $rd 字节" "期望 <= 65536"
+fi
+
+# ---------------------------------------------------------------- 耗时佐证
+
+# 不加预算时 32 MiB 全字母文件要读约 (nchunks-1) x 16 MiB 的对齐字节，
+# -j 4 的耗时会是顺序路径的数倍；加了预算后两者只差一次 32 MiB 的顺序读，
+# 比值应接近 1。阈值放到 3.0：这条只用来兜住"预算被去掉"的量级回归，
+# 不当作性能指标（CI 上单次耗时抖动大）。
+start=$(date +%s%N)
+"$CLI" "$work/oneword.txt" > /dev/null
+mid=$(date +%s%N)
+"$CLI" -j 4 "$work/oneword.txt" > /dev/null
+end=$(date +%s%N)
+
+seq_ms=$(( (mid - start) / 1000000 ))
+par_ms=$(( (end - mid) / 1000000 ))
+
+if [ "$seq_ms" -gt 0 ] && [ $((par_ms * 10 / seq_ms)) -le 30 ]; then
+	pass "oneword · -j 4 不比顺序慢一个量级" \
+	     "顺序 ${seq_ms} ms，-j 4 ${par_ms} ms"
+else
+	fail "oneword · -j 4 耗时 $par_ms ms 对顺序 $seq_ms ms" "比值超过 3.0"
+fi
+
+echo
+if [ "$failed" -eq 0 ]; then
+	echo "全部通过（$checked 项比对）"
+	exit 0
+fi
+
+echo "$failed 项失败"
+exit 1

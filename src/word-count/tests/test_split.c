@@ -10,10 +10,12 @@
  * 平均分的——它落在哪里完全取决于文件内容长度，人工很难恰好构造。
  * 因此这里不挑输入，而是把每个输入在所有切段数下都跑一遍。
  *
- * 用例分三类：
+ * 用例分四类：
  *   1. wc_align_chunk 本身：给定偏移，它该返回哪个偏移；
  *   2. 整段统计与分段统计的一致性（每个输入 × 每种段数）；
- *   3. 错误路径：非法参数、文件在统计期间被截短、空区域。
+ *   3. 对齐读取预算：放弃一部分切点时段数与结果都要对（对齐扫描的 limit
+ *      由调用方给，驱动层给的是"建议切点 + 1 MiB"）；
+ *   4. 错误路径：非法参数、文件在统计期间被截短、空区域。
  *
  * 编译：make test（与 test_wordcount 一起运行）
  */
@@ -333,7 +335,199 @@ static void test_one_huge_word(void) {
 }
 
 /*
- * 第三类：错误路径。
+ * 与驱动层同构、但对每个建议切点施加"对齐读取预算"的切分。
+ *
+ * 与 chunked_stat 只差一条：wc_align_chunk 的 limit 不是文件末尾，而是
+ * "建议切点 + cap"。预算内找不到分隔符时，这个切点被放弃——它所在的那一段
+ * 并进前一段，右边界由下一个被接受的切点或文件末尾给出。
+ *
+ * 这条策略唯一可能出错的地方是"放弃"与"接受"混排时的边界交叠：被接受的
+ * 边界仍然是"≥ 建议切点的第一个分隔符"，因此两两单调，理论上不会重叠。
+ * 但理论要靠用例钉住——下面 test_align_budget 里那个 1 MiB 的单词
+ * 正好让三个建议切点落在"接受 / 放弃 / 接受"的顺序上。
+ */
+static wc_status chunked_stat_budget(int fd, off_t size, int nchunks, off_t cap,
+                                     wc_stat *out, int *ntasks, int *skipped) {
+	off_t bounds[40];
+	int   nb        = 1;
+	int   nskipped  = 0;
+
+	if (nchunks < 1 || nchunks >= (int)(sizeof bounds / sizeof bounds[0])) {
+		return WC_ERR_PARAM;
+	}
+
+	bounds[0] = 0;
+
+	for (int k = 1; k < nchunks; k++) {
+		off_t     suggested = (size / nchunks) * (off_t)k;
+		off_t     scan_to   = (size - suggested > cap) ? suggested + cap : size;
+		off_t     aligned   = size;
+		wc_status st        = wc_align_chunk(fd, suggested, scan_to, &aligned);
+
+		if (st != WC_OK) {
+			return st;
+		}
+
+		if (aligned == scan_to) {
+			nskipped++;
+			continue;
+		}
+
+		bounds[nb++] = aligned;
+	}
+	bounds[nb] = size;
+
+	int tasks = 0;
+	for (int k = 0; k < nb; k++) {
+		if (bounds[k] < bounds[k + 1]) {
+			tasks++;
+		}
+	}
+
+	wc_stat sum = {0, 0, 0};
+
+	for (int k = 0; k < nb; k++) {
+		wc_stat   part;
+		wc_status st = wc_count_fd_range(fd, bounds[k], bounds[k + 1], &part);
+
+		if (st != WC_OK) {
+			return st;
+		}
+		sum.lines += part.lines;
+		sum.words += part.words;
+		sum.bytes += part.bytes;
+	}
+
+	*out     = sum;
+	*ntasks  = tasks;
+	*skipped = nskipped;
+	return WC_OK;
+}
+
+/*
+ * 第三类：对齐读取预算（驱动层的 ALIGN_SCAN_BYTES）。
+ *
+ * 三条判据：
+ *   1. 预算只影响"段怎么分"，不影响"数出什么"——任何 cap 下结果都必须
+ *      与整文件统计相同；
+ *   2. 预算够小时超长单词内的切点必须被放弃（段数变少），不能"硬切"；
+ *   3. cap == size 时与不加预算完全等价（这条保证新策略是旧的超集，
+ *      而不是另一套算法）。
+ */
+static void test_align_budget(void) {
+	const off_t mib   = (off_t)(1024 * 1024);
+	const off_t size  = 3 * mib;
+	char       *buf   = (char *)malloc((size_t)size);
+	char        path[256];
+	wc_stat     whole;
+
+	if (buf == NULL) {
+		g_checks++;
+		g_failures++;
+		(void)printf("FAIL  无法分配 3 MiB 缓冲区\n");
+		return;
+	}
+
+	/*
+	 * 先整块填 'a'，再每 9 字节放一个空格：分隔符密集，
+	 * 最后一个空格之后不足 9 字节的尾巴仍然是 'a'——不能留未初始化的字节，
+	 * 否则同一个用例在两次运行里可能扫到不同的内容（malloc 不保证清零）。
+	 */
+	(void)memset(buf, 'a', (size_t)size);
+	for (off_t i = 8; i < size; i += 9) {
+		buf[i] = ' ';
+	}
+
+	/* 中间 1 MiB 抹成 'a'：一个横跨 1 MiB 的单词 */
+	(void)memset(buf + mib, 'a', (size_t)mib);
+
+	int fd = make_temp(buf, (size_t)size, path, sizeof path);
+	free(buf);
+
+	expect_status("预算：整文件统计", wc_count_file(path, &whole), WC_OK);
+
+	/* 4 段 -> 建议切点在 0.75 / 1.5 / 2.25 MiB，中间那个落在单词内部 */
+	{
+		wc_stat got;
+		int     tasks = -1;
+		int     skipped = -1;
+
+		expect_status("预算 64 KiB：4 段",
+		              chunked_stat_budget(fd, size, 4, 64 * 1024, &got, &tasks, &skipped),
+		              WC_OK);
+		expect("预算 64 KiB：结果与整文件一致", &got,
+		       whole.lines, whole.words, whole.bytes);
+		expect_off("预算 64 KiB：单词内的切点被放弃", skipped, 1);
+		expect_off("预算 64 KiB：段数 4 -> 3", tasks, 3);
+	}
+
+	/* cap == size 等价于不加预算：三个切点全部接受 */
+	{
+		wc_stat got;
+		int     tasks = -1;
+		int     skipped = -1;
+
+		expect_status("预算无上限：4 段",
+		              chunked_stat_budget(fd, size, 4, size, &got, &tasks, &skipped),
+		              WC_OK);
+		expect("预算无上限：结果与整文件一致", &got,
+		       whole.lines, whole.words, whole.bytes);
+		expect_off("预算无上限：无切点被放弃", skipped, 0);
+		expect_off("预算无上限：段数 4", tasks, 4);
+	}
+
+	/* 预算为 0：每个切点都放弃，退化为一段，结果仍必须正确 */
+	{
+		wc_stat got;
+		int     tasks = -1;
+		int     skipped = -1;
+
+		expect_status("预算 0：4 段",
+		              chunked_stat_budget(fd, size, 4, 0, &got, &tasks, &skipped),
+		              WC_OK);
+		expect("预算 0：结果与整文件一致", &got,
+		       whole.lines, whole.words, whole.bytes);
+		expect_off("预算 0：全部切点被放弃", skipped, 3);
+		expect_off("预算 0：只剩一段", tasks, 1);
+	}
+
+	(void)close(fd);
+	(void)unlink(path);
+
+	/* 2 MiB 全字母：预算是 64 KiB 时一个切点都留不下 */
+	{
+		const off_t wsize = 2 * mib;
+		char       *wbuf  = (char *)malloc((size_t)wsize);
+
+		if (wbuf == NULL) {
+			g_checks++;
+			g_failures++;
+			(void)printf("FAIL  无法分配 2 MiB 缓冲区\n");
+			return;
+		}
+		(void)memset(wbuf, 'a', (size_t)wsize);
+
+		int wfd = make_temp(wbuf, (size_t)wsize, path, sizeof path);
+		free(wbuf);
+
+		wc_stat got;
+		int     tasks = -1;
+		int     skipped = -1;
+
+		expect_status("2 MiB 单词 + 预算 64 KiB",
+		              chunked_stat_budget(wfd, wsize, 4, 64 * 1024, &got, &tasks, &skipped),
+		              WC_OK);
+		expect("2 MiB 单词 + 预算：结果与整文件一致", &got, 0, 1, (unsigned long)wsize);
+		expect_off("2 MiB 单词 + 预算：三个切点全放弃", skipped, 3);
+		expect_off("2 MiB 单词 + 预算：只剩一段", tasks, 1);
+
+		(void)close(wfd);
+		(void)unlink(path);
+	}
+}
+
+/*
+ * 第四类：错误路径。
  *
  * 文件在统计期间被截短是最容易被写成"静默成功"的一条：
  * pread 返回 0 表示"没有更多数据"，若把它当成正常结束，
@@ -390,6 +584,7 @@ int main(void) {
 	test_align_no_separator();
 	test_chunked_equals_whole();
 	test_one_huge_word();
+	test_align_budget();
 	test_errors();
 
 	(void)printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);

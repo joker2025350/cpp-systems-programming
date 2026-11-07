@@ -6,7 +6,7 @@
 #   make lib        只构建静态库 bin/libwordcount.a
 #   make cli        只构建命令行工具 bin/wordcount
 #   make test       构建并运行单元测试
-#   make check      与 wc 交叉验证 + 并行/顺序输出一致性检查
+#   make check      与 wc 交叉验证 + 并行/顺序一致性 + 切分（含对齐读取预算）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make tsan       TSan 重新构建并跑测试（产物在 bin/tsan/）
 #   make bench      缓冲区大小与并行度的吞吐测量
@@ -115,6 +115,8 @@ check: $(CLI)
 	@sh tests/check_parallel.sh $(CLI)
 	@echo
 	@sh tests/check_split.sh $(CLI)
+	@echo
+	@sh tests/check_align_budget.sh $(CLI)
 
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1
 
@@ -197,6 +199,29 @@ bench: $(CLI) | $(OUT)
 		end=$$(date +%s%N); \
 		if [ "$$j" = "0" ]; then label=seq; else label="-j $$j"; fi; \
 		printf "  %-6s %6d ms（5 轮合计）\n" "$$label" $$(( (end - start) / 1000000 )); \
+	done
+	@# 对齐读取预算：64 MiB 全是字母，没有任何可用切点。
+	@# 没有预算时每个建议切点都要读到文件末尾才放弃，-j 16（64 段）合计读
+	@# 约 31 遍文件；有预算时每个切点最多读 1 MiB，因段长 >= 1 MiB，
+	@# 建议切点数 <= 文件大小 / 1 MiB，对齐读取总量不超过一遍文件。
+	@echo
+	@head -c 67108864 /dev/zero | tr '\0' 'a' > $(OUT)/bench_oneword.txt
+	@osize=$$(wc -c < $(OUT)/bench_oneword.txt | tr -d ' '); \
+	echo "对齐读取预算：$$osize 字节全字母文件（无可用切点），各跑 3 轮"; \
+	start=$$(date +%s%N); \
+	for r in 1 2 3; do $(CLI) $(OUT)/bench_oneword.txt > /dev/null; done; \
+	end=$$(date +%s%N); \
+	printf "  顺序     %6d ms\n" $$(( (end - start) / 1000000 )); \
+	for j in 2 4 8 16; do \
+		trace=$$(WORDCOUNT_TRACE_SPLIT=1 $(CLI) -j $$j $(OUT)/bench_oneword.txt 2>&1 >/dev/null | tr -d '\r'); \
+		seg=$$(printf '%s' "$$trace" | sed -n 's/.*：\([0-9][0-9]*\) 段.*/\1/p'); \
+		pts=$$(printf '%s' "$$trace" | sed -n 's/.*建议切点 \([0-9][0-9]*\) 个.*/\1/p'); \
+		rd=$$(printf '%s' "$$trace" | sed -n 's/.*对齐扫描读 \([0-9][0-9]*\) 字节.*/\1/p'); \
+		start=$$(date +%s%N); \
+		for r in 1 2 3; do $(CLI) -j $$j $(OUT)/bench_oneword.txt > /dev/null; done; \
+		end=$$(date +%s%N); \
+		printf "  -j %-5s %6d ms  段 %s / 建议切点 %s，对齐读 %s 字节（%s%% 文件）\n" \
+			"$$j" $$(( (end - start) / 1000000 )) "$$seg" "$$pts" "$$rd" $$(( rd * 100 / osize )); \
 	done
 
 clean:
