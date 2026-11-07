@@ -1,0 +1,199 @@
+sha:      e8c6d05c57921c8e5e0d3565f50ef5d36885455a
+ref:      main
+run:      https://github.com/joker2025350/cpp-systems-programming/actions/runs/42376956727
+compiler: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+result:   success
+
+== 步骤 ==
+默认构建：0 条警告（make 退出码 0）
+==> concurrent-lock
+72 项检查，0 项失败
+==> contact-list
+242 项检查，0 项失败
+466 项检查，0 项失败
+20 项检查，0 项失败
+43 项检查，0 项失败
+==> thread-pool
+检查项 215，失败 0
+==> word-count
+40 项检查，0 项失败
+207 项检查，0 项失败
+==> concurrent-lock
+42 项检查，0 项失败
+==> contact-list
+全部通过（50 项检查）
+==> thread-pool
+检查项 64，失败 0
+==> word-count
+全部一致（2 个文件，6 项比对）
+全部一致（28 项比对）
+全部一致（87 项比对）
+全部通过（17 项比对）
+ASan+UBSan：0 条警告（make 退出码 0）
+==> concurrent-lock
+72 项检查，0 项失败
+==> contact-list
+242 项检查，0 项失败
+466 项检查，0 项失败
+20 项检查，0 项失败
+43 项检查，0 项失败
+==> thread-pool
+检查项 215，失败 0
+==> word-count
+40 项检查，0 项失败
+207 项检查，0 项失败
+TSan：0 条警告（make 退出码 0）
+==> concurrent-lock
+71 项检查，0 项失败
+==> thread-pool
+检查项 215，失败 0
+==> word-count
+40 项检查，0 项失败
+207 项检查，0 项失败
+加严警告构建：0 条警告（其中 -Wcast-qual 0 条，同样判定）（make 退出码 0）
+
+== 基准 ==
+
+==> concurrent-lock
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/concurrent-lock'
+
+threads=10  per-thread=1000000  rounds=3  sleep=off
+
+kind           expected          final  match       avg_ms     Mops/s
+--------------------------------------------------------------------------
+raw            10000000        2457850     NO        66.35     150.71
+mutex          10000000       10000000    yes       414.49      24.13
+spin           10000000       10000000    yes      1436.23       6.96
+atomic         10000000       10000000    yes       257.05      38.90
+asm            10000000       10000000    yes       282.11      35.45
+
+raw 一行的 final 小于 expected 是正常的：它按定义会丢更新。
+match 为 part 说明多轮里有时对有时错，也是 raw 的典型表现。
+
+===== 池驱动：任务粒度扫描（8 个工作线程，总自增次数固定 2^20）=====
+driver=pool  workers=8  tasks=1048576  batch=0  rounds=3  sleep=off  queue=4096
+atomic                0              0    yes      1018.62       0.00
+池统计：submitted=3145728 completed=3145728 backpressure=0（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=1048576  batch=1  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes      1001.59       1.05
+池统计：submitted=3145728 completed=3145728 backpressure=2（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=131072  batch=8  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes       119.69       8.76
+池统计：submitted=393216 completed=393216 backpressure=0（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=16384  batch=64  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes        26.42      39.69
+池统计：submitted=49152 completed=49152 backpressure=407（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=2048  batch=512  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes        27.34      38.36
+池统计：submitted=6144 completed=6144 backpressure=0（提交端因队列满阻塞）
+
+===== 池驱动：batch=1 时五种实现（任务粒度 = 一次自增）=====
+driver=pool  workers=8  tasks=1048576  batch=1  rounds=3  sleep=off  queue=4096
+
+kind           expected          final  match       avg_ms     Mops/s
+--------------------------------------------------------------------------
+raw             1048576        1043760     NO      1005.39       1.04
+mutex           1048576        1048576    yes       993.74       1.06
+spin            1048576        1048576    yes      1044.73       1.00
+atomic          1048576        1048576    yes      1035.12       1.01
+asm             1048576        1048576    yes      1019.12       1.03
+
+池统计：submitted=15728640 completed=15728640 backpressure=37（提交端因队列满阻塞）
+raw 一行的 final 小于 expected 是正常的：它按定义会丢更新。
+match 为 part 说明多轮里有时对有时错，也是 raw 的典型表现。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/concurrent-lock'
+
+==> contact-list
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/contact-list'
+cc -std=c11 -Wall -Wextra -Wconversion -O2 -g -Iinclude tests/bench_contacts.c bin/libcontacts.a -o bin/bench_contacts
+
+contacts 1.4.0 基准
+种子固定为 0：哈希不做随机化，桶分布与 1.3.0 逐字节相同，数字可与历史记录对照。
+
+       n    build(ms)     find(ms)    order(ms)     save(ms)     load(ms)     loaded
+-----------------------------------------------------------------------------
+    1000          0.3          0.2          0.1          0.2          0.3       1000
+    4000          0.8          0.7          0.2          0.5          1.1       4000
+   16000          3.6          3.0          1.0          2.0          4.1      16000
+   64000         14.8         11.8          4.5          7.5         17.1      64000
+
+       n   buckets     load  maxchain   used/buckets  find(ns)   heap(KiB)  B/entry
+--------------------------------------------------------------------------------------
+    1000      1024     0.98         3            68%        81         170      174
+    4000      4096     0.98         7            57%        87         667      171
+   16000     16384     0.98         6            64%        93        2514      161
+   64000     65536     0.98         7            56%        92       10016      160
+
+收缩（n = 64000，删到 1024 条，再抖动 100000 轮）
+
+  桶数         建完 65536 -> 删完 4096 -> 抖动后 2048
+  装载因子     0.98 -> 0.25 -> 0.50
+  堆占用       10532 KiB -> 212 KiB
+  删除耗时     62976 次 contacts_remove 共 7.1 ms（单次 0.11 µs）
+  抖动         100000 次删一条加一条共 16.9 ms，桶表重分配 1 次（本轮）
+
+find 一列做的是 2n 次查找（n 次命中 + n 次落空）。
+find(ns) 是单次查找平均耗时，包含命中的一次 strcmp。
+order 是 contacts_order 取 n 个指针并 qsort 的总耗时，含调用方的 malloc/free。
+load 是 entries/buckets 的装载因子；超过 1.0 说明扩容分配失败，处于降级状态。
+heap 是 glibc mallinfo2 的 uordblks，即已分配未释放的堆字节数；非 glibc 平台为 0。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/contact-list'
+
+==> thread-pool
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/thread-pool'
+cc -std=c11 -Wall -Wextra -Wconversion -O2 -g -pthread -Iinclude -D_POSIX_C_SOURCE=200809L tests/bench_threadpool.c bin/libthreadpool.a -o bin/bench_threadpool
+
+线程池基准（单位：每任务纳秒，5 轮取最小值）
+========================================================================
+
+[1] 空任务：提交 → 调度 → 执行 → 回收
+  线程数    任务数    ns/任务     任务/秒
+  1              200000        179.8        5561077
+  2              200000        189.7        5270350
+  4              200000        556.1        1798256
+  8              200000        914.8        1093133
+
+[2] 对照：每个任务新建一个线程再 join
+  —             20000      34335.7          29124
+
+[3] 固定工作量：每任务忙等 100 µs，共 1000 个任务
+  线程数 总耗时(ms)    加速比         效率
+  1               100.2         1.00           100%
+  2                50.1         2.00           100%
+  4                25.1         3.98           100%
+  8                25.1         3.99            50%
+
+[4][5] 积压：1 个工作线程，每任务忙等 3 µs，提交 200000 个任务
+  队列         提交数 耗时(ms) 峰值深度   背压   超时 RSS峰值(KiB)
+  无界           200000       15.3     195620        0        0       6988
+  有界(64)       200000      886.9         64   104843        0       1228
+  有界(64,截止)   200000      886.5         64   110495        0       1228
+
+说明：加速比以 1 线程为基准；效率 = 加速比 / 线程数。
+      [4][5] 的三行来自三个独立的子进程（ru_maxrss 是进程级高水位，
+      同一进程内先跑一组再跑另一组，后面的数会包含前面的峰值）。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/thread-pool'
+
+==> word-count
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/word-count'
+输入：bin/bench_input.txt，各跑 20 轮
+b256      751 ms
+b1k       732 ms
+b4k       720 ms
+b16k      685 ms
+b64k      678 ms
+
+并行度：8 个文件，合计 39528768 字节，各跑 5 轮
+  seq       557 ms（5 轮合计）
+  -j 1      560 ms（5 轮合计）
+  -j 2      313 ms（5 轮合计）
+  -j 4      208 ms（5 轮合计）
+  -j 8      222 ms（5 轮合计）
+
+对齐读取预算：67108864 字节全字母文件（无可用切点），各跑 3 轮
+  顺序        217 ms
+  -j 2        227 ms  段 1 / 建议切点 7，对齐读 7340032 字节（10% 文件）
+  -j 4        238 ms  段 1 / 建议切点 15，对齐读 15728640 字节（23% 文件）
+  -j 8        260 ms  段 1 / 建议切点 31，对齐读 32505856 字节（48% 文件）
+  -j 16       306 ms  段 1 / 建议切点 63，对齐读 66060288 字节（98% 文件）
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/word-count'
