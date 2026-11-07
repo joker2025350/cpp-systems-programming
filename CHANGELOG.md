@@ -54,6 +54,8 @@
   ASan+UBSan 0 警告、TSan 0 警告、加严构建 0 条警告（含 `-Wcast-qual`）；
   word-count 单元 40 + 207 项、check 6 + 28 + 87 + 17 全过；
   全仓单元 1288 → **1305** 项 0 失败；testdata 字节数未变。
+  本节所在的文档提交（`1b3fb74`）的 CI 同样是 success（run 42376584267），
+  各模块项数与上表一致。
 - 反向验证：在临时分支 `rev-align-budget` 上去掉预算（`limit` 改回文件末尾），
   让 CI 实跑（run 42376269332，`result: failure`，与预期一致）。`check_align_budget.sh`
   4 项失败：`oneword · 对齐读取超出预算：251658240 字节 > 15 x 1048576`
