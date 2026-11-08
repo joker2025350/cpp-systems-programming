@@ -1,5 +1,5 @@
 #!/bin/sh
-# check_align_budget.sh —— 验证"切点对齐有读取预算"这条策略真的生效
+# check_align_budget.sh —— 验证"切点对齐的读取预算"按段长收缩这件事真的生效
 #
 # 要回答的问题：单个大文件切段时，切点对齐扫描读了多少字节？
 #
@@ -10,17 +10,19 @@
 #      （基因序列、单行 minified JSON）会让每个建议切点都读到末尾才放弃，
 #      (nchunks-1) 个切点合计读约 (nchunks-1)/2 遍文件，之后还要顺序再读一遍。
 #      结果完全正确，只是慢——这类退化不会让任何断言失败。
-#   2. 预算生效与不生效，输出都逐字节相同。所以 ASSERT 输出一致测不出预算。
+#   2. 预算生效与不生效，输出都逐字节相同；连段数都可能相同（全部切点被
+#      放弃时两者都是 1 段）。所以 ASSERT 输出一致测不出预算。
 #
-# 因此这里断言三件事，全部来自 WORDCOUNT_TRACE_SPLIT 打出的可观测量：
+# 因此这里断言四件事，全部来自 WORDCOUNT_TRACE_SPLIT 打出的可观测量：
 #
 #   · 全字母文件：每个切点都必须被放弃，段数退化成 1（切分被跳过）；
 #   · 中段有超长单词的文件：被放弃的只是一部分切点，剩下的仍能切，段数 >= 2，
 #     且结果与顺序一致——这是"放弃切点"这条策略唯一可能出错的地方（漏数/重数）；
-#   · 对齐扫描读掉的字节数 <= 建议切点个数 x 1 MiB。
+#   · 预算公式：每个切点的预算 = min(段长 / 4, 1 MiB)，逐组核对数值；
+#   · 对齐读取总量 <= 文件大小 / 4，且对 -j 的每个取值都成立。
 #
-# 最后一条是预算的定义。1 MiB 与驱动层的 ALIGN_SCAN_BYTES 同值，
-# 改那个常量必须同步改这里的 CAP。
+# 最后一条是比例预算存在的全部理由。固定 1 MiB 的预算下这条会失败：
+# 32 MiB 文件 -j 8 时 31 个切点各读 1 MiB，合计 31 MiB，等于文件大小的 97%。
 #
 # 另附一条耗时比值（只作佐证，阈值放得很宽）：不加预算时全字母文件要读
 # 数倍于文件大小的字节，-j 4 的耗时会明显高于顺序路径；加了预算后两者接近。
@@ -40,11 +42,12 @@ if [ ! -x "$CLI" ]; then
 	exit 1
 fi
 
-# 与 src/main.c 的 ALIGN_SCAN_BYTES 必须一致
+# 与 src/main.c 的 ALIGN_SCAN_BYTES / ALIGN_BUDGET_DIV 必须一致
 CAP=1048576
+DIV=4
 
 # 全字母文件的大小。要 >= 2 MiB 才会进切分路径；取 32 MiB 是为了让
-# "-j 4 vs 顺序"的耗时差在页缓存内也足够明显（见文件末尾）。
+# "-j 16 vs 顺序"的读取量差在页缓存内也足够明显（见文件末尾）。
 ONEWORD_BYTES=33554432
 
 work=$(mktemp -d) || exit 1
@@ -107,8 +110,15 @@ trace_of() {
 }
 
 # field_of <trace> <标签> <单位>：取 "标签 N 单位" 里的 N
+#
+# 用 | 当 sed 的分隔符，因为单位里带 /（"字节/切点"）。
 field_of() {
-	printf '%s\n' "$1" | sed -n "s/.*$2 \([0-9][0-9]*\) $3.*/\1/p"
+	printf '%s\n' "$1" | sed -n "s|.*$2 \([0-9][0-9]*\) $3.*|\1|p"
+}
+
+# size_of <文件>：文件字节数
+size_of() {
+	wc -c < "$1" | tr -d ' '
 }
 
 # ---------------------------------------------------------------- 造输入
@@ -130,7 +140,7 @@ cat testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
     testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
     testdata/b.txt testdata/b.txt > "$work/mixed.txt"
 
-echo "切点对齐的读取预算"
+echo "切点对齐的读取预算（每切点 = min(段长/4, $CAP)）"
 echo "---------------------------------------------------------------"
 
 # ---------------------------------------------------------------- 一致性
@@ -139,7 +149,7 @@ for name in oneword longword mixed; do
 	f="$work/$name.txt"
 	capture "$name-seq" "$f"
 
-	for j in 2 4 8; do
+	for j in 2 4 8 16; do
 		capture "$name-j$j" -j "$j" "$f"
 		check_triple "$name · -j $j" "$name-seq" "$name-j$j"
 	done
@@ -151,14 +161,14 @@ done
 # 中段有超长词的文件应当只放弃一部分，正常文本一个都不该放弃。
 for name in oneword longword mixed; do
 	f="$work/$name.txt"
+	size=$(size_of "$f")
 	t=$(trace_of "$f" 4)
 
 	segs=$(printf '%s\n' "$t" | sed -n 's/.*：\([0-9][0-9]*\) 段.*/\1/p')
 	pts=$(field_of "$t" '建议切点' '个')
 	skp=$(field_of "$t" '放弃' '个')
-	rd=$(field_of "$t" '对齐扫描读' '字节')
 
-	if [ -z "$segs" ] || [ -z "$pts" ] || [ -z "$skp" ] || [ -z "$rd" ]; then
+	if [ -z "$segs" ] || [ -z "$pts" ] || [ -z "$skp" ]; then
 		fail "$name · 切分记录不完整" "$t"
 		continue
 	fi
@@ -190,17 +200,56 @@ for name in oneword longword mixed; do
 		fi
 		;;
 	esac
-
-	# 预算的定义：每个建议切点最多读 CAP 字节
-	limit=$((pts * CAP))
-	if [ "$rd" -le "$limit" ]; then
-		pass "$name · 对齐读取在预算内" "$rd 字节 <= $pts x $CAP"
-	else
-		fail "$name · 对齐读取超出预算" "$rd 字节 > $pts x $CAP"
-	fi
 done
 
-# 正常文本的读取量应当远小于预算：分隔符平均每几字节一个，
+# 预算公式与总量上界：每个 -j 都核对一遍。
+#
+#   段数 nchunks = 建议切点 + 1（被放弃的切点不占段，但在 TRACE 里
+#   "建议切点"报的是 nchunks-1，与段数无关），段长 = size / nchunks，
+#   期望预算 = min(段长 / DIV, CAP)。
+#
+# 上界 size/4 与 -j 无关——这正是比例预算的要点。固定 1 MiB 时这里
+# 会在 -j 4 及更大时失败（32 MiB 文件、15 个切点 × 1 MiB = 15 MiB > 8 MiB）。
+for name in oneword longword mixed; do
+	f="$work/$name.txt"
+	size=$(size_of "$f")
+	bound=$((size / DIV))
+
+	for j in 2 4 8 16; do
+		t=$(trace_of "$f" "$j")
+		pts=$(field_of "$t" '建议切点' '个')
+		rd=$(field_of "$t" '对齐扫描读' '字节')
+		bud=$(field_of "$t" '预算' '字节/切点')
+
+		if [ -z "$pts" ] || [ -z "$rd" ] || [ -z "$bud" ]; then
+			fail "$name · -j $j 切分记录不完整" "$t"
+			continue
+		fi
+
+		want=$(( (size / (pts + 1)) / DIV ))
+		if [ "$want" -gt "$CAP" ]; then
+			want=$CAP
+		fi
+
+		if [ "$bud" = "$want" ]; then
+			pass "$name · -j $j 预算公式" \
+			     "$pts 个切点，段长 $((size / (pts + 1)))，预算 $bud"
+		else
+			fail "$name · -j $j 预算应为 $want" \
+			     "TRACE 报 $bud，段长 $((size / (pts + 1)))，size $size"
+		fi
+
+		if [ "$rd" -le "$bound" ]; then
+			pass "$name · -j $j 对齐读取不超 size/4" \
+			     "$rd 字节 <= $bound（文件的 $((rd * 100 / size))%）"
+		else
+			fail "$name · -j $j 对齐读取超出 size/4" \
+			     "$rd 字节 > $bound（文件的 $((rd * 100 / size))%）"
+		fi
+	done
+done
+
+# 正常文本的读取量应当远小于上界：分隔符平均每几字节一个，
 # 每个切点读不到 1 KiB。这条判据能发现"对齐改成逐块读整个区间"这类退化。
 t=$(trace_of "$work/mixed.txt" 4)
 rd=$(field_of "$t" '对齐扫描读' '字节')
@@ -213,8 +262,8 @@ fi
 
 # ---------------------------------------------------------------- 耗时佐证
 
-# 不加预算时 32 MiB 全字母文件要读约 (nchunks-1) x 16 MiB 的对齐字节，
-# -j 4 的耗时会是顺序路径的数倍；加了预算后两者只差一次 32 MiB 的顺序读，
+# 不加预算时 32 MiB 全字母文件的 -j 4 要读 15 个切点 x 16 MiB 的对齐字节，
+# 耗时会是顺序路径的数倍；加了预算后两者只差一次 32 MiB 的顺序读，
 # 比值应接近 1。阈值放到 3.0：这条只用来兜住"预算被去掉"的量级回归，
 # 不当作性能指标（CI 上单次耗时抖动大）。
 start=$(date +%s%N)

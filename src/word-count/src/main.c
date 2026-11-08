@@ -13,7 +13,7 @@
  *   单文件切分    只有一个文件且 -j N（N >= 2）时，把这个文件本身切成若干段，
  *                 每段一个任务。切点必须落在分隔符上，否则段首的词会被
  *                 切成两半、计两次；切点怎么找由 wc_align_chunk 负责，
- *                 每个切点只给 ALIGN_SCAN_BYTES 的读取预算。
+ *                 每个切点只给"段长的 1/4"（封顶 ALIGN_SCAN_BYTES）读取预算。
  *
  * 三种方式共用同一套输出逻辑，因此三种方式的输出必须逐字节相同。
  * 这一点是 tests/check_split.sh 的判据。
@@ -59,22 +59,55 @@
  * CHUNKS_PER_WORKER 让段数多于线程数：各段耗时不可能完全均匀
  * （词长分布不同），段数只有线程数时，最慢的那段决定总时长。
  *
- * ALIGN_SCAN_BYTES 是**每个**建议切点的对齐读取预算。
+ * 对齐读取的预算分两层：每个建议切点的预算是"段长的 1/4"，再受
+ * ALIGN_SCAN_BYTES 封顶。
  *
  * wc_align_chunk 从建议切点往后逐字节找第一个分隔符，找不到就一直在读，
  * 直到它收到的 limit。若把 limit 传成文件末尾，那么当整段内容落在同一个
  * 超长单词里时（基因序列、单行 minified JSON），每个建议切点都会读到文件
  * 末尾才放弃：nchunks-1 个切点合计读 (nchunks-1) 遍文件，之后还要顺序再读
- * 一遍。这不是"读两遍"——-j 16 时是 30 遍（见 README 6.5 的实测）。
+ * 一遍。这不是"读两遍"——-j 16（64 段）时是 31.5 遍（见 README 6.5 的实测）。
  *
- * 所以每次对齐只给 1 MiB 的预算：预算内没有分隔符就放弃这个切点。
- * 取 1 MiB 与 MIN_CHUNK_BYTES 同值——一个"单词"长到 1 MiB 的输入本来就不该
- * 在它内部切，为它多读几十兆字节没有意义。放弃切点不影响正确性：被接受的
- * 边界仍然是"≥ 建议切点的第一个分隔符"，因此两两单调，只是段数变少（3.7 节）。
+ * 所以每次对齐只给一个有界预算：预算内没有分隔符就放弃这个切点。
+ * 放弃切点不影响正确性：被接受的边界仍然是"≥ 建议切点的第一个分隔符"，
+ * 因此两两单调，只是段数变少（3.7 节）。
+ *
+ * 为什么预算不能是一个固定的字节数：对齐读取发生在 (nchunks-1) 个切点上，
+ * 总量随段数线性增长，而段数随 -j 线性增长。固定 1 MiB 时，64 MiB 文件、
+ * -j 16（64 段）的 63 个切点各读 1 MiB，合计 63 MiB，占文件大小的 98%，
+ * 全部花在"找分隔符"上，而这些字节紧接着还要被计数再读一遍（6.5 节实测）。
+ * 把预算改成与段长成比例，总量就有了一条与 -j、与段数都无关的上界：
+ *
+ *     Σ budget_i ≤ Σ chunk_i / 4 = size / 4
+ *
+ * 这个不等式只用到 min(x, ALIGN_SCAN_BYTES) ≤ x，不依赖段长是否均匀，
+ * 也不依赖有多少个切点被放弃（放弃只减少读取）。正常文本碰不到这条上界
+ * ——分隔符平均每 5~6 字节出现一次，每个切点读几个字节；它挡住的是
+ * "整段落在一个超长单词里"这类输入。
+ *
+ * 取 1/4 的理由：对齐读取是纯附加 I/O，被它读过的字节随后还要被计数再读
+ * 一遍，所以它直接抬高总 I/O 量。1/4 意味着最坏情况下 I/O 量是文件大小的
+ * 1.25 倍；6.5 节实测这个最坏情况（64 MiB 全字母、-j 16）是 169 ms 对顺序
+ * 154 ms，而固定 1 MiB 的预算是 213 ms。这个除数没有推导，是取舍：再收紧
+ * 就会在分隔符稀疏的正常输入（行很长的日志、CSV）上白白丢切点、损失并行度。
+ * 该用哪种输入定这个值，目前还没有数据（README 待办）。
+ *
+ * ALIGN_SCAN_BYTES 仍然保留，作用是让"段本来就很大"（低 -j、大文件）时
+ * 预算不至于跟着段长线性膨胀：400 MiB / -j 8 时段长 12.5 MiB，比例预算
+ * 会是 3.1 MiB，而这个文件按 1 MiB 就足够找到分隔符了。
  */
 #define MIN_CHUNK_BYTES   (1024 * 1024)
 #define CHUNKS_PER_WORKER 4
 #define ALIGN_SCAN_BYTES  (1024 * 1024)
+#define ALIGN_BUDGET_DIV  4
+
+/*
+ * 预算为 0 时每个切点都会被立刻放弃、切分静默退化成顺序路径。段长下限
+ * 保证预算至少有 MIN_CHUNK_BYTES / ALIGN_BUDGET_DIV 字节，但这个关系
+ * 编译器不会替人检查，改上面两个常量时容易踩空。
+ */
+_Static_assert(MIN_CHUNK_BYTES / ALIGN_BUDGET_DIV > 0,
+               "段长下限除以预算除数必须是正数");
 
 /*
  * 一个文件的处理槽位。
@@ -286,6 +319,8 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	int         nb         = 1;   /* 已接受的边界个数，bounds[0 .. nb-1] 有效 */
 	int         skipped    = 0;   /* 预算内找不到分隔符而放弃的建议切点个数 */
 	long long   align_read = 0;   /* 对齐扫描总共读掉的字节数 */
+	off_t       chunk_bytes;      /* size / nchunks，各段等长 */
+	off_t       align_budget;     /* 每个建议切点的对齐读取预算 */
 	int         failed = 0;
 	off_t      *bounds = NULL;
 	chunk_slot *slots  = NULL;
@@ -341,6 +376,20 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	bounds[0] = 0;
 
 	/*
+	 * 每个建议切点的对齐读取预算 = min(段长 / 4, ALIGN_SCAN_BYTES)。
+	 *
+	 * suggested 是 (size / nchunks) * k，所以各段长度相等（都是 size / nchunks），
+	 * 预算在循环外算一次就够。最后一段可能短一点，但那一段没有切点，
+	 * 不参与对齐扫描。
+	 */
+	chunk_bytes  = size / nchunks;
+	align_budget = chunk_bytes / ALIGN_BUDGET_DIV;
+
+	if (align_budget > ALIGN_SCAN_BYTES) {
+		align_budget = ALIGN_SCAN_BYTES;
+	}
+
+	/*
 	 * 边界是"筛"出来的，不是"按下标填"的：被放弃的建议切点不占位置，
 	 * 所以用 nb 记已接受的个数，最后才写右端点。nb 最多等于 nchunks-1，
 	 * 因此 bounds 的 nchunks+1 个格子永远够用。
@@ -356,12 +405,12 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		wc_status st;
 
 		/*
-		 * 预算终点用减法算，不写 suggested + ALIGN_SCAN_BYTES：
+		 * 预算终点用减法算，不写 suggested + align_budget：
 		 * 后者在 suggested 接近 off_t 上限时会进位成负数（C11 6.5p5，
 		 * 有符号整数溢出是未定义行为），而 size - suggested 恒不为负。
 		 */
-		scan_to = (size - suggested > ALIGN_SCAN_BYTES)
-		              ? suggested + ALIGN_SCAN_BYTES
+		scan_to = (size - suggested > align_budget)
+		              ? suggested + align_budget
 		              : size;
 
 		st = wc_align_chunk(fd, suggested, scan_to, &aligned);
@@ -420,15 +469,21 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	 * 三种方式的 stdout 与 stderr 仍然完全一致。
 	 *
 	 * 第五轮起多打三项：建议切点个数、被放弃的个数、对齐扫描读了多少字节。
+	 * 第五轮起多打三项：建议切点个数、被放弃的个数、对齐扫描读了多少字节。
 	 * 理由同上一段——"预算生效了"也必须是可观测的，否则 check_align_budget.sh
 	 * 只能断言输出正确，而加不加预算输出都正确。
+	 *
+	 * 第六轮再打一项：每个切点的对齐读取预算。"预算按段长的 1/4 收缩"同样是一条
+	 * 看不见的策略，不与固定常量区分开就无法断言。脚本用它核对公式本身（策略），
+	 * 用"对齐扫描读"核对实际发生量（结果）——两者在注入验证里会分别失败。
 	 */
 	if (getenv("WORDCOUNT_TRACE_SPLIT") != NULL) {
 		(void)fprintf(stderr,
 		              "wordcount: 切分 %s：%d 段（建议切点 %d 个，接受 %d 个，"
-		              "放弃 %d 个），对齐扫描读 %lld 字节，%d 个工作线程\n",
+		              "放弃 %d 个），对齐扫描读 %lld 字节，预算 %lld 字节/切点，"
+		              "%d 个工作线程\n",
 		              path, ntasks, nchunks - 1, nb - 1, skipped, align_read,
-		              (jobs < ntasks) ? jobs : ntasks);
+		              (long long)align_budget, (jobs < ntasks) ? jobs : ntasks);
 	}
 
 	/*
