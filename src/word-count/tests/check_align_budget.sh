@@ -13,7 +13,7 @@
 #   2. 预算生效与不生效，输出都逐字节相同；连段数都可能相同（全部切点被
 #      放弃时两者都是 1 段）。所以 ASSERT 输出一致测不出预算。
 #
-# 因此这里断言五件事，全部来自 WORDCOUNT_TRACE_SPLIT 打出的可观测量：
+# 因此这里断言六件事，全部来自 WORDCOUNT_TRACE_SPLIT 打出的可观测量：
 #
 #   · 全字母文件：每个切点都必须被放弃，段数退化成 1（切分被跳过）；
 #   · 中段有超长单词的文件：被放弃的只是一部分切点，剩下的仍能切，段数 >= 2，
@@ -24,6 +24,9 @@
 #     也算进最大值"这种写法全绿——那个写法让最长扫描恒等于预算，这个量就
 #     退化成预算的副本，说明不了"切点离分隔符有多远"，而 6.6 的除数依据
 #     正是这个量。
+#   · 稀疏分隔符（行 96 KiB）的文件一个切点都不该放弃（第七轮）。这条给
+#     除数划下界：预算小到低于最长的那一行时它才失败。它与 6.6 的分工是
+#     ——6.6 用实测值说明"现在余量多少"，这条防止将来把余量改到负的。
 #
 # 最后一条是比例预算存在的全部理由。固定 1 MiB 的预算下这条会失败：
 # 32 MiB 文件 -j 8 时 31 个切点各读 1 MiB，合计 31 MiB，等于文件大小的 97%。
@@ -144,12 +147,26 @@ cat testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
     testdata/b.txt testdata/b.txt testdata/b.txt testdata/b.txt \
     testdata/b.txt testdata/b.txt > "$work/mixed.txt"
 
+# 4) 8 MiB、每行 96 KiB：分隔符稀疏但确实存在——长行日志 / 每行一条 base64
+#    的大字段导出文件就是这个形态。前三种输入一个太密（mixed）、两个太稀
+#    （oneword、longword），都测不出"预算刚好够用"这一档。
+#
+#    行长取 96 KiB 是为了让这条用例能把除数钉在 1/4 附近：行长 98304 会让
+#    最长扫描落在 32767~98303 之间，而 8 MiB 文件在 -j 2..16 上段长恒为
+#    1 MiB、预算恒为 262144。除数改成 8 时预算降到 131072，仍然够用（这条
+#    抓不到）；改成 16 时预算 65536，小于 98303，切点开始被放弃，这条就失败。
+#    ——测试能钉住的边界就是它测到的那个量级，写清楚这一点比声称"钉死了除数"
+#    更准确。
+pattern=$(head -c 98303 /dev/zero | tr '\0' 'a')
+yes "$pattern" 2>/dev/null | head -c 8388608 > "$work/sparse.txt"
+unset pattern
+
 echo "切点对齐的读取预算（每切点 = min(段长/4, $CAP)）"
 echo "---------------------------------------------------------------"
 
 # ---------------------------------------------------------------- 一致性
 
-for name in oneword longword mixed; do
+for name in oneword longword mixed sparse; do
 	f="$work/$name.txt"
 	capture "$name-seq" "$f"
 
@@ -161,9 +178,11 @@ done
 
 # ---------------------------------------------------------------- 预算
 
-# 三个文件都单独断言，判据不同：全字母文件应当一个切点都留不下，
-# 中段有超长词的文件应当只放弃一部分，正常文本一个都不该放弃。
-for name in oneword longword mixed; do
+# 四个文件都单独断言，判据不同：全字母文件应当一个切点都留不下，
+# 中段有超长词的文件应当只放弃一部分，正常文本一个都不该放弃，
+# 稀疏分隔符（行 96 KiB）的文件也应当一个都不放弃——最后这条是除数的下界：
+# 预算一旦小到低于"最长的那一行"，它就会失败。
+for name in oneword longword mixed sparse; do
 	f="$work/$name.txt"
 	size=$(size_of "$f")
 	t=$(trace_of "$f" 4)
@@ -171,8 +190,9 @@ for name in oneword longword mixed; do
 	segs=$(printf '%s\n' "$t" | sed -n 's/.*：\([0-9][0-9]*\) 段.*/\1/p')
 	pts=$(field_of "$t" '建议切点' '个')
 	skp=$(field_of "$t" '放弃' '个')
+	max=$(field_of "$t" '接受切点最长扫描' '字节')
 
-	if [ -z "$segs" ] || [ -z "$pts" ] || [ -z "$skp" ]; then
+	if [ -z "$segs" ] || [ -z "$pts" ] || [ -z "$skp" ] || [ -z "$max" ]; then
 		fail "$name · 切分记录不完整" "$t"
 		continue
 	fi
@@ -203,7 +223,27 @@ for name in oneword longword mixed; do
 			     "段数 $segs，建议切点 $pts，放弃 $skp"
 		fi
 		;;
+	sparse)
+		if [ "$segs" -ge 2 ] && [ "$skp" = "0" ]; then
+			pass "$name · 稀疏分隔符不放弃切点" \
+			     "$pts 个建议切点全部接受，$segs 段，最长扫描 $max 字节"
+		else
+			fail "$name · 稀疏分隔符不该放弃切点" \
+			     "段数 $segs，建议切点 $pts，放弃 $skp，最长扫描 $max"
+		fi
+		;;
 	esac
+
+	# 输入本身也要断言，否则上面那条可以靠"把输入造成密集分隔符文本"
+	# 通过——那时它测的根本不是稀疏输入。行长 96 KiB，切点落在行中，
+	# 所以最长扫描必然在行长量级；16384 是很松的下界，只用来抓"造错了"。
+	if [ "$name" = "sparse" ]; then
+		if [ "$max" -ge 16384 ]; then
+			pass "$name · 输入确实是稀疏分隔符" "最长扫描 $max 字节（行 96 KiB）"
+		else
+			fail "$name · 最长扫描只有 $max 字节" "期望 >= 16384，输入可能造错了"
+		fi
+	fi
 done
 
 # 预算公式与总量上界：每个 -j 都核对一遍。
@@ -214,7 +254,7 @@ done
 #
 # 上界 size/4 与 -j 无关——这正是比例预算的要点。固定 1 MiB 时这里
 # 会在 -j 4 及更大时失败（32 MiB 文件、15 个切点 × 1 MiB = 15 MiB > 8 MiB）。
-for name in oneword longword mixed; do
+for name in oneword longword mixed sparse; do
 	f="$work/$name.txt"
 	size=$(size_of "$f")
 	bound=$((size / DIV))
