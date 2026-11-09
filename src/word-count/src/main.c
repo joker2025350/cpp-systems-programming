@@ -319,6 +319,7 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	int         nb         = 1;   /* 已接受的边界个数，bounds[0 .. nb-1] 有效 */
 	int         skipped    = 0;   /* 预算内找不到分隔符而放弃的建议切点个数 */
 	long long   align_read = 0;   /* 对齐扫描总共读掉的字节数 */
+	long long   max_scan   = 0;   /* 已接受切点里最长的一次对齐扫描距离 */
 	off_t       chunk_bytes;      /* size / nchunks，各段等长 */
 	off_t       align_budget;     /* 每个建议切点的对齐读取预算 */
 	int         failed = 0;
@@ -402,6 +403,7 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		off_t     suggested = (size / nchunks) * k;
 		off_t     scan_to;
 		off_t     aligned = size;
+		long long scan;
 		wc_status st;
 
 		/*
@@ -427,7 +429,8 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		 * 开始逐字节往后找，找到分隔符就停，没找到就停在 limit。
 		 * 这个量在测试里是可断言的（预算的界），比拿耗时当判据稳。
 		 */
-		align_read += (long long)(aligned - suggested);
+		scan = (long long)(aligned - suggested);
+		align_read += scan;
 
 		/*
 		 * aligned == scan_to 表示 [suggested, scan_to) 里一个分隔符都没有。
@@ -442,6 +445,15 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		if (aligned == scan_to) {
 			skipped++;
 			continue;
+		}
+
+		/*
+		 * 只统计"被接受的切点"的扫描距离。被放弃的那一次必然读满预算，
+		 * 拿它做样本只会让最大值恒等于预算，把"这个文件的切点离分隔符有多远"
+		 * 这个真正要量的东西盖住。
+		 */
+		if (scan > max_scan) {
+			max_scan = scan;
 		}
 
 		bounds[nb++] = aligned;
@@ -469,21 +481,26 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	 * 三种方式的 stdout 与 stderr 仍然完全一致。
 	 *
 	 * 第五轮起多打三项：建议切点个数、被放弃的个数、对齐扫描读了多少字节。
-	 * 第五轮起多打三项：建议切点个数、被放弃的个数、对齐扫描读了多少字节。
 	 * 理由同上一段——"预算生效了"也必须是可观测的，否则 check_align_budget.sh
 	 * 只能断言输出正确，而加不加预算输出都正确。
 	 *
 	 * 第六轮再打一项：每个切点的对齐读取预算。"预算按段长的 1/4 收缩"同样是一条
 	 * 看不见的策略，不与固定常量区分开就无法断言。脚本用它核对公式本身（策略），
 	 * 用"对齐扫描读"核对实际发生量（结果）——两者在注入验证里会分别失败。
+	 *
+	 * 第七轮再加一项：已接受切点里最长的一次扫描。前五项都是"总量"或"策略值"，
+	 * 回答不了"这个预算够不够用"：够用的判据是被接受的切点离分隔符最远有多远，
+	 * 而这个量只有把它单列出来才看得见——总量除以切点数会被密集分隔符摊平。
+	 * tests/bench_align_sparse.sh 用它给 ALIGN_BUDGET_DIV 这个除数提供依据。
 	 */
 	if (getenv("WORDCOUNT_TRACE_SPLIT") != NULL) {
 		(void)fprintf(stderr,
 		              "wordcount: 切分 %s：%d 段（建议切点 %d 个，接受 %d 个，"
 		              "放弃 %d 个），对齐扫描读 %lld 字节，预算 %lld 字节/切点，"
-		              "%d 个工作线程\n",
+		              "接受切点最长扫描 %lld 字节，%d 个工作线程\n",
 		              path, ntasks, nchunks - 1, nb - 1, skipped, align_read,
-		              (long long)align_budget, (jobs < ntasks) ? jobs : ntasks);
+		              (long long)align_budget, max_scan,
+		              (jobs < ntasks) ? jobs : ntasks);
 	}
 
 	/*
@@ -612,7 +629,8 @@ static void usage(FILE *out, const char *prog) {
 	    "            多个文件：每个文件一个任务，工作线程数取 min(JOBS, 文件数)。\n"
 	    "            单个文件：把这个普通文件按分隔符对齐切成若干段并行（需 >= 2 MiB），\n"
 	    "            切点若落在词中间会退到下一个分隔符，单词不会被切开；\n"
-	    "            一个切点往后 1 MiB 内都找不到分隔符时放弃该切点（那一段并进前一段）。\n"
+	    "            一个切点在 min(段长/4, 1 MiB) 的对齐预算内都找不到分隔符时\n"
+	    "            放弃该切点（那一段并进前一段）。\n"
 	    "  -h        显示本说明\n"
 	    "\n"
 	    "没有 FILE 参数时读标准输入。多个文件时末尾补一行 total。\n"

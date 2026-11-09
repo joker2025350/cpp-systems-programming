@@ -9,7 +9,7 @@
 #   make check      与 wc 交叉验证 + 并行/顺序一致性 + 切分（含对齐读取预算）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make tsan       TSan 重新构建并跑测试（产物在 bin/tsan/）
-#   make bench      缓冲区大小与并行度的吞吐测量
+#   make bench      缓冲区大小、并行度、对齐读取预算的吞吐测量
 #   make clean      删除 bin/（含全部变体）
 # ============================================================
 
@@ -203,8 +203,8 @@ bench: $(CLI) | $(OUT)
 	@# 对齐读取预算：64 MiB 全是字母，没有任何可用切点。
 	@# 没有预算时每个建议切点都要读到文件末尾才放弃，-j 16（64 段）合计读
 	@# 约 31 遍文件。现在的预算 = min(段长 / 4, 1 MiB)，总量不超过 文件大小 / 4
-	@# （第六轮），与 -j 无关；改大 ALIGN_BUDGET_DIV 会更省读取但更容易丢切点，
-	@# 改小则相反，这组数据的用途就是让这个取舍看得见。
+	@# （第六轮），与 -j 无关。这一组量的是"预算省掉了多少浪费"，
+	@# 下一组（稀疏分隔符）量的是相反的一面："预算够不够用"。
 	@echo
 	@head -c 67108864 /dev/zero | tr '\0' 'a' > $(OUT)/bench_oneword.txt
 	@osize=$$(wc -c < $(OUT)/bench_oneword.txt | tr -d ' '); \
@@ -224,6 +224,12 @@ bench: $(CLI) | $(OUT)
 		printf "  -j %-5s %6d ms  段 %s / 建议切点 %s，对齐读 %s 字节（%s%% 文件）\n" \
 			"$$j" $$(( (end - start) / 1000000 )) "$$seg" "$$pts" "$$rd" $$(( rd * 100 / osize )); \
 	done
+	@# 稀疏分隔符输入（第七轮）：上面那组是"切不动"的文件，它的 -j 永远退化，
+	@# 说明不了 1/4 这个除数够不够用。这一组三类输入的分隔符稀疏但存在，
+	@# 用"接受切点最长扫描"与预算的比值给出余量。脚本单独放，是为了让
+	@# 造输入与取数的逻辑可读——塞进 Makefile 的续行里只剩转义符。
+	@echo
+	@sh tests/bench_align_sparse.sh $(CLI) $(OUT)/bench_sparse
 
 clean:
 	rm -rf $(OUT)
