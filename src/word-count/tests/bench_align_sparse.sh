@@ -28,6 +28,12 @@
 # 决定。普通英文文本里那个距离只有 5~6 字节（5.10 已断言最长扫描 <= 1024），
 # 拿它当样本等于什么都没测。
 #
+# 前两组的行长（4 KiB / 64 KiB）整除段长（1~2 MiB），于是每个建议切点都恰好
+# 落在行首，测到的"最长扫描"就是行尾那个换行的距离，也就是这一组的**最坏
+# 距离**。这不是巧合而是构造：预算够不够用要看最坏距离，不是平均值。
+# 第三组的行长故意取不整除的奇数，让建议切点落在行中，测的是"预算只够覆盖
+# 一部分切点"这个中间形态。
+#
 # 这是测量脚本，不做断言：数据要写进 README 6.6，判据是"预算 / 最长扫描"
 # 这一列。为了让 make bench 在数据异常时也能给出完整表格，解析失败只打一行
 # 提示，不中止整个 bench。
@@ -49,12 +55,54 @@ mkdir -p "$WORK" || exit 1
 
 # make_rows <路径> <行长> <总字节>
 #
-# yes 反复输出同一个模式行，head -c 截到目标字节数。模式行是 (行长 - 1) 个
-# 'a' 加一个换行，因此除换行之外没有任何分隔符。最后一行会被截断，
-# 不影响结论——文件末尾不产生切点。
+# 造一个"每行 <行长> 字节、行内除换行外没有分隔符"的文件。
+#
+# 分两步：先造一个 1 MiB 的块（块里全是同样的行），再把块反复追加到目标文件。
+# 不能直接用 `yes 模式行 | head -c 总字节`：模式行一旦超过 128 KiB，
+# execve 就返回 E2BIG（Linux 的 MAX_ARG_STRLEN 是 32 页），行 1 MiB 那组
+# 会造出一个 0 字节的文件——第一次跑就是这么失败的，而它不会让脚本报错，
+# 只会让那一组的三行数据全是空的。
+#
+# 块里最后一行的换行可能被 head -c 截掉，于是块尾会粘上下一块的行首，
+# 造出"两行连成一行"的假行长。为了不让这个偏差进到测量里，块大小取
+# 行长（不是某个整数）的整数倍，见下面的 block_target。
 make_rows() {
-	pattern=$(head -c $(($2 - 1)) /dev/zero | tr '\0' 'a')
-	yes "$pattern" | head -c "$3" > "$1"
+	rowbytes=$2
+	total=$3
+	block="$1.block"
+
+	# 块目标长度：行长的整数倍，且不超过 1 MiB。行长超过 1 MiB 时就取一行。
+	block_target=$((1048576 / rowbytes * rowbytes))
+	if [ "$block_target" -le 0 ]; then
+		block_target=$rowbytes
+	fi
+
+	rm -f "$block"
+	if [ "$rowbytes" -le 65536 ]; then
+		pattern=$(head -c $((rowbytes - 1)) /dev/zero | tr '\0' 'a')
+		# yes 在 head 关掉管道时会收到 SIGPIPE 并打一行 "Broken pipe"，
+		# 那是正常终止，不是错误；不屏蔽会让 make bench 的日志里冒出
+		# 一堆与测量无关的行。
+		yes "$pattern" 2>/dev/null | head -c "$block_target" > "$block"
+	else
+		head -c $((rowbytes - 1)) /dev/zero | tr '\0' 'a' > "$block"
+		printf '\n' >> "$block"
+	fi
+
+	blocksize=$(size_of "$block")
+	reps=$((total / blocksize))
+	rem=$((total - reps * blocksize))
+
+	: > "$1"
+	i=0
+	while [ "$i" -lt "$reps" ]; do
+		cat "$block" >> "$1"
+		i=$((i + 1))
+	done
+	if [ "$rem" -gt 0 ]; then
+		head -c "$rem" "$block" >> "$1"
+	fi
+	rm -f "$block"
 }
 
 trace_of() {
@@ -85,8 +133,8 @@ run_case() {
 	echo
 	echo "$name：$desc"
 	echo "  $size 字节，每行 $row 字节，行内无分隔符"
-	printf '  %-6s %8s %5s %5s %11s %10s %9s %6s\n' \
-	       "-j" "耗时" "段" "放弃" "预算/切点" "对齐读" "最长扫描" "余量"
+	printf '  %-6s %8s %5s %5s %11s %10s %5s %9s %6s\n' \
+	       "-j" "耗时" "段" "放弃" "预算/切点" "对齐读" "占比" "最长扫描" "余量"
 
 	for j in 2 4 8 16; do
 		t=$(trace_of "$f" "$j")
@@ -111,13 +159,17 @@ run_case() {
 		if [ "$max" -gt 0 ]; then
 			margin=$((bud / max))
 			margin="${margin}x"
+			pct=$((rd * 100 / size))%
 		else
+			# 一个切点都没被接受：最长扫描无样本，余量没有意义。
+			# 这一行要看的是"放弃 = 建议"，即预算全部不够用。
 			margin="—"
+			pct=$((rd * 100 / size))%
 		fi
 
-		printf '  %-6s %5d ms %5s %5s %11s %10s %9s %6s\n' \
+		printf '  %-6s %5d ms %5s %5s %11s %10s %5s %9s %6s\n' \
 		       "-j $j" $(( (end - start) / 1000000 )) \
-		       "$segs" "$skp" "$bud" "$rd" "$max" "$margin"
+		       "$segs" "$skp" "$bud" "$rd" "$pct" "$max" "$margin"
 	done
 }
 
@@ -126,7 +178,7 @@ echo "余量 = 预算 / 最长扫描；余量大说明除数保守（多读）�
 
 run_case csv4k  "行 4 KiB 的长行 CSV / 每行一条 base64" 4096    67108864
 run_case log64k "行 64 KiB 的单列大字段"                65536   33554432
-run_case blob1m "行 1 MiB 的极端形态"                   1048576 16777216
+run_case blob1m "行 1 MiB 的极端形态（行长取奇数，见上）" 1048571 16777216
 
 echo
 echo "输入留在 $WORK/ 下（make clean 会一并删除）"
