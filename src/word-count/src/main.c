@@ -5,27 +5,34 @@
  * 所有统计逻辑都在 wordcount 模块里。把这层单独分出来，
  * 是为了让模块可以被别的程序链接使用，而不必连带一个 main。
  *
- * 三档执行方式：
+ * 两档执行方式：
  *
  *   顺序（默认）  主线程按 argv 顺序逐个处理文件。
- *   并行（-j N）  每个文件作为一个任务提交给 thread-pool 的线程池，
- *                 由至多 N 个工作线程同时处理。
- *   单文件切分    只有一个文件且 -j N（N >= 2）时，把这个文件本身切成若干段，
- *                 每段一个任务。切点必须落在分隔符上，否则段首的词会被
- *                 切成两半、计两次；切点怎么找由 wc_align_chunk 负责，
- *                 每个切点只给"段长的 1/4"（封顶 ALIGN_SCAN_BYTES）读取预算。
+ *   并行（-j N）  一个共享队列 + N 个工作线程。队列里的任务单元是
+ *                 "某个文件的一个字节区间"，而不是"一个文件"：
+ *                 大于等于 2 MiB 的普通文件按分隔符对齐切成若干段，
+ *                 每段一个任务；其余文件整份作为一个任务。
  *
- * 三种方式共用同一套输出逻辑，因此三种方式的输出必须逐字节相同。
- * 这一点是 tests/check_split.sh 的判据。
+ * 为什么任务单元是字节区间而不是文件：按文件分发时，总时长由最大的那个文件
+ * 决定——其余工作线程把小块文件做完就空转。任务单元细化到区间之后，
+ * 大文件的时间被摊到所有线程上，而队列是 FIFO 的，剩下的问题只是
+ * "哪个任务排在前面"，见下面关于提交顺序的说明。
  *
- * 并行模式有两条硬性约束，它们是"并行输出可以直接和串行输出做 cmp"的前提：
+ * 两条硬性约束，它们是"并行输出可以直接和串行输出做 cmp"的前提：
  *
  *   1. 输出顺序 = argv 顺序，与任务完成顺序无关。每个任务只写自己那个槽位，
  *      主线程等全部任务结束后再按 argv 顺序统一打印。若让任务自己 printf，
- *      输出顺序就取决于哪个文件先读完，结果是同一批文件每次运行的行序都可能不同。
+ *      输出顺序就取决于哪个区间先读完，结果是同一批文件每次运行的行序都可能不同。
  *   2. 错误也在 argv 顺序上报告。errno 是线程局部的（POSIX.1-2008 规定 errno
  *      为 thread-local），任务返回之后主线程读到的是自己的 errno，与工作线程无关，
  *      因此错误号必须在任务函数内部取值并存进槽位。
+ *
+ * 提交顺序按任务字节数从大到小（LPT，longest processing time first）。
+ * 理由不是"大的先做看起来公平"，而是列表调度的完工时间上界：m 个同构工作线程、
+ * 队列 FIFO 时，把任务按耗时降序提交，makespan 不超过最优值的 4/3 - 1/(3m)。
+ * 反过来按 argv 顺序提交时，末尾若剩下一个大任务，其余线程只能空转等它，
+ * 最坏情况退化成单线程（那正是"按文件分发"的老问题，只是从文件级挪到了区间级）。
+ * 实现上不需要调度器：区间长度已经等价于耗时，一次 qsort 就够。
  *
  * 为什么并发放在驱动层而不是模块里：libwordcount.a 的使用者不一定需要并发，
  * 更不一定愿意链接 pthread。并发属于"怎么调度 I/O 与 CPU"，不属于"怎么数词"，
@@ -50,7 +57,7 @@
 #define MAX_JOBS 256
 
 /*
- * 单文件切分的三个常量。
+ * 切分的三个常量。
  *
  * MIN_CHUNK_BYTES 既是"要不要切"的门槛，也是每段的大小下限：
  * 建池、逐段 pread、切点对齐扫描都是固定开销，段太小就摊不平。
@@ -58,6 +65,8 @@
  *
  * CHUNKS_PER_WORKER 让段数多于线程数：各段耗时不可能完全均匀
  * （词长分布不同），段数只有线程数时，最慢的那段决定总时长。
+ * 它是"每个可切文件"的段数上限，不是整个队列的任务数上限：
+ * 后者天然被"每段不小于 1 MiB"这条下限约束住。
  *
  * 对齐读取的预算分两层：每个建议切点的预算是"段长的 1/4"，再受
  * ALIGN_SCAN_BYTES 封顶。
@@ -88,9 +97,9 @@
  * 取 1/4 的理由：对齐读取是纯附加 I/O，被它读过的字节随后还要被计数再读
  * 一遍，所以它直接抬高总 I/O 量。1/4 意味着最坏情况下 I/O 量是文件大小的
  * 1.25 倍；6.5 节实测这个最坏情况（64 MiB 全字母、-j 16）是 169 ms 对顺序
- * 154 ms，而固定 1 MiB 的预算是 213 ms。这个除数没有推导，是取舍：再收紧
+ * 154 ms，而固定 1 MiB 的预算是 213 ms。这个除数是取舍而不是推导：再收紧
  * 就会在分隔符稀疏的正常输入（行很长的日志、CSV）上白白丢切点、损失并行度。
- * 该用哪种输入定这个值，目前还没有数据（README 待办）。
+ * 96 KiB 一行的输入在 256 KiB 预算下仍不丢切点，1 MiB 一行的全放弃（6.6 节）。
  *
  * ALIGN_SCAN_BYTES 仍然保留，作用是让"段本来就很大"（低 -j、大文件）时
  * 预算不至于跟着段长线性膨胀：400 MiB / -j 8 时段长 12.5 MiB，比例预算
@@ -109,253 +118,132 @@
 _Static_assert(MIN_CHUNK_BYTES / ALIGN_BUDGET_DIV > 0,
                "段长下限除以预算除数必须是正数");
 
-/*
- * 一个文件的处理槽位。
- *
- * 槽位数等于文件数，第 i 个槽位只由处理第 i 个文件的那个任务写，
- * 主线程在 threadpool_wait 返回之后才读。槽位之间没有共享，
- * 因此不需要任何额外的同步原语——这是让 TSan 保持干净的关键：
- * 并发代码不出问题的最省事写法，是根本不让它共享可写状态。
- */
-typedef struct {
-	const char *path;        /* NULL 表示标准输入 */
-	wc_status   status;      /* 统计结果的状态码 */
-	int         saved_errno; /* 失败时的 errno，在任务线程内部取值 */
-	wc_stat     stat;        /* 三个计数 */
-} file_slot;
-
 static void print_stat(const wc_stat *st, const char *label);
 
-/*
- * 处理一个输入源，把结果写进槽位。
- * slot->path 为 NULL 时从 stream 读（标准输入），否则按路径读文件。
- */
-static void count_one(file_slot *slot, FILE *stream) {
-	if (slot->path != NULL) {
-		slot->status = wc_count_file(slot->path, &slot->stat);
-	} else {
-		slot->status = wc_count_stream(stream, &slot->stat);
-	}
-
-	/*
-	 * errno 必须在调用线程里取值。wc_count_file 的约定是失败时保留 errno，
-	 * 但"保留"只对同一条线程有意义：主线程的 errno 是它自己的副本，
-	 * 工作线程里发生的 ENOENT 不会传过来。
-	 */
-	slot->saved_errno = errno;
-}
-
-/* 线程池的任务签名是 void (*)(void *)，参数就是该任务独占的槽位 */
-static void count_task(void *arg) {
-	count_one((file_slot *)arg, NULL);
-}
+/* ------------------------------------------------------------------
+ * 顺序路径
+ * ------------------------------------------------------------------ */
 
 /*
- * 按 argv 顺序输出一个槽位的结果，并累加到 sum。
- * 成功返回 0，失败返回 1。
- */
-static int report_slot(const file_slot *slot, wc_stat *sum) {
-	if (slot->status != WC_OK) {
-		/*
-		 * WC_ERR_OPEN / WC_ERR_READ / WC_ERR_CLOSE 三种情况都会保留 errno，
-		 * 用 strerror 给出具体原因。WC_ERR_PARAM 不会出现在这里：
-		 * 它只由编程错误（传 NULL）触发，而 path 与 stream 都由本层保证有效。
-		 */
-		(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
-		              (slot->path != NULL) ? slot->path : "(stdin)",
-		              wc_status_string(slot->status),
-		              strerror(slot->saved_errno));
-		return 1;
-	}
-
-	print_stat(&slot->stat, slot->path);
-
-	/* 累加总计数。大文件时 unsigned long 不会溢出，直接相加即可。 */
-	sum->lines += slot->stat.lines;
-	sum->words += slot->stat.words;
-	sum->bytes += slot->stat.bytes;
-
-	return 0;
-}
-
-/*
- * 顺序路径：主线程自己处理全部文件。
- * 只有一个文件、或者没有给 -j 时走这里。
+ * 主线程自己按 argv 顺序处理全部文件。
+ * 没有给 -j、只给 -j 1、或者读标准输入时走这里。
  */
 static int run_sequential(const char *const *paths, int nfiles, wc_stat *sum) {
-	file_slot slot;
-	int       failed = 0;
+	wc_stat st;
+	int     failed = 0;
 
 	for (int i = 0; i < nfiles; i++) {
-		memset(&slot, 0, sizeof slot);
-		slot.path = paths[i];
+		wc_status status = wc_count_file(paths[i], &st);
+		int       saved  = errno;
 
-		count_one(&slot, NULL);
-
-		if (report_slot(&slot, sum) != 0) {
+		if (status != WC_OK) {
+			(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
+			              paths[i], wc_status_string(status), strerror(saved));
 			failed = 1;
+			continue;
 		}
+
+		print_stat(&st, paths[i]);
+		sum->lines += st.lines;
+		sum->words += st.words;
+		sum->bytes += st.bytes;
 	}
 
-	return failed;
-}
-
-/*
- * 并行路径：每个文件一个任务，全部完成后按 argv 顺序汇总输出。
- * 提交失败时只汇总已经提交出去的任务，未提交的槽位不会被当成"统计成功"打印。
- */
-static int run_parallel(const char *const *paths, int nfiles, int jobs, wc_stat *sum) {
-	threadpool  *pool = NULL;
-	file_slot   *slots;
-	tpool_status st;
-	int          workers;
-	int          submitted = 0;
-	int          failed    = 0;
-
-	/*
-	 * 工作线程数取 min(jobs, 文件数)。任务数少于线程数时，
-	 * 多出来的工作线程一个任务都取不到，只是白占一块线程栈和一份调度实体。
-	 */
-	workers = (jobs < nfiles) ? jobs : nfiles;
-
-	slots = (file_slot *)calloc((size_t)nfiles, sizeof *slots);
-	if (slots == NULL) {
-		(void)fprintf(stderr, "wordcount: 分配 %d 个结果槽位失败\n", nfiles);
-		return 1;
-	}
-
-	st = threadpool_create(workers, &pool);
-	if (st != TPOOL_OK) {
-		/*
-		 * 不静默退回串行。使用者写了 -j 8 就是期望并行，悄悄改成单线程之后
-		 * 输出完全正常、只是耗时对不上，这种"能跑但不符合预期"的状态
-		 * 比直接报错难查得多。
-		 */
-		(void)fprintf(stderr, "wordcount: 无法创建 %d 个工作线程的线程池：%s\n",
-		              workers, threadpool_status_string(st));
-		free(slots);
-		return 1;
-	}
-
-	for (int i = 0; i < nfiles; i++) {
-		slots[i].path = paths[i];
-
-		st = threadpool_submit(pool, count_task, &slots[i]);
-		if (st != TPOOL_OK) {
-			(void)fprintf(stderr, "wordcount: 提交第 %d 个文件的任务失败：%s\n",
-			              i, threadpool_status_string(st));
-			failed = 1;
-			break;
-		}
-		submitted++;
-	}
-
-	/*
-	 * threadpool_wait 返回时，所有已提交的任务都已执行完毕。
-	 * 这个等待在池内部的互斥量上完成（工作线程在持锁状态下把 running 减一），
-	 * 因此它与任务写槽位的动作之间构成 happens-before 关系：
-	 * 主线程从这里往后读槽位，不需要再加任何同步。
-	 */
-	(void)threadpool_wait(pool);
-	threadpool_destroy(pool);
-
-	for (int i = 0; i < submitted; i++) {
-		if (report_slot(&slots[i], sum) != 0) {
-			failed = 1;
-		}
-	}
-
-	free(slots);
 	return failed;
 }
 
 /* ------------------------------------------------------------------
- * 单文件切分
+ * 计划：把一个文件规划成若干个字节区间
  * ------------------------------------------------------------------ */
 
+/* 一个字节区间 [from, to)，长度就是它的调度权重 */
+typedef struct {
+	off_t from;
+	off_t to;
+} seg_range;
+
 /*
- * 一个段的处理槽位。与 file_slot 同一个套路：每个任务只写自己那一格，
- * 主线程在 threadpool_wait 之后才读，因此不需要额外同步。
+ * 一个文件的计划与状态。
+ *
+ * fd 只在"这个文件真的要切"时保持打开：切分期间所有段共用一个 fd，
+ * 靠 pread 的"不动偏移"保证互不干扰，同时避免"规划时 fstat 的 inode 与
+ * 执行时打开的 inode 不是同一个"这个 TOCTOU 窗口。代价是同时打开的文件数
+ * 等于可切文件数，文件很多时可能撞上 RLIMIT_NOFILE（见 README 9.5）。
  */
 typedef struct {
-	int         fd;          /* 所有段共用同一个 fd，靠 pread 的"不动偏移"保证互不干扰 */
-	off_t       from;        /* 段起点，0 或某个分隔符的偏移 */
-	off_t       to;          /* 段终点（不含） */
-	int         submitted;   /* 这段是否真的提交成了任务 */
-	wc_status   status;
-	int         saved_errno; /* 在任务线程内部取 errno，理由同 count_one */
-	wc_stat     stat;
-} chunk_slot;
-
-static void chunk_task(void *arg) {
-	chunk_slot *slot = (chunk_slot *)arg;
-
-	slot->status      = wc_count_fd_range(slot->fd, slot->from, slot->to, &slot->stat);
-	slot->saved_errno = errno;
-}
-
-/* run_split_file 的返回码 */
-enum split_result {
-	SPLIT_FAILED = -1,   /* 失败，错误信息已经打印 */
-	SPLIT_SKIP   = 0,    /* 不适用，调用方退回顺序路径 */
-	SPLIT_DONE   = 1     /* 成功，结果已经累加进 *sum */
-};
+	const char *path;
+	int         fd;         /* 可切文件持有的 fd；否则 -1 */
+	seg_range  *ranges;     /* 段区间，nranges 个；0 表示整文件一个任务 */
+	int         nranges;
+	int         first;      /* 该文件第一个任务在 tasks[] 里的下标 */
+	int         ntask;      /* 该文件的任务数；0 表示计划失败 */
+	off_t       size;       /* 普通文件的 st_size，其余为 0 */
+	int         known_size; /* size 是否有效（决定自检与调度权重） */
+	int         aborted;    /* 计划阶段已打印错误，报告阶段不再输出 */
+	wc_status   status;     /* WC_OK 或计划阶段的失败状态 */
+	int         saved_errno;
+} file_entry;
 
 /*
- * 把单个文件切成若干段并行统计。
+ * 规划一个文件：
+ *   nranges >= 2  → 切成这么多段，fd 保持打开；
+ *   nranges == 0  → 整文件一个任务，按路径顺序读，fd 已关闭。
  *
- * 只在"普通文件、大小不小于 2 MiB、且筛出的段数不少于 2"时才真的并行；
- * 其它情况返回 SPLIT_SKIP，由调用方走顺序路径。管道与终端不可定位，
- * 目录与设备文件的大小没有"统计开始时"这个确定值（fstat 的 st_size
- * 对目录的含义是实现相关的），对它们做定长切分没有意义。
+ * 判定条件是"普通文件、大小不小于 2 MiB、且 -j >= 2"，任何一条不满足
+ * 都退回整文件任务。管道与终端不可定位；目录与设备文件的 st_size
+ * 没有"统计开始时"这个确定值（fstat 的 st_size 对目录的含义是实现相关的），
+ * 对它们做定长切分没有意义。
  */
-static int run_split_file(const char *path, int jobs, wc_stat *sum) {
+static void plan_file(file_entry *e, int jobs) {
 	struct stat sb;
-	int         fd;
 	off_t       size;
 	int         nchunks;
-	int         workers;
-	int         ntasks;
-	int         nb         = 1;   /* 已接受的边界个数，bounds[0 .. nb-1] 有效 */
-	int         skipped    = 0;   /* 预算内找不到分隔符而放弃的建议切点个数 */
-	long long   align_read = 0;   /* 对齐扫描总共读掉的字节数 */
-	long long   max_scan   = 0;   /* 已接受切点里最长的一次对齐扫描距离 */
-	off_t       chunk_bytes;      /* size / nchunks，各段等长 */
-	off_t       align_budget;     /* 每个建议切点的对齐读取预算 */
-	int         failed = 0;
-	off_t      *bounds = NULL;
-	chunk_slot *slots  = NULL;
-	threadpool *pool   = NULL;
-	wc_stat     local  = {0, 0, 0};
+	off_t       chunk_bytes;
+	off_t       align_budget;
+	off_t       prev = 0;
+	int         nranges = 0;
+	int         skipped = 0;
+	long long   align_read = 0;
+	long long   max_scan   = 0;
+	seg_range  *ranges = NULL;
+	int         fd;
 
-	fd = open(path, O_RDONLY);
+	e->status      = WC_OK;
+	e->saved_errno = 0;
+	e->fd          = -1;
+	e->size        = 0;
+	e->known_size  = 0;
+
+	fd = open(e->path, O_RDONLY);
 	if (fd < 0) {
-		int saved = errno;
-		(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
-		              path, wc_status_string(WC_ERR_OPEN), strerror(saved));
-		return SPLIT_FAILED;
+		e->status      = WC_ERR_OPEN;
+		e->saved_errno = errno;
+		return;
 	}
 
 	/*
 	 * 用 fstat 而不是 stat：要切的是已经打开的这个 fd，判定和读取必须
 	 * 针对同一个对象，否则中间被换成别的文件时判断与读取对不上。
-	 * fstat 失败时不去猜原因，直接退回顺序路径——那里会重新打开、
-	 * 报出真正的原因。
 	 */
 	if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
 		(void)close(fd);
-		return SPLIT_SKIP;
+		return;
 	}
 
-	size = sb.st_size;
-	if (size < 2 * MIN_CHUNK_BYTES) {
+	size           = sb.st_size;
+	e->size        = size;
+	e->known_size  = 1;
+
+	if (size < (off_t)(2 * MIN_CHUNK_BYTES) || jobs < 2) {
 		(void)close(fd);
-		return SPLIT_SKIP;
+		return;
 	}
 
 	/*
 	 * 段数先按"每 MiB 一段"估，再压到 jobs * CHUNKS_PER_WORKER 以内：
 	 * 段数超过线程数太多时，每段的对齐扫描与任务分派会开始占可观比例。
+	 * 这条上限逐文件计算，因此整个队列的任务数上限是"可切文件数 × jobs × 4"，
+	 * 实际还会被"每段不小于 1 MiB"压得更低。
 	 */
 	nchunks = (int)(size / MIN_CHUNK_BYTES);
 	if (nchunks > jobs * CHUNKS_PER_WORKER) {
@@ -363,23 +251,21 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	}
 	if (nchunks < 2) {
 		(void)close(fd);
-		return SPLIT_SKIP;
+		return;
 	}
 
-	bounds = (off_t *)calloc((size_t)nchunks + 1, sizeof *bounds);
-	slots  = (chunk_slot *)calloc((size_t)nchunks, sizeof *slots);
-	if (bounds == NULL || slots == NULL) {
-		(void)fprintf(stderr, "wordcount: 分配 %d 个切点失败\n", nchunks);
-		failed = 1;
-		goto done;
+	ranges = (seg_range *)calloc((size_t)nchunks, sizeof *ranges);
+	if (ranges == NULL) {
+		(void)fprintf(stderr, "wordcount: %s: 分配 %d 个切点失败\n", e->path, nchunks);
+		(void)close(fd);
+		e->aborted = 1;
+		return;
 	}
-
-	bounds[0] = 0;
 
 	/*
 	 * 每个建议切点的对齐读取预算 = min(段长 / 4, ALIGN_SCAN_BYTES)。
 	 *
-	 * suggested 是 (size / nchunks) * k，所以各段长度相等（都是 size / nchunks），
+	 * suggested 是 (size / nchunks) * k，所以各段长度相等，
 	 * 预算在循环外算一次就够。最后一段可能短一点，但那一段没有切点，
 	 * 不参与对齐扫描。
 	 */
@@ -390,11 +276,6 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		align_budget = ALIGN_SCAN_BYTES;
 	}
 
-	/*
-	 * 边界是"筛"出来的，不是"按下标填"的：被放弃的建议切点不占位置，
-	 * 所以用 nb 记已接受的个数，最后才写右端点。nb 最多等于 nchunks-1，
-	 * 因此 bounds 的 nchunks+1 个格子永远够用。
-	 */
 	/*
 	 * 先除后乘：size * k 在超大文件上可能溢出 off_t（有符号 64 位的上限
 	 * 是 8 EiB，虽然现在没有这种盘，但溢出是未定义行为，不该留在这里）。
@@ -419,9 +300,11 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 		if (st != WC_OK) {
 			int saved = errno;
 			(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
-			              path, wc_status_string(st), strerror(saved));
-			failed = 1;
-			goto done;
+			              e->path, wc_status_string(st), strerror(saved));
+			free(ranges);
+			(void)close(fd);
+			e->aborted = 1;
+			return;
 		}
 
 		/*
@@ -456,19 +339,24 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 			max_scan = scan;
 		}
 
-		bounds[nb++] = aligned;
+		/*
+		 * 边界是"筛"出来的：被放弃的建议切点不占位置，因此每接受一个
+		 * 就当场闭合一段。accepted 的边界两两单调（suggested 每步前进
+		 * 一个段长，远大于预算），所以这里不会出现零长度段；仍然判一次，
+		 * 是因为"长度为正"是下面 ntasks 计数的前提。
+		 */
+		if (aligned > prev) {
+			ranges[nranges].from = prev;
+			ranges[nranges].to   = aligned;
+			nranges++;
+			prev = aligned;
+		}
 	}
 
-	bounds[nb] = size;
-
-	ntasks = 0;
-	for (int k = 0; k < nb; k++) {
-		slots[k].fd   = fd;
-		slots[k].from = bounds[k];
-		slots[k].to   = bounds[k + 1];
-		if (bounds[k] < bounds[k + 1]) {
-			ntasks++;
-		}
+	if (size > prev) {
+		ranges[nranges].from = prev;
+		ranges[nranges].to   = size;
+		nranges++;
 	}
 
 	/*
@@ -476,134 +364,376 @@ static int run_split_file(const char *path, int jobs, wc_stat *sum) {
 	 *
 	 * 需要它的原因很具体——tests/check_split.sh 比对的是"切分输出 = 顺序输出"，
 	 * 而这条断言在切分根本没有发生时也成立（文件太小、不是普通文件都会退回
-	 * 顺序路径）。不把"切了几段"变成可观测量，测试就会在什么都没测到的
+	 * 整文件任务）。不把"切了几段"变成可观测量，测试就会在什么都没测到的
 	 * 情况下报绿。不加命令行选项是避免污染正常输出契约：默认情况下
-	 * 三种方式的 stdout 与 stderr 仍然完全一致。
+	 * 两种方式的 stdout 与 stderr 仍然完全一致。
 	 *
 	 * 第五轮起多打三项：建议切点个数、被放弃的个数、对齐扫描读了多少字节。
-	 * 理由同上一段——"预算生效了"也必须是可观测的，否则 check_align_budget.sh
-	 * 只能断言输出正确，而加不加预算输出都正确。
+	 * 第六轮再打每个切点的预算，第七轮再打"接受切点最长扫描"——它们是三条
+	 * 互相独立的策略量，注入验证里会分别失败（5.10 节）。
 	 *
-	 * 第六轮再打一项：每个切点的对齐读取预算。"预算按段长的 1/4 收缩"同样是一条
-	 * 看不见的策略，不与固定常量区分开就无法断言。脚本用它核对公式本身（策略），
-	 * 用"对齐扫描读"核对实际发生量（结果）——两者在注入验证里会分别失败。
-	 *
-	 * 第七轮再加一项：已接受切点里最长的一次扫描。前五项都是"总量"或"策略值"，
-	 * 回答不了"这个预算够不够用"：够用的判据是被接受的切点离分隔符最远有多远，
-	 * 而这个量只有把它单列出来才看得见——总量除以切点数会被密集分隔符摊平。
-	 * tests/bench_align_sparse.sh 用它给 ALIGN_BUDGET_DIV 这个除数提供依据。
+	 * 第八轮去掉了行尾的"N 个工作线程"：工作线程数现在是整个队列的属性
+	 * （min(-j, 总任务数)），不再是单个文件的属性，它移到调度行里。
 	 */
 	if (getenv("WORDCOUNT_TRACE_SPLIT") != NULL) {
 		(void)fprintf(stderr,
 		              "wordcount: 切分 %s：%d 段（建议切点 %d 个，接受 %d 个，"
 		              "放弃 %d 个），对齐扫描读 %lld 字节，预算 %lld 字节/切点，"
-		              "接受切点最长扫描 %lld 字节，%d 个工作线程\n",
-		              path, ntasks, nchunks - 1, nb - 1, skipped, align_read,
-		              (long long)align_budget, max_scan,
-		              (jobs < ntasks) ? jobs : ntasks);
+		              "接受切点最长扫描 %lld 字节\n",
+		              e->path, nranges, nchunks - 1, nranges - 1, skipped,
+		              align_read, (long long)align_budget, max_scan);
 	}
 
 	/*
-	 * 所有切点都被放弃时只有一段，切了也没有并行度。
-	 * 这时退回顺序路径：结果一样，但少建一次池。
+	 * 只剩一段时切了也没有并行度。这时退回整文件任务：结果一样，
+	 * 但少一份区间任务与一个长期打开的 fd。
 	 */
-	if (ntasks < 2) {
+	if (nranges < 2) {
+		free(ranges);
 		(void)close(fd);
-		free(bounds);
-		free(slots);
-		return SPLIT_SKIP;
+		return;
 	}
 
-	workers = (jobs < ntasks) ? jobs : ntasks;
+	e->fd      = fd;
+	e->ranges  = ranges;
+	e->nranges = nranges;
+}
 
-	tpool_status st = threadpool_create(workers, &pool);
-	if (st != TPOOL_OK) {
-		(void)fprintf(stderr, "wordcount: 无法创建 %d 个工作线程的线程池：%s\n",
-		              workers, threadpool_status_string(st));
-		failed = 1;
-		goto done;
+/* ------------------------------------------------------------------
+ * 统一调度：区间任务 + LPT 提交顺序
+ * ------------------------------------------------------------------ */
+
+enum {
+	TASK_WHOLE = 0,  /* 整文件，任务里按路径重新打开并用 stdio 顺序读 */
+	TASK_RANGE = 1   /* 一个字节区间，用规划阶段留下的 fd 做 pread */
+};
+
+/*
+ * 一个任务槽位。每个任务只写自己那一格，主线程在 threadpool_wait
+ * 返回之后才读，因此不需要额外的同步原语——这是让 TSan 保持干净的关键：
+ * 并发代码不出问题的最省事写法，是根本不让它共享可写状态。
+ */
+typedef struct {
+	const char *path;
+	int         kind;
+	int         fd;
+	int         file;        /* 所属文件在 entries[] 里的下标 */
+	int         seg;         /* 文件内的段号，0 起 */
+	off_t       from;
+	off_t       to;
+	int         submitted;   /* 是否真的进了队列（或内联执行） */
+	wc_status   status;
+	int         saved_errno; /* 在任务线程内部取 errno，理由见文件头 */
+	wc_stat     stat;
+} seg_task;
+
+static void task_exec(seg_task *t) {
+	if (t->kind == TASK_RANGE) {
+		t->status = wc_count_fd_range(t->fd, t->from, t->to, &t->stat);
+	} else {
+		t->status = wc_count_file(t->path, &t->stat);
 	}
 
-	for (int k = 0; k < nb; k++) {
-		/* 空段不提交：任务函数什么都不做，但分派本身要约 600 ns */
-		if (slots[k].from >= slots[k].to) {
+	/*
+	 * errno 必须在调用线程里取值。wc_count_* 的约定是失败时保留 errno，
+	 * 但"保留"只对同一条线程有意义：主线程的 errno 是它自己的副本，
+	 * 工作线程里发生的 ENOENT 不会传过来。
+	 */
+	t->saved_errno = errno;
+}
+
+/* 线程池的任务签名是 void (*)(void *)，参数就是该任务独占的槽位 */
+static void task_thunk(void *arg) {
+	task_exec((seg_task *)arg);
+}
+
+/*
+ * LPT 比较函数：字节数降序；相等时按 (文件下标, 段号) 升序。
+ *
+ * 第二级比较不是装饰：qsort 不保证稳定，若只比长度，等长的任务之间的
+ * 相对次序由实现决定（glibc 的归并排序与 musl 的平滑排序结果就不同），
+ * 于是同一次输入在不同 libc 上的提交顺序不同，排障时无法复现。
+ */
+static int cmp_task_weight(const void *a, const void *b) {
+	const seg_task *ta = *(const seg_task *const *)a;
+	const seg_task *tb = *(const seg_task *const *)b;
+	off_t           wa = ta->to - ta->from;
+	off_t           wb = tb->to - tb->from;
+
+	if (wa != wb) {
+		return (wa > wb) ? -1 : 1;
+	}
+	if (ta->file != tb->file) {
+		return (ta->file < tb->file) ? -1 : 1;
+	}
+	if (ta->seg != tb->seg) {
+		return (ta->seg < tb->seg) ? -1 : 1;
+	}
+	return 0;
+}
+
+/*
+ * 并行路径：先规划（决定每个文件怎么切），再建一条共享队列，
+ * 按任务字节数降序提交，最后按 argv 顺序输出。
+ *
+ * 规划与执行分开是为了让任务总数在执行前已知：线程数取
+ * min(jobs, 任务数)，任务数少于线程数时多出来的线程一个任务都取不到，
+ * 只是白占一块线程栈和一份调度实体。
+ */
+static int run_parallel(const char *const *paths, int nfiles, int jobs, wc_stat *sum) {
+	file_entry *entries;
+	seg_task   *tasks  = NULL;
+	seg_task  **order  = NULL;
+	threadpool *pool   = NULL;
+	int         ntasks = 0;
+	int         nwhole = 0;
+	int         pos    = 0;
+	int         failed = 0;
+
+	entries = (file_entry *)calloc((size_t)nfiles, sizeof *entries);
+	if (entries == NULL) {
+		(void)fprintf(stderr, "wordcount: 分配 %d 个文件的计划槽位失败\n", nfiles);
+		return 1;
+	}
+
+	for (int i = 0; i < nfiles; i++) {
+		entries[i].path = paths[i];
+		plan_file(&entries[i], jobs);
+
+		if (entries[i].aborted) {
+			failed = 1;
+			continue;
+		}
+		if (entries[i].status != WC_OK) {
+			continue;      /* 打不开：错误在报告阶段按 argv 顺序打印 */
+		}
+
+		entries[i].ntask = (entries[i].nranges > 0) ? entries[i].nranges : 1;
+		ntasks += entries[i].ntask;
+		if (entries[i].nranges == 0) {
+			nwhole++;
+		}
+	}
+
+	if (ntasks > 0) {
+		tasks = (seg_task *)calloc((size_t)ntasks, sizeof *tasks);
+		order = (seg_task **)calloc((size_t)ntasks, sizeof *order);
+		if (tasks == NULL || order == NULL) {
+			(void)fprintf(stderr, "wordcount: 分配 %d 个任务槽位失败\n", ntasks);
+			ntasks = 0;
+			failed = 1;
+			goto report;
+		}
+	}
+
+	for (int i = 0; i < nfiles; i++) {
+		file_entry *e = &entries[i];
+
+		if (e->ntask == 0) {
 			continue;
 		}
 
-		st = threadpool_submit(pool, chunk_task, &slots[k]);
-		if (st != TPOOL_OK) {
-			(void)fprintf(stderr, "wordcount: %s: 提交第 %d/%d 段的任务失败：%s\n",
-			              path, k + 1, ntasks, threadpool_status_string(st));
-			failed = 1;
-			break;
+		e->first = pos;
+
+		for (int k = 0; k < e->ntask; k++) {
+			seg_task *t = &tasks[pos];
+
+			t->path = e->path;
+			t->file = i;
+			t->seg  = k;
+
+			if (e->nranges > 0) {
+				t->kind = TASK_RANGE;
+				t->fd   = e->fd;
+				t->from = e->ranges[k].from;
+				t->to   = e->ranges[k].to;
+			} else {
+				t->kind = TASK_WHOLE;
+				t->fd   = -1;
+				t->from = 0;
+				t->to   = e->size;
+			}
+
+			order[pos] = t;
+			pos++;
 		}
-		slots[k].submitted = 1;
 	}
 
-	(void)threadpool_wait(pool);
+	if (ntasks >= 2) {
+		int          workers = (jobs < ntasks) ? jobs : ntasks;
+		tpool_status st      = threadpool_create(workers, &pool);
 
-	if (!failed) {
-		for (int k = 0; k < nb; k++) {
-			if (!slots[k].submitted) {
-				continue;
-			}
-			if (slots[k].status != WC_OK) {
-				/*
-				 * saved_errno 为 0 表示不是系统调用失败，而是这段在读到
-				 * 终点之前就碰到了文件末尾——文件在统计期间被截短。
-				 * 这种情况不能拿 strerror(0) 说成 "Success"。
-				 */
-				if (slots[k].saved_errno == 0) {
-					(void)fprintf(stderr,
-					              "wordcount: %s: %s: 第 %d/%d 段在读到第 %lld 字节之前就遇到文件末尾\n",
-					              path, wc_status_string(slots[k].status),
-					              k + 1, ntasks, (long long)slots[k].to);
-				} else {
-					(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
-					              path, wc_status_string(slots[k].status),
-					              strerror(slots[k].saved_errno));
-				}
+		if (st != TPOOL_OK) {
+			/*
+			 * 不静默退回串行。使用者写了 -j 8 就是期望并行，悄悄改成单线程之后
+			 * 输出完全正常、只是耗时对不上，这种"能跑但不符合预期"的状态
+			 * 比直接报错难查得多。
+			 */
+			(void)fprintf(stderr, "wordcount: 无法创建 %d 个工作线程的线程池：%s\n",
+			              workers, threadpool_status_string(st));
+			failed = 1;
+			goto report;
+		}
+
+		qsort(order, (size_t)ntasks, sizeof *order, cmp_task_weight);
+
+		/*
+		 * 调度行是第八轮新增的可观测量。原因与 5.9 / 5.10 记的两个假通过
+		 * 同源：多文件 + 切分这条路径若根本没被走到（每个文件都退化成一个
+		 * 整文件任务），"输出与顺序一致"照样成立。只有把"任务数 > 文件数"
+		 * 和"首个任务有多大"打出来，测试才能断言切分真的发生了、
+		 * 并且确实按 LPT 排过序。
+		 */
+		if (getenv("WORDCOUNT_TRACE_SPLIT") != NULL) {
+			(void)fprintf(stderr,
+			              "wordcount: 调度：共 %d 个任务（其中整文件任务 %d 个），"
+			              "工作线程 %d 个，首个任务 %lld 字节，按任务字节数降序提交\n",
+			              ntasks, nwhole, workers,
+			              (long long)(order[0]->to - order[0]->from));
+		}
+
+		for (int k = 0; k < ntasks; k++) {
+			st = threadpool_submit(pool, task_thunk, order[k]);
+			if (st != TPOOL_OK) {
+				(void)fprintf(stderr, "wordcount: 提交第 %d/%d 个任务失败：%s\n",
+				              k + 1, ntasks, threadpool_status_string(st));
 				failed = 1;
 				break;
 			}
-
-			local.lines += slots[k].stat.lines;
-			local.words += slots[k].stat.words;
-			local.bytes += slots[k].stat.bytes;
+			order[k]->submitted = 1;
 		}
-	}
 
-	/*
-	 * 最后一道自检：逐段相加的字节数必须等于 fstat 报告的 st_size。
-	 * 各段都返回 OK 时理论上必然相等，写在这里是为了让"文件在统计期间
-	 * 被改短"这件事宁可报错，也不静默输出一个偏小的结果。
-	 */
-	if (!failed && local.bytes != (unsigned long)size) {
-		(void)fprintf(stderr,
-		              "wordcount: %s: 统计期间文件大小发生变化（预期 %lld 字节，读到 %lu 字节）\n",
-		              path, (long long)size, local.bytes);
-		failed = 1;
-	}
-
-done:
-	if (pool != NULL) {
+		/*
+		 * threadpool_wait 返回时，所有已提交的任务都已执行完毕。
+		 * 这个等待在池内部的互斥量上完成（工作线程在持锁状态下把 running 减一），
+		 * 因此它与任务写槽位的动作之间构成 happens-before 关系：
+		 * 主线程从这里往后读槽位，不需要再加任何同步。
+		 */
+		(void)threadpool_wait(pool);
 		threadpool_destroy(pool);
+		pool = NULL;
+	} else if (ntasks == 1) {
+		/*
+		 * 只有一个任务时不建池：建池 + 一次 wait + destroy 要几十微秒，
+		 * 而"在别的线程上做"没有任何收益。内联执行与提交执行走的是同一个
+		 * task_exec，所以两条路的结果不会分叉。
+		 */
+		tasks[0].submitted = 1;
+		task_exec(&tasks[0]);
 	}
-	(void)close(fd);
-	free(bounds);
-	free(slots);
 
-	if (failed) {
-		return SPLIT_FAILED;
+report:
+	for (int i = 0; i < nfiles; i++) {
+		file_entry *e = &entries[i];
+		wc_stat     st = {0, 0, 0};
+		int         bad = 0;
+
+		if (e->aborted) {
+			failed = 1;
+			continue;
+		}
+
+		if (e->status != WC_OK) {
+			/*
+			 * WC_ERR_OPEN 保留 errno（open 设置的），用 strerror 给出具体原因。
+			 * WC_ERR_PARAM 不会出现在这里：它只由编程错误（传 NULL）触发，
+			 * 而 path 由本层保证有效。
+			 */
+			(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
+			              e->path, wc_status_string(e->status),
+			              strerror(e->saved_errno));
+			failed = 1;
+			continue;
+		}
+
+		if (ntasks == 0) {
+			/* 任务槽位没分配出来，上面已经报过错 */
+			continue;
+		}
+
+		for (int k = 0; k < e->ntask; k++) {
+			seg_task *t = &tasks[e->first + k];
+
+			if (!t->submitted) {
+				bad = 1;      /* 提交在它之前就失败了 */
+				break;
+			}
+			if (t->status == WC_OK) {
+				continue;
+			}
+
+			/*
+			 * saved_errno 为 0 表示不是系统调用失败，而是这段在读到
+			 * 终点之前就碰到了文件末尾——文件在统计期间被截短。
+			 * 这种情况不能拿 strerror(0) 说成 "Success"。
+			 * 这条说明只对切开的文件成立：整文件任务走 stdio 读到 EOF，
+			 * 没有"这段该有多少字节"这个先验，仍按老样子报 errno。
+			 */
+			if (t->saved_errno == 0 && e->nranges > 0) {
+				(void)fprintf(stderr,
+				              "wordcount: %s: %s: 第 %d/%d 段在读到第 %lld 字节之前就遇到文件末尾\n",
+				              e->path, wc_status_string(t->status),
+				              k + 1, e->ntask, (long long)t->to);
+			} else {
+				(void)fprintf(stderr, "wordcount: %s: %s: %s\n",
+				              e->path, wc_status_string(t->status),
+				              strerror(t->saved_errno));
+			}
+			bad = 1;
+			break;
+		}
+
+		if (bad) {
+			failed = 1;
+			continue;
+		}
+
+		for (int k = 0; k < e->ntask; k++) {
+			seg_task *t = &tasks[e->first + k];
+
+			st.lines += t->stat.lines;
+			st.words += t->stat.words;
+			st.bytes += t->stat.bytes;
+		}
+
+		/*
+		 * 最后一道自检：逐段相加的字节数必须等于 fstat 报告的 st_size。
+		 * 各段都返回 OK 时理论上必然相等，写在这里是为了让"文件在统计期间
+		 * 被改短"这件事宁可报错，也不静默输出一个偏小的结果。
+		 * 整文件任务走的是 stdio 读到 EOF，没有这个已知长度，跳过。
+		 */
+		if (e->nranges > 0 && e->known_size &&
+		    st.bytes != (unsigned long)e->size) {
+			(void)fprintf(stderr,
+			              "wordcount: %s: 统计期间文件大小发生变化（预期 %lld 字节，读到 %lu 字节）\n",
+			              e->path, (long long)e->size, st.bytes);
+			failed = 1;
+			continue;
+		}
+
+		print_stat(&st, e->path);
+		sum->lines += st.lines;
+		sum->words += st.words;
+		sum->bytes += st.bytes;
 	}
 
-	print_stat(&local, path);
-	sum->lines += local.lines;
-	sum->words += local.words;
-	sum->bytes += local.bytes;
+	for (int i = 0; i < nfiles; i++) {
+		if (entries[i].fd >= 0) {
+			(void)close(entries[i].fd);
+		}
+		free(entries[i].ranges);
+	}
 
-	return SPLIT_DONE;
+	free(order);
+	free(tasks);
+	free(entries);
+
+	return failed;
 }
+
+/* ------------------------------------------------------------------
+ * 输出
+ * ------------------------------------------------------------------ */
 
 static void print_stat(const wc_stat *st, const char *label) {
 	if (label == NULL) {
@@ -626,15 +756,16 @@ static void usage(FILE *out, const char *prog) {
 	    "\n"
 	    "Options:\n"
 	    "  -j JOBS   用至多 JOBS 个线程并行统计（1..%d）。\n"
-	    "            多个文件：每个文件一个任务，工作线程数取 min(JOBS, 文件数)。\n"
-	    "            单个文件：把这个普通文件按分隔符对齐切成若干段并行（需 >= 2 MiB），\n"
-	    "            切点若落在词中间会退到下一个分隔符，单词不会被切开；\n"
-	    "            一个切点在 min(段长/4, 1 MiB) 的对齐预算内都找不到分隔符时\n"
-	    "            放弃该切点（那一段并进前一段）。\n"
+	    "            不小于 2 MiB 的普通文件按分隔符对齐切成若干段，每段一个任务；\n"
+	    "            其余文件整份一个任务。所有任务进同一条队列，按字节数从大到小提交，\n"
+	    "            因此大文件不会把完工时间拖到最后。切点落在词中间时退到下一个\n"
+	    "            分隔符，单词不会被切开；一个切点在 min(段长/4, 1 MiB) 的对齐预算内\n"
+	    "            都找不到分隔符时放弃该切点（那一段并进前一段）。\n"
 	    "  -h        显示本说明\n"
 	    "\n"
-	    "没有 FILE 参数时读标准输入。多个文件时末尾补一行 total。\n"
-	    "三种方式（顺序 / 多文件并行 / 单文件切分）的输出逐字节相同（含错误信息与退出码）。\n"
+	    "没有 FILE 参数时读标准输入（只有一条流，-j 对它无效）。\n"
+	    "多个文件时末尾补一行 total。\n"
+	    "两种方式（顺序 / 并行）的输出逐字节相同（含错误信息与退出码）。\n"
 	    "\n"
 	    "Example:\n"
 	    "  %s -j 4 logs/*.log      # 4 个线程并行统计多个文件\n"
@@ -684,31 +815,25 @@ int main(int argc, char *argv[]) {
 
 		if (nfiles == 0) {
 			/* 没有文件名参数时读标准输入，这样可以直接接管道 */
-			file_slot slot;
+			wc_stat st = {0, 0, 0};
 
-			memset(&slot, 0, sizeof slot);
-			count_one(&slot, stdin);
+			wc_status status = wc_count_stream(stdin, &st);
+			if (status != WC_OK) {
+				(void)fprintf(stderr, "wordcount: (stdin): %s: %s\n",
+				              wc_status_string(status), strerror(errno));
+				return 1;
+			}
 
 			/* 标准输入只有一份，-j 对它没有意义，直接走同一套输出逻辑 */
-			return report_slot(&slot, &sum);
+			print_stat(&st, NULL);
+			return 0;
 		}
 
 		/*
-		 * 单文件 + -j：切分这个文件本身。jobs 为 1 时不切——
-		 * 一个工作线程的"并行"只是多一次入队与出队，纯属开销。
-		 * 多文件时仍走按文件分发，两条路径不叠加：那需要一个带权重的
-		 * 共享队列，是另一个设计问题（见 README 9.6）。
+		 * -j 1 等价于顺序：一个工作线程的"并行"只是多一次入队与出队，
+		 * 而且顺序路径不必为每个文件多开一个区间任务。
 		 */
-		if (jobs >= 2 && nfiles == 1) {
-			int r = run_split_file(paths[0], jobs, &sum);
-
-			if (r == SPLIT_SKIP) {
-				/* 不是普通文件、太小，或者整段落在同一个单词里 */
-				failed = run_sequential(paths, nfiles, &sum);
-			} else {
-				failed = (r == SPLIT_FAILED) ? 1 : 0;
-			}
-		} else if (jobs >= 1 && nfiles >= 2) {
+		if (jobs >= 2) {
 			failed = run_parallel(paths, nfiles, jobs, &sum);
 		} else {
 			failed = run_sequential(paths, nfiles, &sum);
