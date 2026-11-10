@@ -233,6 +233,11 @@ bench: $(CLI) | $(OUT)
 	@# 造输入与取数的逻辑可读——塞进 Makefile 的续行里只剩转义符。
 	@echo
 	@sh tests/bench_align_sparse.sh $(CLI) $(OUT)/bench_sparse
+	@# 混合负载（第八轮）：一个大文件 + 若干个刚好不切的小文件。前几组量的都是
+	@# "一种输入形态下的吞吐"，这一组量的是"任务划分方式"本身——老实现的完工
+	@# 时间下界是最大那个文件的单线程耗时，可以直接用 -j 1 测出来当对照。
+	@echo
+	@sh tests/bench_mix_weight.sh $(CLI) $(OUT)/bench_mix
 
 clean:
 	rm -rf $(OUT)
