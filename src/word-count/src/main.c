@@ -34,6 +34,12 @@
  * 最坏情况退化成单线程（那正是"按文件分发"的老问题，只是从文件级挪到了区间级）。
  * 实现上不需要调度器：区间长度已经等价于耗时，一次 qsort 就够。
  *
+ * 第三条约束来自资源：切开的文件要让它的区间任务共用一个 fd（一次
+ * fstat 定尺寸、多次 pread 读），这个 fd 于是从规划阶段活到任务结束，
+ * 同时打开的文件数就等于可切文件数。文件多到撞上 RLIMIT_NOFILE 时，
+ * 超出的文件退化成整文件任务而不是报错退出——配额（fd_budget）在开工前
+ * 按软上限算出，见 fd_budget_init。
+ *
  * 为什么并发放在驱动层而不是模块里：libwordcount.a 的使用者不一定需要并发，
  * 更不一定愿意链接 pthread。并发属于"怎么调度 I/O 与 CPU"，不属于"怎么数词"，
  * 所以 wordcount.h 里没有任何线程相关的东西。
@@ -44,9 +50,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -118,6 +126,82 @@
 _Static_assert(MIN_CHUNK_BYTES / ALIGN_BUDGET_DIV > 0,
                "段长下限除以预算除数必须是正数");
 
+/*
+ * fd 配额 = RLIMIT_NOFILE 的软上限 - 预留量，其中预留量包含了
+ * "同时进行的整文件任务"这一项（见 fd_budget_init）。这里记的是
+ * 除它以外的固定部分。
+ */
+#define FD_RESERVE_EXTRA 4
+
+/* 规划阶段的 fd 配额：不是"文件数上限"，而是"同时能保留几个切分 fd" */
+typedef struct {
+	long long limit;    /* RLIMIT_NOFILE 的软上限；-1 表示无上限 */
+	int       reserve;  /* 从上限里扣掉的预留量 */
+	int       budget;   /* 最多能同时持有几个切分 fd */
+	int       held;     /* 当前已持有几个 */
+	int       degraded; /* 因预算用尽而放弃切分的文件数 */
+} fd_budget;
+
+/*
+ * 算出这次的配额。
+ *
+ * 预留量的构成（这就是"为什么不是随便填个常数"）：
+ *
+ *   jobs 个  整文件任务在各自线程里 fopen 一个文件。整文件任务不占切分配额
+ *            （它们是任务里打开、读完就关），但它们与切分任务同时进行，
+ *            最坏情况是 jobs 个工作线程各持一个。漏掉这一项时，
+ *            -j 16 配 ulimit -n 24 会让整文件任务的 open 拿到 EMFILE，
+ *            于是"配额算得没错、程序照样出错"。
+ *   3 个     stdin / stdout / stderr。
+ *   1 个     规划阶段的临时打开：预算耗尽之后仍要 open + fstat + close 才知道
+ *            文件多大（LPT 的权重需要这个值），这一步不能在配额用光时失败。
+ *
+ * 也就是说 held + jobs + 3 + 1 <= limit 恒成立，这是本函数唯一要保证的性质。
+ */
+static void fd_budget_init(fd_budget *b, int jobs) {
+	struct rlimit rl;
+
+	b->limit    = -1;
+	b->reserve  = 0;
+	b->budget   = 0;
+	b->held     = 0;
+	b->degraded = 0;
+
+	if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+		/*
+		 * 取不到上限时按"一个都不保留"处理。这个方向是保守的：切分只是
+		 * 加速手段，退化之后结果仍然正确；反过来假定上限很大，就会在真正
+		 * 受限的环境里把配额用光，把"慢一点"变成"跑不完"。
+		 */
+		return;
+	}
+
+	b->reserve = jobs + FD_RESERVE_EXTRA;
+
+	/*
+	 * rlim_t 是无符号类型，RLIM_INFINITY 就是它的全 1 值，不能直接参与
+	 * 减法后再转 int（会变成 -1 或者巨大正数）。两者都归到 INT_MAX：
+	 * 上限大到这个程度时，配额已经不是约束，"上限不可达"就够了。
+	 */
+	if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > (rlim_t)INT_MAX) {
+		b->budget = INT_MAX;
+		return;
+	}
+
+	b->limit = (long long)rl.rlim_cur;
+
+	if (rl.rlim_cur > (rlim_t)b->reserve) {
+		b->budget = (int)rl.rlim_cur - b->reserve;
+	} else {
+		/*
+		 * 上限连预留量都不够：一个切分 fd 都不保留，全部文件走整文件任务。
+		 * 这里不能取负数——负的 budget 会让 held >= budget 恒真（行为正确）
+		 * 但表达含糊，而且打印出来是错的。
+		 */
+		b->budget = 0;
+	}
+}
+
 static void print_stat(const wc_stat *st, const char *label);
 
 /* ------------------------------------------------------------------
@@ -168,7 +252,8 @@ typedef struct {
  * fd 只在"这个文件真的要切"时保持打开：切分期间所有段共用一个 fd，
  * 靠 pread 的"不动偏移"保证互不干扰，同时避免"规划时 fstat 的 inode 与
  * 执行时打开的 inode 不是同一个"这个 TOCTOU 窗口。代价是同时打开的文件数
- * 等于可切文件数，文件很多时可能撞上 RLIMIT_NOFILE（见 README 9.5）。
+ * 等于可切文件数，因此需要一份配额（fd_budget）；配额用尽的文件退化成
+ * 整文件任务（见 fd_budget_init）。
  */
 typedef struct {
 	const char *path;
@@ -193,8 +278,11 @@ typedef struct {
  * 都退回整文件任务。管道与终端不可定位；目录与设备文件的 st_size
  * 没有"统计开始时"这个确定值（fstat 的 st_size 对目录的含义是实现相关的），
  * 对它们做定长切分没有意义。
+ *
+ * 还有一条外部条件：fb 里剩下的配额。配额用尽时同样退回整文件任务，
+ * 理由见 FD_RESERVE 的说明。
  */
-static void plan_file(file_entry *e, int jobs) {
+static void plan_file(file_entry *e, int jobs, fd_budget *fb) {
 	struct stat sb;
 	off_t       size;
 	int         nchunks;
@@ -235,6 +323,23 @@ static void plan_file(file_entry *e, int jobs) {
 	e->known_size  = 1;
 
 	if (size < (off_t)(2 * MIN_CHUNK_BYTES) || jobs < 2) {
+		(void)close(fd);
+		return;
+	}
+
+	/*
+	 * fd 配额用尽：不再尝试切分，直接退化成整文件任务。
+	 *
+	 * 这个判断必须在对齐扫描之前。扫描的产出是一组区间，而区间任务只能
+	 * 靠"规划阶段留下的那个 fd"来读（TASK_RANGE 走 pread），没有 fd 就
+	 * 用不上；先把切点算出来再发现留不住 fd，扫描读的那些字节全是白读。
+	 *
+	 * 计数只统计"因为配额而没切"的文件，所以判定放在这里而不是放在
+	 * 后面 ranges 算完之后——那样会把"对齐失败退回一段"的文件也算进来，
+	 * 混淆两个不同的原因。
+	 */
+	if (fb->held >= fb->budget) {
+		fb->degraded++;
 		(void)close(fd);
 		return;
 	}
@@ -397,6 +502,7 @@ static void plan_file(file_entry *e, int jobs) {
 	e->fd      = fd;
 	e->ranges  = ranges;
 	e->nranges = nranges;
+	fb->held++;
 }
 
 /* ------------------------------------------------------------------
@@ -485,6 +591,7 @@ static int run_parallel(const char *const *paths, int nfiles, int jobs, wc_stat 
 	seg_task   *tasks  = NULL;
 	seg_task  **order  = NULL;
 	threadpool *pool   = NULL;
+	fd_budget   fdb;
 	int         ntasks = 0;
 	int         nwhole = 0;
 	int         pos    = 0;
@@ -496,9 +603,11 @@ static int run_parallel(const char *const *paths, int nfiles, int jobs, wc_stat 
 		return 1;
 	}
 
+	fd_budget_init(&fdb, jobs);
+
 	for (int i = 0; i < nfiles; i++) {
 		entries[i].path = paths[i];
-		plan_file(&entries[i], jobs);
+		plan_file(&entries[i], jobs, &fdb);
 
 		if (entries[i].aborted) {
 			failed = 1;
@@ -512,6 +621,33 @@ static int run_parallel(const char *const *paths, int nfiles, int jobs, wc_stat 
 		ntasks += entries[i].ntask;
 		if (entries[i].nranges == 0) {
 			nwhole++;
+		}
+	}
+
+	/*
+	 * fd 配额是第九轮新增的可观测量，理由与调度行相同（5.9 / 5.10 / 5.11
+	 * 三个假通过都出在"某条路径根本没被走到，断言却照样成立"）：一条
+	 * "输出与顺序一致"的断言在配额根本没生效时也成立，只有把"可用几个、
+	 * 实际持有几个、几个被降级"打出来，测试才能区分
+	 * "配额生效并优雅退化"与"配额压根没被算过"。
+	 *
+	 * 没有文件需要 fd 时（held 与 degraded 都为 0）这一行不打印：
+	 * tests/check_split.sh 有一条"小于 2 MiB 的文件不该产生任何记录"，
+	 * 靠的就是"根本没走切分"时 stderr 为空。无条件打印会把这层断言降级成
+	 * "有一行与切分无关的记录"，而它检验的正是"切分路径没被走到"。
+	 */
+	if (getenv("WORDCOUNT_TRACE_SPLIT") != NULL &&
+	    (fdb.held > 0 || fdb.degraded > 0)) {
+		if (fdb.limit < 0) {
+			(void)fprintf(stderr,
+			              "wordcount: 文件描述符配额：软上限 无上限，已持有 %d 个，"
+			              "因配额用尽放弃切分的文件 %d 个\n",
+			              fdb.held, fdb.degraded);
+		} else {
+			(void)fprintf(stderr,
+			              "wordcount: 文件描述符配额：软上限 %lld、预留 %d、可用 %d 个，"
+			              "已持有 %d 个，因配额用尽放弃切分的文件 %d 个\n",
+			              fdb.limit, fdb.reserve, fdb.budget, fdb.held, fdb.degraded);
 		}
 	}
 

@@ -8,6 +8,7 @@
 #   make test       构建并运行单元测试
 #   make check      与 wc 交叉验证 + 并行/顺序一致性 + 切分（含对齐读取预算）
 #                   + 多文件与切分共用一条队列（check_mix.sh）
+#                   + fd 配额在 RLIMIT_NOFILE 不足时的退化（check_fdlimit.sh）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make tsan       TSan 重新构建并跑测试（产物在 bin/tsan/）
 #   make bench      缓冲区大小、并行度、对齐读取预算的吞吐测量
@@ -120,6 +121,8 @@ check: $(CLI)
 	@sh tests/check_align_budget.sh $(CLI)
 	@echo
 	@sh tests/check_mix.sh $(CLI)
+	@echo
+	@sh tests/check_fdlimit.sh $(CLI)
 
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1
 
