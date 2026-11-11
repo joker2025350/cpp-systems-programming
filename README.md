@@ -13,7 +13,7 @@ build target — not a single-file exercise.
 | [`thread-pool`](src/thread-pool) | Fixed-size pool with an FIFO task queue, condition-variable handoff, a drain-on-destroy shutdown, and optional bounded queues with three backpressure modes: reject, block, or block until a monotonic deadline; both the submission and the drain barrier carry a deadline; the mutex and the condition variables live in a separately allocated `tp_sync` so every `const` query locks without a cast | `threadpool.h` | 215 checks · 64 end-to-end · race stress (destroy vs barrier waiter, ASan) · ASan/UBSan · TSan |
 | [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets, prepared statements, BLOB round-trip | `mysqlclient.h` | 119 checks · 41 end-to-end · 50 live checks · 24 streaming checks · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list plus a hash index that grows and shrinks with the load factor; seeded hashing (`mix64(FNV-1a ^ seed)`, seed 0 keeps the pre-1.4 bucket layout) so a name-to-bucket mapping cannot be built offline; text format that round-trips byte for byte; byte-order sorting over a caller-supplied pointer array; save-failure injection (read-only dir, `RLIMIT_FSIZE`, failing `rename`) | `contacts.h` | 242 checks · 466 allocation-failure injections · 20 save-failure injections · 43 seed checks · 50 end-to-end · ASan/UBSan |
-| [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` (one shared queue of byte-range tasks, submitted longest-first; split points are aligned to separators with an alignment scan budgeted at `min(chunk / 4, 1 MiB)`) | `wordcount.h` | 266 checks · 28 parallel-vs-sequential comparisons · 87 single-file-split comparisons · 72 alignment-budget comparisons · 24 mixed-load scheduling comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
+| [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` (one shared queue of byte-range tasks, submitted longest-first; split points are aligned to separators with an alignment scan budgeted at `min(chunk / 4, 1 MiB)`; the number of split files kept open is bounded by an fd quota derived from `RLIMIT_NOFILE`, and files beyond it fall back to whole-file tasks) | `wordcount.h` | 266 checks · 28 parallel-vs-sequential comparisons · 87 single-file-split comparisons · 72 alignment-budget comparisons · 24 mixed-load scheduling comparisons · 12 fd-quota comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
 
 All five modules are libraries: the CLI links against `lib*.a` and never
 recompiles the module sources, so "this module can be linked independently" is
@@ -34,6 +34,9 @@ needs neither pthread nor a worker pool:
   workers idle behind the largest one — a 64 MiB file plus seven 1 MiB files runs 2.5×
   faster than the old floor, which is the 64 MiB file's single-threaded time
   (`wc_align_chunk` + `wc_count_fd_range` in the library, threading stays in the driver).
+  Each split file holds one descriptor from planning until every task is done, so the
+  count of open files is capped by an fd quota computed from `RLIMIT_NOFILE`; files past
+  the quota fall back to whole-file tasks instead of failing with `EMFILE`.
 - `concurrent-lock` submits one task per batch of increments (`-p`). That second
   consumer exists to answer a different question: how much of a throughput number
   is the counter, and how much is the dispatch that carries it. Measured dispatch
