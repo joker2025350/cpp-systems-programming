@@ -191,11 +191,34 @@ void mc_rows_free(mc_rows *rows);
  * 调用方不能保存指针，需要保留时必须自己拷贝。
  *
  * length 数组本身也属于"回调期间有效"，同样不能保存。
+ *
+ * 列名不走这个回调：它是结果集的属性而不是行的属性，因此在
+ * mc_query_each_ex 里由单独的 mc_cols_fn 在交付第一行之前调用一次。
  * ------------------------------------------------------------------ */
 
 /* 返回 0 继续取下一行，返回非 0 停止。 */
 typedef int (*mc_row_fn)(void *ctx, const char *const *cell,
                          const size_t *length, size_t cols);
+
+/* 列名回调：一次拿到整个结果集的列名，返回 0 继续取数，返回非 0 放弃取数。
+ *
+ * 单独成一个回调，而不是把 names 加进 mc_row_fn，理由是列名属于结果集、
+ * 不属于行：它是服务器元数据的一部分，在取到第一行之前就已经完整。
+ * 每行都传一遍既浪费，也表达不出"第一行之前就知道"这个事实——
+ * 而"打印表头"恰好必须发生在第一行之前，用行回调实现就得先把第一行
+ * 存在调用方那边等表头打完，为一个本来不存在的顺序依赖增加状态。
+ *
+ * 三条契约：
+ *   - 语句执行成功就调用，**与结果集有几行无关**。0 行的结果集同样有列名，
+ *     因为元数据来自服务器，不是从行里推断的。
+ *   - names[j] 非 NULL 且以 '\0' 结尾，顺序与行回调里 cell[j] 一致；
+ *     names 数组与其中的字符串在整个 mc_query_each_ex 调用期间都有效，
+ *     所以行回调里可以继续读它们，不需要自己拷贝。
+ *   - 返回非 0 表示调用方不需要这些行：函数随即返回 MC_OK，*out_rows 为 0，
+ *     一行都不交付。这与行回调的"提前停止"是同一个语义——都是调用方
+ *     主动放弃，不是错误，因此不能用错误码表示。
+ */
+typedef int (*mc_cols_fn)(void *ctx, const char *const *names, size_t cols);
 
 /* 逐行取数：每一行都调用一次 fn，max 行内存占用与总行数无关。
  *
@@ -223,6 +246,21 @@ typedef int (*mc_row_fn)(void *ctx, const char *const *cell,
  */
 mc_status mc_query_each(mc_conn *conn, const char *sql,
                         mc_row_fn fn, void *ctx, size_t *out_rows);
+
+/* 同 mc_query_each，另外在交付第一行之前调用一次 on_cols 交付列名。
+ *
+ * on_cols 为 NULL 时行为与 mc_query_each 逐字节相同（连内存分配也不做）。
+ * 列名是拷贝出来的：实现从服务器元数据里取出后放进自己的缓冲区，
+ * 元数据对象随即释放，因此调用方看到的 names 不依赖 libmysqlclient
+ * 的任何对象生命周期。
+ *
+ * 顺序固定为：prepare → execute → on_cols（若有）→ 逐行 fn。执行失败
+ * （语法错、表不存在、权限不足）发生在 on_cols 之前，此时一行列名也
+ * 不会交付——调用方看到一个回调都没被调用的失败，不会误以为表头已经
+ * 打出去了。 */
+mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
+                           mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                           size_t *out_rows);
 
 /* ------------------------------------------------------------------
  * 大字段（BLOB）

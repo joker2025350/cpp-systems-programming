@@ -115,12 +115,12 @@ check_contains "结果集带列名 id" "id" "$OUT"
 check_contains "结果集带列名 note" "note" "$OUT"
 
 # ------------------------------------------------------------
-# 1b. 流式取数（each）：行内容必须与 sql 逐字节相同
+# 1b. 流式取数（each）：输出必须与 sql 逐字节相同
 #
-# sql 多打印一行表头（列名），each 的回调只拿到行内容，
-# 因此比对时去掉表头。除此之外必须完全一致：NULL 打印成 NULL、
-# 空串打印成空字段——这两条在流式路径上走的是另一段代码
-# （bind_result + fetch_column），不能拿 sql 的输出代之。
+# 两个子命令都打印表头：列名由列名回调在交付第一行之前给出，
+# 因此整份输出可以整体 cmp，不再需要"去掉表头再比"。
+# NULL 打印成 NULL、空串打印成空字段这两条在流式路径上走的是另一段代码
+# （bind_result + fetch_column），cmp 一并覆盖。
 # ------------------------------------------------------------
 
 "$CLI" sql -q "SELECT id, note FROM $TBL ORDER BY id" \
@@ -131,25 +131,45 @@ check_exit "sql 取三行" 0 $?
 	> "$TMPD/each.out" 2>/dev/null
 check_exit "each 退出码 0" 0 $?
 
-tail -n +2 "$TMPD/sql.out" > "$TMPD/sql.body"
 CHECKS=$((CHECKS + 1))
-if cmp -s "$TMPD/sql.body" "$TMPD/each.out"; then
-	printf 'ok    each 与 sql 的行内容逐字节相同\n'
+if cmp -s "$TMPD/sql.out" "$TMPD/each.out"; then
+	printf 'ok    each 与 sql 的输出逐字节相同（含表头）\n'
 else
 	FAILS=$((FAILS + 1))
-	printf 'FAIL  %-46s 输出不同\n' "each 与 sql 的行内容"
-	diff "$TMPD/sql.body" "$TMPD/each.out" | head -6
+	printf 'FAIL  %-46s 输出不同\n' "each 与 sql 的输出"
+	diff "$TMPD/sql.out" "$TMPD/each.out" | head -6
 fi
+
+# 表头单独确认一次：cmp 通过也可能是两边都不打印表头
+check_equal "each 的表头就是列名" \
+	"$("$CLI" each -q "SELECT id, note FROM $TBL LIMIT 1" 2>/dev/null | head -1)" \
+	"$(printf 'id\tnote')"
+
+# 0 行的结果集：表头照打（元数据与行数无关），摘要报 0 行
+check_equal "each 在 0 行时仍打印表头" \
+	"$("$CLI" each -q "SELECT id, note FROM $TBL WHERE id < 0" 2>/dev/null)" \
+	"$(printf 'id\tnote')"
+
+ERR=$("$CLI" each -q "SELECT id, note FROM $TBL WHERE id < 0" 2>&1 >/dev/null)
+check_contains "each 在 0 行时的摘要" "0 行" "$ERR"
 
 ERR=$("$CLI" each -q "SELECT id FROM $TBL ORDER BY id" 2>&1 >/dev/null)
 check_contains "each 的行数摘要走 stderr" "3 行" "$ERR"
 
-# 行数上限：出口码仍是 0（主动停止不是失败），stderr 报告的交付行数受限
+# 行数上限：出口码仍是 0（主动停止不是失败），表头照打，只出一行数据
 OUT=$("$CLI" each -q "SELECT id FROM $TBL ORDER BY id" -n 1 2>/dev/null)
-check_equal "each -n 1 只输出一行" "$OUT" "1"
+check_equal "each -n 1 输出表头加一行" "$OUT" "$(printf 'id\n1')"
 
 ERR=$("$CLI" each -q "SELECT id FROM $TBL ORDER BY id" -n 2 2>&1 >/dev/null)
 check_contains "each -n 2 只交付两行" "2 行" "$ERR"
+
+# 表达式列名：没有别名时服务器给的就是表达式原文
+OUT=$("$CLI" each -q "SELECT 1 + 1" 2>/dev/null)
+check_equal "each 打印表达式列名" "$OUT" "$(printf '1 + 1\n2')"
+
+# UTF-8 列名按字节原样打印
+OUT=$("$CLI" each -q "SELECT 1 AS \`睡蓝蕉\`" 2>/dev/null)
+check_equal "each 打印 UTF-8 列名" "$OUT" "$(printf '睡蓝蕉\n1')"
 
 # 不返回结果集的语句
 OUT=$("$CLI" each -q "UPDATE $TBL SET note='x' WHERE id=999" 2>&1)

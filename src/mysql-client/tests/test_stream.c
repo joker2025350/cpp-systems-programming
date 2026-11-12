@@ -58,6 +58,20 @@ static void check_true(const char *name, int cond) {
 	else      fail(name, "条件不成立");
 }
 
+static void check_str(const char *name, const char *actual, const char *expected) {
+	char detail[192];
+
+	if (actual != NULL && expected != NULL && strcmp(actual, expected) == 0) {
+		ok(name);
+		return;
+	}
+
+	(void)snprintf(detail, sizeof detail, "实际 \"%s\"，期望 \"%s\"",
+	               (actual != NULL) ? actual : "(null)",
+	               (expected != NULL) ? expected : "(null)");
+	fail(name, detail);
+}
+
 /* ------------------------------------------------------------------
  * 建连：与驱动层同样的三层来源里只用前两层（环境变量 + 内置默认值），
  * 命令行这一层对测试没有意义。
@@ -198,6 +212,100 @@ static int count_row(void *ctx, const char *const *cell,
 }
 
 static const char *TBL = "mc_stream_t";
+
+/*
+ * ---- 列名回调的夹具 ----
+ *
+ * saved[] 里存的是**列名回调收到的指针**，不是拷贝：头文件的契约说
+ * names 与其中的字符串在整个 mc_query_each_ex 调用期间有效，那么行回调
+ * 里继续解引用它们就是合法的，而不该出现的释放会被 ASan 当场抓住。
+ * cols_fnv 是列名回调里算的指纹，行回调里用同一批指针重算一遍再比——
+ * 指针"还在但内容被改过"（缓冲区被复用）也能被发现。
+ */
+typedef struct {
+	size_t      calls;          /* 列名回调被调用几次 */
+	size_t      cols;           /* 列名回调收到的列数 */
+	const char *saved[8];       /* 存下的列名指针（夹具上限 8 列） */
+	size_t      rows;           /* 行回调被调用次数 */
+	int         stop;           /* 非 0：列名回调直接放弃取数 */
+	int         cols_bad;       /* 行回调看到的列数与列名回调不一致 */
+	int         names_bad;      /* 行回调里重算的指纹与列名回调不同 */
+	unsigned long long fnv;     /* 列名回调里算的列名指纹 */
+	char        joined[256];    /* 用 '|' 连起来的列名，便于一条断言比全部 */
+} names_state;
+
+static unsigned long long fnv_str(unsigned long long h, const char *s) {
+	if (s == NULL) {
+		h ^= 0xffu;
+		return h * 1099511628211ull;
+	}
+	for (; *s != '\0'; s++) {
+		h ^= (unsigned char)*s;
+		h *= 1099511628211ull;
+	}
+	return h;
+}
+
+static unsigned long long names_fnv(const char *const *names, size_t cols) {
+	unsigned long long h = 14695981039346656037ull;
+	size_t             j;
+
+	for (j = 0; j < cols; j++) h = fnv_str(h, names[j]);
+	return h;
+}
+
+/* 把列名用 '|' 连起来。列数超过夹具上限时只连前 8 个（cols_bad 会报）。 */
+static void join_names(names_state *st) {
+	size_t used = 0;
+	size_t j;
+
+	st->joined[0] = '\0';
+
+	for (j = 0; j < st->cols && j < 8; j++) {
+		int n = snprintf(st->joined + used, sizeof st->joined - used, "%s%s",
+		                 (j == 0) ? "" : "|",
+		                 (st->saved[j] != NULL) ? st->saved[j] : "(null)");
+
+		if (n < 0 || (size_t)n >= sizeof st->joined - used) break;
+		used += (size_t)n;
+	}
+}
+
+static int capture_cols(void *ctx, const char *const *names, size_t cols) {
+	names_state *st = (names_state *)ctx;
+	size_t       j;
+
+	st->calls++;
+	st->cols = cols;
+	if (cols > 8) st->cols_bad = 1;
+
+	for (j = 0; j < cols && j < 8; j++) st->saved[j] = names[j];
+	st->fnv = names_fnv(st->saved, cols < 8 ? cols : 8);
+
+	join_names(st);
+
+	return st->stop;
+}
+
+/*
+ * 行回调里把 saved 里的指针再读一遍、重算指纹。
+ * 指针若已失效（代码把名字放在语句对象上、又在行循环里 close 了语句），
+ * ASan 会当场报 heap-use-after-free；缓冲区若被复用，指纹对不上。
+ */
+static int names_row(void *ctx, const char *const *cell,
+                     const size_t *length, size_t cols) {
+	names_state *st = (names_state *)ctx;
+	size_t       n = (cols < 8) ? cols : 8;
+
+	(void)cell;
+	(void)length;
+
+	if (st->cols != cols) st->cols_bad = 1;
+	if (names_fnv(st->saved, n) != st->fnv) st->names_bad = 1;
+
+	st->rows++;
+	return 0;
+}
 
 static int run_correctness(void) {
 	mc_conn     *conn = NULL;
@@ -377,7 +485,104 @@ static int run_correctness(void) {
 	st = mc_query_each(conn, "", count_row, &cnt, &got);
 	check_long("空 SQL 被拒绝", st, MC_ERR_PARAM);
 
-	/* ---- 6. 收尾 ---- */
+	/* ---- 6. 列名（mc_query_each_ex） ---- */
+	{
+		names_state ns;
+		char        longname[65];
+
+		/* 6a. 主查询：列名与 mc_query 的 names 逐个相同，行数不变 */
+		memset(&ns, 0, sizeof ns);
+		(void)snprintf(sql, sizeof sql,
+		               "SELECT id, s, n, b FROM %s ORDER BY id", TBL);
+		got = 0;
+		st = mc_query_each_ex(conn, sql, capture_cols, names_row, &ns, &got);
+		check_long("each_ex 返回 MC_OK", st, MC_OK);
+		check_long("列名回调恰好被调用 1 次", (long)ns.calls, 1);
+		check_long("列名回调收到 4 列", (long)ns.cols, 4);
+		check_str("列名内容与顺序", ns.joined, "id|s|n|b");
+		check_long("行回调看到的列数与列名回调一致", ns.cols_bad, 0);
+		check_long("行回调里列名指针仍然有效", ns.names_bad, 0);
+		check_long("交付行数不受列名回调影响", (long)got, ROWS);
+		check_long("行回调次数", (long)ns.rows, ROWS);
+
+		/* 6b. 0 行的结果集同样有列名：元数据与行数无关 */
+		memset(&ns, 0, sizeof ns);
+		(void)snprintf(sql, sizeof sql, "SELECT id FROM %s WHERE id < 0", TBL);
+		got = 0;
+		st = mc_query_each_ex(conn, sql, capture_cols, names_row, &ns, &got);
+		check_long("空结果集返回 MC_OK", st, MC_OK);
+		check_long("空结果集也交付列名", (long)ns.calls, 1);
+		check_str("空结果集的列名", ns.joined, "id");
+		check_long("空结果集不交付行", (long)got, 0);
+		check_long("空结果集行回调未被调用", (long)ns.rows, 0);
+
+		/* 6c. 别名是服务器给的名字，不是 SQL 里的表达式 */
+		memset(&ns, 0, sizeof ns);
+		st = mc_query_each_ex(conn, "SELECT 1 AS a, 2 + 2 AS b, 'x' AS c",
+		                      capture_cols, names_row, &ns, &got);
+		check_long("别名查询返回 MC_OK", st, MC_OK);
+		check_str("列名取服务器的别名", ns.joined, "a|b|c");
+
+		/* 6d. 没有别名时服务器给的就是表达式原文 */
+		memset(&ns, 0, sizeof ns);
+		st = mc_query_each_ex(conn, "SELECT 1 + 1", capture_cols, names_row,
+		                      &ns, &got);
+		check_long("表达式查询返回 MC_OK", st, MC_OK);
+		check_str("无别名时列名是表达式原文", ns.joined, "1 + 1");
+
+		/* 6e. UTF-8 列名按字节原样交付（9 字节） */
+		memset(&ns, 0, sizeof ns);
+		st = mc_query_each_ex(conn, "SELECT 1 AS `睡蓝蕉`", capture_cols,
+		                      names_row, &ns, &got);
+		check_long("UTF-8 列名查询返回 MC_OK", st, MC_OK);
+		check_str("UTF-8 列名不被转义", ns.joined, "睡蓝蕉");
+		check_long("UTF-8 列名字节数", (long)strlen(ns.joined), 9);
+
+		/* 6f. 64 字节的列名不被截断——这条挡的是"按固定长度拷贝" */
+		memset(longname, 'a', 64);
+		longname[64] = '\0';
+		memset(&ns, 0, sizeof ns);
+		(void)snprintf(sql, sizeof sql, "SELECT 1 AS `%s`", longname);
+		st = mc_query_each_ex(conn, sql, capture_cols, names_row, &ns, &got);
+		check_long("64 字节列名查询返回 MC_OK", st, MC_OK);
+		check_long("64 字节列名完整交付", (long)strlen(ns.joined), 64);
+		check_str("64 字节列名内容", ns.joined, longname);
+
+		/* 6g. 列名里的空格是内容，不是分隔符 */
+		memset(&ns, 0, sizeof ns);
+		st = mc_query_each_ex(conn, "SELECT 1 AS `a b`", capture_cols,
+		                      names_row, &ns, &got);
+		check_long("含空格的列名查询返回 MC_OK", st, MC_OK);
+		check_str("列名里的空格原样保留", ns.joined, "a b");
+
+		/* 6h. 列名回调返回非 0：放弃取数，不是错误 */
+		memset(&ns, 0, sizeof ns);
+		ns.stop = 1;
+		got = 777;
+		(void)snprintf(sql, sizeof sql,
+		               "SELECT id, s, n, b FROM %s ORDER BY id", TBL);
+		st = mc_query_each_ex(conn, sql, capture_cols, names_row, &ns, &got);
+		check_long("列名回调放弃时返回 MC_OK", st, MC_OK);
+		check_long("列名回调放弃时交付 0 行", (long)got, 0);
+		check_long("列名回调放弃时行回调未被调用", (long)ns.rows, 0);
+
+		/* 6i. 执行失败时一行列名都不交付：调用方不会误以为表头已打出 */
+		memset(&ns, 0, sizeof ns);
+		st = mc_query_each_ex(conn, "SELECT id FROM mc_no_such_table",
+		                      capture_cols, names_row, &ns, &got);
+		check_true("表不存在时返回失败", st != MC_OK);
+		check_long("失败时不调用列名回调", (long)ns.calls, 0);
+		check_long("失败时不交付行", (long)got, 0);
+
+		/* 6j. 提前停止后连接仍可用（列名路径也要排空结果集） */
+		memset(&cnt, 0, sizeof cnt);
+		cnt.stop_at = 2;
+		(void)snprintf(sql, sizeof sql, "SELECT id FROM %s ORDER BY id", TBL);
+		st = mc_query_each(conn, sql, count_row, &cnt, &got);
+		check_long("列名路径之后连接仍可用", st, MC_OK);
+	}
+
+	/* ---- 7. 收尾 ---- */
 	(void)mc_exec(conn, "DROP TABLE IF EXISTS mc_stream_t", NULL);
 	mc_close(conn);
 

@@ -10,6 +10,7 @@
 #   make check-live 需要真实数据库的往返验证，连接参数走环境变量
 #   make check-scale 百万行下的峰值内存对照（物化 vs 流式，需要数据库）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
+#   make sanitize-live 同 sanitize，另把需要数据库的两套用例也跑在插桩版上
 #   make bench      文件读写的吞吐测量
 #   make clean      删除 bin/（含全部变体）
 #
@@ -80,7 +81,8 @@ BENCHBIN := $(OUT)/bench_file
 LIB_OBJ  := $(OUT)/mysqlclient.o $(OUT)/options.o $(OUT)/status.o $(OUT)/file.o
 CLI_OBJ  := $(OUT)/main.o
 
-.PHONY: all lib cli test check check-live check-scale sanitize sanitize-run bench clean
+.PHONY: all lib cli test check check-live check-scale sanitize sanitize-run \
+        sanitize-live sanitize-live-run bench clean
 
 all: lib cli
 
@@ -166,6 +168,24 @@ sanitize-run: all $(TESTPURE) $(TESTDB)
 	@echo "\n--- 用法与错误路径（ASan + UBSan）---"
 	@$(CLI) -h > /dev/null
 	@$(CLI) -H 127.0.0.1 -P 1 ping || true
+
+# 需要数据库的两套用例跑在插桩版上。
+#
+# 单独一个目标而不是并进 sanitize，是因为它要求一台连得上的服务器：
+# 把"需要环境"的东西塞进默认目标，等于让没有数据库的机器上一次都跑不通。
+# 递归的原因同 sanitize——命令行上传不下去 $(TESTSTRM) 这类含 OUT 的路径，
+# 让子 make 自己展开才不会错位。
+sanitize-live:
+	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
+		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' \
+		MYSQL_CFLAGS='$(MYSQL_CFLAGS)' MYSQL_LIBS='$(MYSQL_LIBS)' \
+		sanitize-live-run
+
+sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM)
+	@echo "\n--- 真实数据库往返（ASan + UBSan）---"
+	@sh tests/check_live.sh $(CLI)
+	@echo "\n--- 流式取数（ASan + UBSan）---"
+	@$(TESTSTRM)
 
 clean:
 	rm -rf $(OUT)

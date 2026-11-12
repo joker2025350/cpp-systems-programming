@@ -76,8 +76,8 @@ static void usage(FILE *out, const char *prog) {
 	    "  -h         显示本说明\n"
 	    "\n"
 	    "stdout 只输出数据，行数等摘要在 stderr，因此可以安全地接管道。\n"
-	    "each 不打印表头——游标接口回调的是行内容，不含列名；\n"
-	    "需要表头时用 sql（或对结果自行拼一行）。\n"
+	    "sql 与 each 的输出格式相同（表头 + 制表符分隔的行），\n"
+	    "同一查询用这两个子命令打印出来的字节完全一致。\n"
 	    "\n"
 	    "Example:\n"
 	    "  %s -H 127.0.0.1 -u root sql -q 'SELECT 1'\n"
@@ -247,6 +247,29 @@ typedef struct {
 } each_state;
 
 /*
+ * 表头。列名来自结果集元数据，在交付第一行之前就由库交到这里，
+ * 因此表头一定出现在数据之前——这也是列名要单独一个回调的理由：
+ * 若等第一行才知道列名，就得先把这一行缓存起来。
+ *
+ * 格式与 cmd_sql 的表头逐字节相同，两个子命令的输出才能直接 cmp。
+ */
+static int print_cols(void *ctx, const char *const *names, size_t cols) {
+	size_t j;
+
+	(void)ctx;
+
+	for (j = 0; j < cols; j++) {
+		/* 契约上 names[j] 不会是 NULL，这里仍然判一次：
+		 * printf("%s", NULL) 是未定义行为，代价只有一条比较。 */
+		(void)printf("%s%s", (j == 0) ? "" : "\t",
+		             (names[j] != NULL) ? names[j] : "");
+	}
+	if (cols > 0) (void)printf("\n");
+
+	return 0;
+}
+
+/*
  * 打印一行并决定是否继续。
  *
  * length 参数在这里刻意不用：打印走 printf("%s")，对文本列足够，
@@ -281,7 +304,7 @@ static int cmd_each(mc_conn *conn, const char *sql, unsigned long long limit) {
 	state.limit = limit;
 	state.rows  = 0;
 
-	st = mc_query_each(conn, sql, print_row, &state, &delivered);
+	st = mc_query_each_ex(conn, sql, print_cols, print_row, &state, &delivered);
 
 	if (st != MC_OK) {
 		/* 中途失败时 delivered 是"已经打印出去的那些行"，

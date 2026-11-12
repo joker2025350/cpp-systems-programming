@@ -495,14 +495,104 @@ static int col_reserve(stream_col *col, size_t need) {
 	return 0;
 }
 
-mc_status mc_query_each(mc_conn *conn, const char *sql,
-                        mc_row_fn fn, void *ctx, size_t *out_rows) {
+/*
+ * 从语句元数据里拷出列名。
+ *
+ * 为什么不直接把服务器给的名字递出去：那些字符串属于 MYSQL_RES，
+ * 而这个 MYSQL_RES 在函数返回前就被释放了，语句对象也会被 close。
+ * 调用方若在行回调里留着 names（头文件明确允许），指针就会失效。
+ * 所以整体拷进一段连续内存——与 mc_rows 的 name_arena 同一手法，
+ * 一次 malloc 而不是每列一次。
+ *
+ * 元数据在 prepare 之后就有，不必等到 fetch：列名是服务器对
+ * "这条语句返回什么形状"的回答，与返回几行无关。
+ *
+ * 失败时已把原因写进 conn 的错误缓冲，返回值即对应的状态码。
+ */
+static mc_status column_names_copy(mc_conn *conn, MYSQL_STMT *stmt, size_t cols,
+                                   char ***out_names, char **out_arena) {
+	MYSQL_RES   *meta  = NULL;
+	MYSQL_FIELD *field = NULL;
+	char       **names = NULL;
+	char        *arena = NULL;
+	char        *p;
+	size_t       total = 0;
+	size_t       n;
+	size_t       j;
+
+	meta = mysql_stmt_result_metadata(stmt);
+	if (meta == NULL) {
+		set_error(conn, "result_metadata", mysql_error(conn->mysql));
+		return MC_ERR_STMT;
+	}
+
+	n = (size_t)mysql_num_fields(meta);
+	if (n != cols) {
+		/* prepare 与 execute 之间列数不该变；真变了说明对元数据的
+		 * 假设已经失效，与其按 cols 读越界，不如直接报错。 */
+		set_error(conn, "result_metadata", "field count mismatch");
+		mysql_free_result(meta);
+		return MC_ERR_STMT;
+	}
+
+	for (j = 0; j < cols; j++) {
+		field = mysql_fetch_field_direct(meta, (unsigned int)j);
+		if (field == NULL || field->name == NULL) {
+			total += 1;
+			continue;
+		}
+		/* name_length 由服务器给出；万一某版本没填就退回 strlen。
+		 * 用 name_length 而不是 strlen 是为了不依赖"名字里没有 '\0'"。 */
+		total += ((field->name_length != 0) ? (size_t)field->name_length
+		                                    : strlen(field->name)) + 1;
+	}
+
+	names = (char **)calloc(cols, sizeof *names);
+	if (names != NULL) arena = (char *)malloc(total);
+	if (names == NULL || arena == NULL) {
+		set_error(conn, "alloc", "out of memory");
+		free(names);
+		free(arena);
+		mysql_free_result(meta);
+		return MC_ERR_NOMEM;
+	}
+
+	p = arena;
+	for (j = 0; j < cols; j++) {
+		field = mysql_fetch_field_direct(meta, (unsigned int)j);
+
+		names[j] = p;
+
+		if (field == NULL || field->name == NULL) {
+			*p++ = '\0';
+			continue;
+		}
+
+		n = (field->name_length != 0) ? (size_t)field->name_length
+		                              : strlen(field->name);
+		memcpy(p, field->name, n);
+		p[n] = '\0';
+		p += n + 1;
+	}
+
+	mysql_free_result(meta);
+
+	*out_names = names;
+	*out_arena = arena;
+	return MC_OK;
+}
+
+mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
+                           mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                           size_t *out_rows) {
 
 	MYSQL_STMT   *stmt = NULL;
 	MYSQL_BIND   *bind = NULL;
 	stream_col   *col = NULL;
 	const char  **cell = NULL;
 	size_t       *length = NULL;
+	char        **names = NULL;
+	char         *name_arena = NULL;
 	size_t        cols = 0;
 	size_t        j;
 	size_t        delivered = 0;
@@ -587,6 +677,27 @@ mc_status mc_query_each(mc_conn *conn, const char *sql,
 		goto out;
 	}
 	executed = true;
+
+	/*
+	 * 列名必须在第一行之前交付：驱动层打印表头要用它，而表头一旦晚于
+	 * 第一行出现，输出就不再是"表头 + 数据"。放在 execute 之后而不是
+	 * prepare 之后，是为了让"表不存在 / 权限不足"这类错误先于任何回调
+	 * 发生——调用方看到一个回调都没被调用的失败，就不会误以为表头已经
+	 * 打出去了。
+	 *
+	 * on_cols 为 NULL 时连这段拷贝都不做，因此 mc_query_each 的开销
+	 * 与加入本功能之前完全相同。
+	 */
+	if (on_cols != NULL) {
+		st = column_names_copy(conn, stmt, cols, &names, &name_arena);
+		if (st != MC_OK) goto out;
+
+		if (on_cols(ctx, (const char *const *)names, cols) != 0) {
+			/* 调用方放弃：与行回调返回非 0 同一语义，不是错误 */
+			st = MC_OK;
+			goto out;
+		}
+	}
 
 	for (;;) {
 		/* 库只在"值被截断"或"出错"时写这三个字段，不清零就会把
@@ -701,10 +812,17 @@ out:
 	free(bind);
 	free(cell);
 	free(length);
+	free(names);
+	free(name_arena);
 
 	if (out_rows != NULL) *out_rows = delivered;
 
 	return st;
+}
+
+mc_status mc_query_each(mc_conn *conn, const char *sql,
+                        mc_row_fn fn, void *ctx, size_t *out_rows) {
+	return mc_query_each_ex(conn, sql, NULL, fn, ctx, out_rows);
 }
 
 /* ------------------------------------------------------------------
