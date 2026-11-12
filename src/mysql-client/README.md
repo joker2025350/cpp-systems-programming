@@ -46,7 +46,7 @@ src/mysql-client/
 │   ├── test_db.c         接口层测试，20 项，含真实建连失败路径
 │   ├── check_cli.sh      命令行端到端检查，41 项，不需要数据库
 │   ├── check_live.sh     真实数据库往返验证，48 项，需要数据库
-│   ├── test_stream.c     流式取数，正确性 24 项 / 内存测量，需要数据库
+│   ├── test_stream.c     流式取数，正确性 56 项 / 内存测量，需要数据库
 │   ├── check_scale.sh    百万行下的峰值内存对照，需要数据库
 │   └── bench_file.c      文件读写吞吐测量
 ├── config.h.example      连接参数模板（config.h 不入库）
@@ -155,9 +155,14 @@ mc_status mc_exec(mc_conn *conn, const char *sql, unsigned long long *affected);
 ```c
 typedef int (*mc_row_fn)(void *ctx, const char *const *cell,
                          const size_t *length, size_t cols);
+typedef int (*mc_cols_fn)(void *ctx, const char *const *names, size_t cols);
 
 mc_status mc_query_each(mc_conn *conn, const char *sql,
                         mc_row_fn fn, void *ctx, size_t *out_rows);
+
+mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
+                           mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                           size_t *out_rows);
 ```
 
 回调的 `cell` / `length` 与 `mc_rows` 里的同名成员语义完全一致
@@ -177,13 +182,26 @@ mc_status mc_query_each(mc_conn *conn, const char *sql,
 `*out_rows` 在失败的路径上也写入，因为已经交付的行回调确实处理过了，
 续算的起点要靠它。
 
-三条约束：
+列名走另一个回调。`mc_query_each_ex` 的 `on_cols` 在**交付第一行之前**被调用一次，
+`names[j]` 与 `cell[j]` 同序、非 NULL、以 `'\0'` 结尾；`on_cols` 返回非 0 表示
+调用方不需要这些行，函数随即返回 `MC_OK`、`*out_rows` 为 0。三条契约：
+
+- **只要语句执行成功就调用，与结果集有几行无关**。0 行的结果集也有列名——
+  它是服务器元数据的一部分，不是从行里推出来的。
+- **`names` 与其中的字符串在整个调用期间有效**，行回调里可以继续读。
+  实现从元数据里拷了一份出来，元数据对象随即释放，因此这份有效性不依赖
+  `libmysqlclient` 的任何对象还活着。
+- 语句执行失败时一次都不调用。语法错、表不存在、权限不足都发生在 `on_cols`
+  之前，调用方看到一个回调都没发生的失败，就不会误以为表头已经打出去了。
+
+`on_cols` 传 NULL 时行为与 `mc_query_each` 完全相同（连这次拷贝都不做）。
+
+两条约束：
 
 - 取数期间这条连接被该语句占用。回调里对同一个 `conn` 再发查询，
   `libmysqlclient` 会报 `Commands out of sync`——协议是半双工的，
   结果集没读完就发下一条命令属于违例。要并发就用另一条连接。
 - 不能回退。读过的行不留在任何地方，要两遍遍历只能用 `mc_query`。
-- 回调拿不到列名。需要表头时用 `mc_query`，或者自己拼一行。
 
 ### 2.5 大字段
 
@@ -250,8 +268,10 @@ Options:
 退出码三档：`0` 成功，`1` 运行期失败，`2` 用法错误。
 分成两档（而不是"非 0 即失败"）是为了让脚本能区分"参数写错了"与"操作失败了"。
 
-`sql` 与 `each` 的输出只在表头上不同：`each` 不打印列名（回调拿不到），
-**行的内容逐字节相同**，`check_live.sh` 用 `cmp` 比对这一点。
+`sql` 与 `each` 的输出格式相同：都先打一行表头（列名，制表符分隔），再打数据行。
+因此同一查询经两个子命令打印出来的**字节完全一致**，`check_live.sh` 直接用 `cmp`
+比对整份输出。列名由 `mc_query_each_ex` 的列名回调在交付第一行之前给出，
+0 行的结果集同样打表头——表头来自元数据，与有没有行无关。
 `-n` 只对 `each` 有效，别的子命令用了它直接报用法错误——
 静默忽略会让 `sql -n 10` 看起来限制了行数，实际一行也没少。
 
@@ -600,6 +620,37 @@ $ ls -l out.bin    # -rw-rw-r--   0664
 因此目标文件是 `0444` 时覆盖**仍然成功**（用 `fopen(path, "wb")` 会 `EACCES`）。
 既然行为是"覆盖成功"，权限位就更必须保持，否则"成功"只对了一半。
 
+### 3.15 列名单独一个回调，而不是加进行回调
+
+列名是**结果集的属性**，不是行的属性：它来自服务器在 `prepare` 之后返回的元数据，
+在取到第一行之前就已经完整。三条路都试过，只有第三条不用为这个事实付代价：
+
+1. **把 `names` 加进 `mc_row_fn`**：签名变成五个参数，每行都传一遍同一个指针。
+   更麻烦的是空结果集——0 行时行回调一次也不调用，表头就打印不出来，
+   而 `SELECT … WHERE 1=0` 恰恰是"只想要表头"的常用写法。
+   若为了这个再补一次"没行也要调一次"，那就等于在行回调里埋一个只走一次的
+   分支，比单独一个回调更难讲清楚。
+2. **另开 `mc_query_names(conn, sql, char ***)` 预先取元数据**：要拿列名就得
+   把语句执行一次。同一份 SQL 执行两遍，中间隔着别人的写操作时两次的形状
+   可能不同；若不执行两遍，就得把语句句柄跨调用存下来，接口变成"先 open
+   再 fetch"的两段式，调用方要自己管一个由列名查询创建的对象。
+3. **`mc_query_each_ex` 多一个 `on_cols` 回调**（选了这个）：顺序天然是
+   `prepare → execute → on_cols → 逐行`，表头在第一行之前落地，
+   空结果集也走同一条路径，接口仍是"一次调用完成一次取数"。
+
+`on_cols` 的"返回非 0"与行回调的"返回非 0"是同一语义：调用方主动放弃，
+函数返回 `MC_OK`。两处语义一致，调用方不用记两套约定。
+
+实现在 `mysql_stmt_result_metadata()` 返回的 `MYSQL_RES` 上取列名
+（`mysql_fetch_field_direct()`），取完立刻 `mysql_free_result`。
+这一步不能省：那个 `MYSQL_RES` 是独立分配的，不属于语句句柄。
+名字也不能直接递出去——它属于这个 `MYSQL_RES`，释放就没了，因此整体拷进
+一段连续内存（与 `mc_rows` 的 `name_arena` 同一手法，一次 `malloc` 而不是每列一次）。
+
+`on_cols` 的调用点放在 `mysql_stmt_execute` 之后而不是 `prepare` 之后：
+`prepare` 只验证语法，表不存在、列名写错、权限不足这些在执行阶段才暴露。
+放在执行之后，"失败时一次回调都不发生"就是自然结果，而不是靠额外判断维持。
+
 ---
 
 ## 4 构建
@@ -610,9 +661,10 @@ make lib          # 只构建静态库
 make cli          # 只构建命令行工具
 make test         # 纯逻辑 99 项 + 接口层 20 项
 make check        # 命令行端到端 41 项（不需要数据库）
-make check-live   # 真实数据库往返 50 项 + 流式比对 24 项（需要数据库，见下）
+make check-live   # 真实数据库往返 55 项 + 流式比对 56 项（需要数据库，见下）
 make check-scale  # 百万行下的峰值内存对照（需要数据库，约 30 秒）
 make sanitize     # ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
+make sanitize-live # 同上，另跑需要数据库的两套用例（需要数据库）
 make bench        # 文件读写吞吐
 make clean        # 删除 bin/（含全部变体）
 ```
@@ -808,7 +860,7 @@ ok    环境变量 MC_PORT 生效
 
 ### 5.4 真实数据库往返
 
-`make check-live`，50 项。需要一台连得上的 MySQL/MariaDB：
+`make check-live`，55 项。需要一台连得上的 MySQL/MariaDB：
 
 ```bash
 MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
@@ -819,7 +871,7 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 | 组 | 内容 |
 |---|---|
 | 文本 | UTF-8 原样取回、空串与 NULL 打印成不同的东西、列名来自服务器 |
-| 流式 | `each` 与 `sql` 的行内容 `cmp` 逐字节相同（表头除外）、`-n 1` 只出一行 |
+| 流式 | `each` 与 `sql` 的整份输出 `cmp` 逐字节相同（含表头）、0 行时仍打表头、`-n 1` 出一行 |
 | BLOB 往返 | 64 KiB / 5 MiB / 0 字节，三种长度都 `cmp` 逐字节相同 |
 | 权限位 | `blob-get` 覆盖一个已存在的 `0600` 文件，事后 `stat` 仍是 `600` |
 | 容量 | `-s 1000` 读 5 MiB → 退出码 1、报出 `5242880 bytes`、**不产生输出文件** |
@@ -837,7 +889,7 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 
 ### 5.5 流式取数（游标）
 
-`test_stream` 24 项，同样由 `make check-live` 一并运行。七行数据覆盖：
+`test_stream` 56 项，同样由 `make check-live` 一并运行。七行数据覆盖：
 普通文本 / 空串 / 全 NULL / 内含 `'\0'` 的二进制 / 100 KiB 的值 /
 UTF-8 多字节文本 / 负数与 `INT` 上界。
 
@@ -847,6 +899,10 @@ UTF-8 多字节文本 / 负数与 `INT` 上界。
 | 长值 | 100 KiB 那一行的长度逐字节核对（它必然走 `fetch_column` 分支） |
 | 提前停止 | 回调在第 3 行返回非 0 → `MC_OK`，`out_rows == 3` |
 | 连接复用 | 提前停止后同一连接执行 `SELECT 1` 仍然成功（验证 `free_result` 确实排空了结果集） |
+| 列名 | `mc_query_each_ex` 的 `on_cols` 恰好调用一次、列名与顺序正确、行回调里这些指针仍可解引用 |
+| 列名的边界 | 0 行的结果集也交付列名、别名优先于表达式原文、UTF-8 / 64 字节 / 含空格的列名不被截断 |
+| 列名回调放弃 | `on_cols` 返回非 0 → `MC_OK`、`out_rows == 0`、行回调一次都不调用 |
+| 失败顺序 | 表不存在时 `on_cols` 一次都不调用（表头不会打出一半） |
 | 空结果集 | 0 行是成功，`out_rows == 0` |
 | 无结果集 | `UPDATE` → `MC_ERR_RESULT`，提示改用 `mc_exec` |
 | 语法错误 | 在 `prepare` 阶段被拒 → `MC_ERR_STMT`，`out_rows` 为 0 |
@@ -855,6 +911,18 @@ UTF-8 多字节文本 / 负数与 `INT` 上界。
 "连接复用"这一条是本节的重点。它验的不是输出对不对，而是**协议状态有没有收拾干净**：
 少一次 `mysql_stmt_free_result`（或把语句句柄直接 `close` 掉而依赖内部实现），
 这里就会得到 `Commands out of sync`。
+
+列名那几条契约各做过一次注入，确认它们不是"功能没生效也照样绿"：
+
+| 注入 | 结果 |
+|---|---|
+| 跳过 `on_cols`（把判据改成 `if (0 && …)`） | `check_live.sh` 败 6 项、`test_stream` 败 16 项；`each` 的第一行变成数据行 |
+| 列名拷进 arena 之后立刻 `free`（模拟"名字跟着元数据一起释放"） | ASan 在 `names_fnv` 报 `heap-use-after-free`，`freed by mc_query_each_ex`——正好是"行回调里还能读"这条契约 |
+| 列名按 8 字节截断 | 64 字节与 9 字节 UTF-8 两个用例失败，脚本层的失败信息本身也变成非 UTF-8 |
+
+第三条说明的不只是"名字短了"：截断切在多字节字符中间会产出**非法 UTF-8**，
+终端、`grep`、下游解析器都会受影响（`grep` 直接把整段输出当二进制）。
+所以列名不能用固定长度的缓冲区接，长度必须来自 `name_length`。
 
 ### 5.6 百万行下的峰值内存
 
@@ -888,14 +956,18 @@ ok    流式峰值内存低于 32 MiB（与 100 万行无关）
 
 ### 5.7 消毒剂
 
-`make sanitize` 跑 99 + 20 项，再用 ASan 版本跑一遍 50 + 24 项实测：
+`make sanitize` 跑 99 + 20 项；把需要数据库的两套用例也放到插桩版上跑，用
+`make sanitize-live`（等价于 `sanitize` 再跑 `check-live` 与 `test_stream`）：
 
 ```
 --- 纯逻辑测试（ASan + UBSan）---   99 项检查，0 项失败
 --- 接口测试（ASan + UBSan）---     20 项检查，0 项失败
---- check_live（ASan + LSan）---    检查项 50，失败 0
---- test_stream（ASan + LSan）---   24 项检查，0 项失败
+--- check_live（ASan + LSan）---    检查项 55，失败 0
+--- test_stream（ASan + LSan）---   56 项检查，0 项失败
 ```
+
+`sanitize-live` 单独一个目标而不是并进 `sanitize`，因为它要求一台连得上的
+服务器；把"需要环境"的用例塞进默认目标，没有数据库的机器上一次都跑不通。
 
 没有 ASan / UBSan 报告，也没有 LeakSanitizer 报告。后者是有意义的：
 `mc_rows` 的 arena、每条语句的 `MYSQL_STMT`、连接句柄在三条失败路径上
@@ -1040,20 +1112,40 @@ $ make test
 二维指针数组释放时必须先逐行 `free` 内层，中途失败的行数不确定，
 清理代码要么多一个计数器，要么在 `free` 时判断每个指针。
 
+### 7.4 第二轮：给流式接口补列名
+
+第一轮（7.1 ~ 7.3）把单文件改成了模块，`mc_query_each` 的签名是
+`(ctx, cell, length, cols)`——列名不在其中，于是驱动层 `each` 打不出表头，
+而 `sql` 能打。两个子命令的输出因此不能整体比对，脚本里要先去掉表头那一行。
+
+这一轮的改动只有一条线：列名怎么交。结论是单独一个 `mc_cols_fn`，
+在第一行之前调一次；详细取舍见 3.15。顺带把三件相关的事一起做了：
+
+- `mc_query_each` 保留原签名，实现改成 `mc_query_each_ex` 的一行包装。
+  旧调用方（含 `tests/test_stream.c` 里的逐格比对、`check_scale.sh` 的内存测量）
+  一行都不用改，`on_cols == NULL` 时连列名拷贝都不发生。
+- 驱动层 `each` 打表头，`check_live.sh` 的判据从"去掉表头再 `cmp`"升级成
+  整份 `cmp`——判据变强了：表头的字节、列序、0 行时是否打表头都在断言范围内。
+- 新增 `make sanitize-live`。以前"My 插桩版也跑过真实数据库"这件事只写在
+  README 里，靠人记着手工执行；现在是能重复的目标，且 `OUT` 覆盖成
+  `bin/sanitize`，不会与普通产物混在一起。
+
+代价是多了一个 6 参数的函数和一个回调类型。这个代价换回来的是：
+流式取数第一次能做"带表头的 CSV 导出"，而不必退回物化取数——
+后者在百万行上是几百 MB 的峰值内存（6.3 节的实测）。
+
 ---
 
 ## 8 已知局限
 
-### 8.1 `mc_query_each` 不能回退，也拿不到列名
+### 8.1 `mc_query_each` 不能回退
 
 游标接口按定义只能向前：读过的行不留在任何地方，`mysql_data_seek` 这类回退
 在二进制协议上也不可用。需要两遍遍历（先算总数再分配、或者先统计后输出）
 就只能用 `mc_query`，代价是内存与行数成正比。
 
-回调只拿到单元格与长度，没有列名。要做"带表头的 CSV 导出"，
-目前得先用 `mc_query` 拿 `names`，或者自己拼一行表头。
-把列名加进回调签名是可行的（元数据在 `prepare` 之后就有），
-但会让签名变成五个参数，暂时没有做。
+列名不在这个限制里：`mc_query_each_ex` 的 `on_cols` 在第一行之前就把整份
+列名交给调用方，取数过程中不需要为此多读一遍（见 2.4、3.15）。
 
 ### 8.2 一个连接一个线程
 
@@ -1128,8 +1220,8 @@ $ make test
 
 ## 9 待办
 
-- [ ] 回调里给出列名：`mc_query_each` 的签名加一个 `const char *const *names`，
-      或者单独一个 `mc_query_names(conn, sql, char ***)` 预先取元数据
+- [x] 回调里给出列名：做成了 `mc_query_each_ex` 的 `on_cols` 回调（3.15），
+      `mc_query_each` 保留为 `on_cols == NULL` 的包装，旧调用方不用改
 - [ ] 通用的参数绑定：`mc_exec_params(conn, sql, mc_param[], n)`，
       支持 int / string / blob / NULL 四类
 - [x] `mc_file_write` 保留权限位：`rename` 覆盖会把目标文件的权限改成临时文件的

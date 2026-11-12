@@ -12,6 +12,49 @@
 
 ---
 
+## 2026-11-12
+
+### mysql-client（接口新增；`mc_query_each` 签名与行为不变）
+
+- 新增 `mc_cols_fn` 与 `mc_query_each_ex(conn, sql, on_cols, fn, ctx, out_rows)`：
+  列名在**交付第一行之前**由 `on_cols` 一次性交给调用方。`mc_query_each` 保留为
+  `on_cols == NULL` 的包装，旧调用方不用改，开销也不变（这条路径连列名拷贝都不做）。
+- 为什么要改：README 待办里"回调里给出列名"是 2026-10-23 记下的，代价是驱动层的
+  `each` 一直打不出表头——同一查询 `sql` 有表头、`each` 没有，两个子命令的输出没法
+  直接 `cmp`，脚本里得先 `tail -n +2` 去掉一行再比。这不只是不整齐：CSV 导出用
+  流式取数（内存与行数无关）就拿不到表头，只能用物化的 `mc_query`，把流式的意义抵消掉。
+- 列名单独一个回调而不是加进行回调（详见 README 3.15）：列名是结果集的属性，
+  `prepare` 之后元数据就完整。塞进行回调有三个代价——每行多传一遍同一个指针、
+  0 行的结果集拿不到（而 `WHERE 1=0` 恰恰是只想要表头的写法）、驱动层为了表头必须
+  先把首行缓存起来。另一条路 `mc_query_names(conn, sql, char ***)` 要执行两遍语句，
+  或者把语句句柄跨调用保存、把接口变成两段式。
+- 实现要点：列名从 `mysql_stmt_result_metadata()` 返回的 `MYSQL_RES` 上取
+  （`mysql_fetch_field_direct()`），取完立刻 `mysql_free_result`；名字整体拷进一段
+  连续内存，因为调用方被允许在行回调里继续读它们。`on_cols` 的调用点放在
+  `mysql_stmt_execute` 之后：`prepare` 只验语法，表不存在、权限不足在执行阶段才暴露，
+  放在执行之后，"失败时一次回调都不发生"就是自然结果。
+- 驱动层：`each` 打印表头，格式与 `sql` 逐字节相同（0 行也打）；`-n` 语义不变，
+  表头不算一行。`check_live.sh` 的比较从"去掉表头再 `cmp`"改成整份 `cmp`。
+- 新增目标 `make sanitize-live`：把 `check_live` 与 `test_stream` 跑在 ASan+UBSan 版上。
+  以前这条是手工执行的（README 5.7 引用过它的输出但没进 Makefile），现在递归子 make
+  完成，`OUT` 覆盖成 `bin/sanitize`，避免插桩产物与普通产物共用目录。
+- 验证环境：验证机上装的 MySQL 是 8.0.46，今天临时解包 `mysql-server-core-8.0` +
+  `libmysqlclient-dev` 到 `/tmp` 后 `--initialize-insecure` 起了一个实例（无 root），
+  端口 3306、socket 在 `/tmp/mcrun`。
+- 验证：默认构建 0 警告；加严构建（`ci.yml` 那套 `-Wpedantic -Wcast-qual -Wundef
+  -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes`）0 警告；
+  ASan+UBSan 无报告、无泄漏。`test_stream` **24 → 56 项**、`check_live.sh`
+  **50 → 55 项**，全过；`test_pure` 99 项与 `test_db` 20 项不变；全仓
+  `make SKIP=mysql-client test` **1324 项 0 失败**、`check` 全绿
+  （50 / 64 / 72 / 24 / 12 五段）；`make sanitize-live` 55 + 56 全过。
+- 反向验证三条注入，失败集合互不重叠：跳过 `on_cols` → `check_live` 败 6 项、
+  `test_stream` 败 16 项；列名拷完立刻 `free`（模拟名字跟着元数据释放）→
+  ASan 在 `names_fnv` 报 `heap-use-after-free`，`freed by mc_query_each_ex`；
+  列名按 8 字节截断 → 64 字节与 9 字节 UTF-8 两个用例失败。第三条顺带暴露一个细节：
+  截断切在多字节字符中间会产出非法 UTF-8，`grep` 直接把整段输出当二进制，
+  所以列名长度只能取服务器的 `name_length`，不能用固定缓冲区。
+- 记录：`testdata` 未改；解析出的列名不参与任何固定长度缓冲，UTF-8 列名逐字节保留。
+
 ## 2026-11-11
 
 ### word-count（驱动层；`wordcount.h` 与 `wordcount.c` 未改，版本仍 1.1.0）
