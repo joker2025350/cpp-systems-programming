@@ -34,7 +34,7 @@ id	name
 ```
 src/mysql-client/
 ├── include/
-│   └── mysqlclient.h     对外接口：状态码、连接、结果集、BLOB、文件辅助
+│   └── mysqlclient.h     对外接口：状态码、连接、结果集、参数绑定、BLOB、文件辅助
 ├── src/
 │   ├── mysqlclient.c     数据库访问层（唯一 Include <mysql.h> 的编译单元）
 │   ├── options.c         连接参数：初始化与校验
@@ -42,10 +42,11 @@ src/mysql-client/
 │   ├── status.c          状态码 → 可读描述
 │   └── main.c            命令行驱动（子命令、参数解析、输出排版、退出码）
 ├── tests/
-│   ├── test_pure.c       纯逻辑单元测试，62 项，不链接 libmysqlclient
-│   ├── test_db.c         接口层测试，20 项，含真实建连失败路径
+│   ├── test_pure.c       纯逻辑单元测试，99 项，不链接 libmysqlclient
+│   ├── test_db.c         接口层测试，23 项，含真实建连失败路径
 │   ├── check_cli.sh      命令行端到端检查，41 项，不需要数据库
-│   ├── check_live.sh     真实数据库往返验证，48 项，需要数据库
+│   ├── check_live.sh     真实数据库往返验证，83 项，需要数据库
+│   ├── test_params.c     参数绑定，65 项，需要数据库
 │   ├── test_stream.c     流式取数，正确性 56 项 / 内存测量，需要数据库
 │   ├── check_scale.sh    百万行下的峰值内存对照，需要数据库
 │   └── bench_file.c      文件读写吞吐测量
@@ -203,7 +204,49 @@ mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
   结果集没读完就发下一条命令属于违例。要并发就用另一条连接。
 - 不能回退。读过的行不留在任何地方，要两遍遍历只能用 `mc_query`。
 
-### 2.5 大字段
+### 2.5 参数绑定
+
+```c
+typedef enum {
+    MC_PARAM_NULL = 0, MC_PARAM_INT = 1, MC_PARAM_UINT = 2,
+    MC_PARAM_DOUBLE = 3, MC_PARAM_TEXT = 4, MC_PARAM_BLOB = 5
+} mc_param_kind;
+
+typedef struct {
+    mc_param_kind kind;
+    union {
+        long long           i;
+        unsigned long long  u;
+        double              d;
+        struct { const void *data; size_t len; } bytes;
+    } v;
+} mc_param;
+
+mc_status mc_exec_params(mc_conn *conn, const char *sql,
+                         const mc_param *params, size_t n,
+                         unsigned long long *affected);
+```
+
+`params[i]` 依次对应 `sql` 里第 `i` 个 `?`。个数必须与占位符个数相等，
+否则返回 `MC_ERR_PARAM` 并在 `mc_error` 里给出两边的数字。
+
+调用方只填 `kind` 与对应的联合体成员：
+
+```c
+mc_param p[2] = {
+    { .kind = MC_PARAM_INT,  .v.i = 42 },
+    { .kind = MC_PARAM_TEXT, .v.bytes = { "张三", 6 } },
+};
+if (mc_exec_params(conn, "INSERT INTO t(a,b) VALUES(?,?)", p, 2, NULL) != MC_OK)
+        puts(mc_error(conn));
+```
+
+`data` 不拷贝，指针必须活到函数返回。`len` 超过 `MC_BLOB_CHUNK` 的
+`TEXT` / `BLOB` 参数改走 `send_long_data` 分块发送（3.5、3.16）。
+
+`mc_blob_write` 现在是 `n == 1` 的 `MC_PARAM_BLOB` 包装，接口与行为保持兼容。
+
+### 2.6 大字段
 
 ```c
 mc_status mc_blob_write(mc_conn *conn, const char *sql,
@@ -212,7 +255,9 @@ mc_status mc_blob_read(mc_conn *conn, const char *sql,
                        void *buf, size_t cap, size_t *out_len);
 ```
 
-`mc_blob_write` 把 `data[0..len)` 绑到 `sql` 的第一个 `?` 上，分块发送。
+`mc_blob_write` 把 `data[0..len)` 绑到 `sql` 的**唯一**一个 `?` 上，分块发送。
+`sql` 里出现多个占位符时返回 `MC_ERR_PARAM`：包装成 `mc_exec_params` 之后
+"占位符个数与参数个数必须相等"这条对它同样生效（3.16 说明了这条检查的由来）。
 
 `mc_blob_read` 的契约是三条，缺一不可，违反时返回 `MC_ERR_RESULT`：
 
@@ -223,7 +268,7 @@ mc_status mc_blob_read(mc_conn *conn, const char *sql,
 比"取到几行算几行"严格，是因为被覆盖的那几行不会留下任何痕迹：
 循环体每轮都从头写同一块缓冲区，最后只剩下最后一行的内容，而函数看起来是成功的。
 
-### 2.6 文件辅助
+### 2.7 文件辅助
 
 ```c
 mc_status mc_file_read(const char *path, void *buf, size_t cap, size_t *out_len);
@@ -248,7 +293,7 @@ $ ./bin/mysqlclient blob-get -q 'SELECT u_img FROM T WHERE id=1' -o export.bin
 $ ls -l export.bin          # 仍然是 0600
 ```
 
-### 2.7 驱动层
+### 2.8 驱动层
 
 ```
 Usage: mysqlclient [OPTIONS] COMMAND [COMMAND-OPTIONS]
@@ -258,15 +303,26 @@ Commands:
   sql   -q SQL              执行查询，结果按制表符分隔打印到 stdout
   each  -q SQL [-n N]       逐行取数并打印，内存占用与行数无关
   exec  -q SQL              执行不返回结果集的语句，打印受影响行数
-  blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的第一个 ? 参数
+  exec-params -q SQL -a P   同上，值走参数绑定（-a 可重复）
+  blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的唯一一个 ? 参数
   blob-get -q SQL -o FILE   把单行单列的查询结果写成 FILE
 
 Options:
   -H HOST  -P PORT  -u USER  -p PASS  -d DB  -s BYTES  -h
+
+exec-params 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：
+  -a int:-42  -a uint:18446744073709551615  -a double:2.5
+  -a text:hello  -a blob:@photo.jpg  -a null
 ```
 
 退出码三档：`0` 成功，`1` 运行期失败，`2` 用法错误。
 分成两档（而不是"非 0 即失败"）是为了让脚本能区分"参数写错了"与"操作失败了"。
+
+`exec-params` 与 `exec` 的区别只在值的传递方式：前者把值当参数交给服务器，
+后者把值拼进 SQL 文本。前者的值里出现单引号不需要写成两个，
+`check_live.sh` 用同一份内容分别走这两条路，验证写入结果逐字相同。
+`-a` 只对 `exec-params` 有效，用在别的子命令上直接报用法错误——
+静默忽略会让使用者以为值绑上去了，而语句里其实还留着未绑定的 `?`。
 
 `sql` 与 `each` 的输出格式相同：都先打一行表头（列名，制表符分隔），再打数据行。
 因此同一查询经两个子命令打印出来的**字节完全一致**，`check_live.sh` 直接用 `cmp`
@@ -651,6 +707,64 @@ $ ls -l out.bin    # -rw-rw-r--   0664
 `prepare` 只验证语法，表不存在、列名写错、权限不足这些在执行阶段才暴露。
 放在执行之后，"失败时一次回调都不发生"就是自然结果，而不是靠额外判断维持。
 
+### 3.16 参数绑定：一个带标签的联合体，和四个实测出来的坑
+
+**为什么不用变参函数。** `mc_exec_params(conn, sql, ...)` 这种签名省掉结构体，
+代价是把类型错误从编译期推到运行期：`va_arg` 取的类型与实参不符是未定义行为
+（C11 7.16.1.1p2 只要求"与提升后的类型兼容"），而编译器对 `printf` 之外的
+变参函数不做格式检查。值一律按 8 字节读出来之后，`int` 与 `double` 的错位
+不会报错，只会写入一个谁也解释不了的值。所以参数是数组 + 显式 `kind`。
+
+**为什么不是六个构造函数。** `mc_param_int(42)` 这类写法能把"kind 与联合体
+成员匹配"收进库里，代价是每个类型多一个函数、多一份文档，而调用方仍可以
+在栈上直接初始化结构体绕过去——C 的类型系统不给带标签的联合体任何保护。
+既然漏洞堵不死，就选接口更小的一侧：结构体 + 指定初始化器，
+`.kind = MC_PARAM_INT, .v.i = 42` 读起来与构造函数一样清楚。
+
+**坑一：占位符个数必须自己核对。** `mysql_stmt_bind_param` 只拿到一个数组指针，
+它按**占位符个数**遍历，不知道数组有多长。参数给少了就是读越界——
+读到的可能是同一个栈帧里别的变量，值不确定，而 `execute` 往往成功。
+所以 `mysql_stmt_param_count()` 与 `n` 不等时直接返回 `MC_ERR_PARAM`，
+错误信息里带上两边的数字。
+
+**坑二：`is_unsigned` 在参数方向上"只看有没有给，不看给的是什么"。**
+文档说的是"指向 `bool`，表示是否无符号"，实测（手工绑 `MYSQL_BIND` 复现，
+三种组合各跑一次）却是：`&false` 失败、`&true` 失败、`NULL` 成功。
+`-42` 在头两种下变成 `18446744073709551614`，服务端报
+`Out of range value for column ...`。也就是说有符号整数的正确写法是
+**让 `is_unsigned` 保持 `NULL`**。结果集绑定那条路径相反（会回填
+`*is_unsigned`），这个不一致只出现在参数方向，写在这里免得下次再踩。
+
+**坑三：零字节参数的 `buffer` 不能是 `NULL`。** `len == 0` 时若把 data 里的
+空指针原样递下去，客户端在 `execute` 期间会解引用它。零字节的内容无处可读，
+但指针必须可读，于是指到槽位自己的内存上（那 8 字节一个也不会被读）。
+这条与"`len == 0` 且 `data == NULL` 合法"是配套的：前者是调用方的便利，
+后者是实现要接住的结果。
+
+**坑四：`const void *` 转 `void *` 会触发 `-Wcast-qual`。** `MYSQL_BIND::buffer`
+的类型是 `void *`，而模块承诺不修改调用方的数据。限定符只在赋值与解引用时
+参与匹配（C11 6.3.2.3p2），转换本身良定义，问题只在 GCC 的告警。
+先转 `uintptr_t` 再转指针：整型不携带限定符，告警消失，运行时值完全相同。
+
+**长字段的门槛取 `MC_BLOB_CHUNK`。** `len` 超过它就改走 `send_long_data`
+（`buffer_type = MYSQL_TYPE_LONG_BLOB`、`buffer_length = 0`、`length` 与
+`is_null` 都留空），内容分块追加。这个写法与 `3.5` 里 `mc_blob_write` 的
+老实现一致；低于门槛时用普通的绑定缓冲区，省掉"声明长字段 + 分块追加"这两步。
+两条路径的分界点必须在**同一处**判断，否则 `mc_blob_write` 与新接口
+会对同一个长度做出不同处理。
+
+**`mc_blob_write` 改为 `n == 1` 的包装。** 收益是长字段分块只有一份实现，
+代价是错误码有一处变化：`sql` 里出现多个 `?` 时现在返回 `MC_ERR_PARAM`。
+这个变化其实是修掉了一个既有隐患——包装之前，绑定数组只有一个元素，
+而 `mysql_stmt_bind_param` 会按占位符个数去读，第二个参数落在栈上相邻的
+内存里；值不确定，`execute` 却可能成功。
+
+**安全性质。** 值作为独立报文发送，服务器不会把它当 SQL 文本解析，
+因此值里的引号、反斜杠、注释符既不改变语句结构也不需要转义
+（`check_live.sh` 用 `it's ok` 与 `a b<TAB>c` 两例钉住；单元测试里还用了
+`it's; DROP TABLE p; -- 注释`）。这是参数化的全部意义，与
+"`mysql_real_query` 本身是否安全"无关——拼接发生在客户端。
+
 ---
 
 ## 4 构建
@@ -659,9 +773,9 @@ $ ls -l out.bin    # -rw-rw-r--   0664
 make              # 静态库 bin/libmysqlclient.a 与命令行工具 bin/mysqlclient
 make lib          # 只构建静态库
 make cli          # 只构建命令行工具
-make test         # 纯逻辑 99 项 + 接口层 20 项
+make test         # 纯逻辑 99 项 + 接口层 23 项
 make check        # 命令行端到端 41 项（不需要数据库）
-make check-live   # 真实数据库往返 55 项 + 流式比对 56 项（需要数据库，见下）
+make check-live   # 真实数据库往返 83 项 + 参数绑定 65 项 + 流式比对 56 项（需要数据库，见下）
 make check-scale  # 百万行下的峰值内存对照（需要数据库，约 30 秒）
 make sanitize     # ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
 make sanitize-live # 同上，另跑需要数据库的两套用例（需要数据库）
@@ -761,7 +875,7 @@ MySQL **8.0.46**（客户端库与服务端同版本，从 Ubuntu 22.04 的 deb 
 
 ### 5.2 单元测试（不需要数据库）
 
-`make test`，119 项：
+`make test`，122 项：
 
 ```
 mysqlclient 纯逻辑单元测试            ← 99 项
@@ -792,7 +906,7 @@ ok    目录不可写时返回 FILE_OPEN
 ok    失败后目标权限不变
 ok    失败后目标内容不变（仍是 old）
 
-mysqlclient 接口层测试                ← 20 项
+mysqlclient 接口层测试                ← 23 项
 ok    mc_ping(NULL)
 ok    mc_error(NULL) 非 NULL
 ok    失败时 out 被置为 NULL
@@ -860,7 +974,7 @@ ok    环境变量 MC_PORT 生效
 
 ### 5.4 真实数据库往返
 
-`make check-live`，55 项。需要一台连得上的 MySQL/MariaDB：
+`make check-live`，83 项（2b 组另见 5.5）。需要一台连得上的 MySQL/MariaDB：
 
 ```bash
 MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
@@ -880,6 +994,7 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 | 无行 | `blob-get` 查不到 → `query returned no row` |
 | 语句错误 | 表不存在 → `query`；用 `sql` / `each` 跑 UPDATE → 提示改用 `mc_exec` |
 | 绑定 | 含单引号的文本经 SQL 字面量写入后原样取回 |
+| 参数绑定 | `exec-params` 的六种类型、长字段往返、五条用法错误（28 项，明细见 5.5） |
 
 5 MiB 那一项同时验证了分块协议：`MC_BLOB_CHUNK` 是 16 KiB，5 MiB 要 320 次
 `send_long_data`，读回则是一次 `fetch_column`。
@@ -887,7 +1002,43 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 `check_live` 不并进 `make check`：没有数据库的机器上它必然全红，
 那种"永远失败的目标"等于没有目标。
 
-### 5.5 流式取数（游标）
+### 5.5 参数绑定
+
+两部分：`test_params`（65 项，库层）与 `check_live.sh` 的 2b 组（28 项，驱动层），
+都由 `make check-live` 一并运行。
+
+| 组 | 项数 | 内容 |
+|---|---|---|
+| 有符号整数 | 5 | `-42`、`LLONG_MIN`、`LLONG_MAX` 三条往返 |
+| 无符号整数 | 2 | `ULLONG_MAX` 与 `0` |
+| 双精度 | 2 | `3.141592653589793`、`-0.5`（比对服务端格式化后的文本） |
+| 文本 | 6 | 引号与注释符原样、UTF-8、空串、空串 `IS NULL` 为 0、SQL NULL |
+| 二进制 | 4 | 含 `0x00` 的 6 字节、零字节、零字节不是 NULL |
+| 长字段边界 | 7 | 恰好一块 / 一块加一字节 / 跨五块，各一次往返；另加跨三块的长文本 |
+| 两个长字段 | 5 | 同一语句里两个不同长度的长字段，内容不互相追加；长字段在第一个位置 |
+| 失败路径 | 13 | 占位符多少不符、未知 kind、`data` 为 NULL 而 `len` 非 0、SELECT、语法错、主键重复、失败后连接仍可用 |
+| 受影响行数 | 6 | 单行 / 多行 / 未命中 / `affected` 为 NULL |
+| 驱动层 `-a` | 28 | 六种类型的解析、引号与制表符原样、NULL、uint 上界、64 KiB 长字段往返、零字节、五条用法错误 |
+
+四条注入（每条都让两层同时变红，失败集合互不重叠）：
+
+| 注入 | `test_params` | `check_live` |
+|---|---|---|
+| 不把槽位的 `bind` 拷进绑定数组（`bind[i] = s->bind` 注释掉） | 败 42 项 | 败 21 项 |
+| 有符号整数也把 `is_unsigned` 指针给上 | 败 8 项 | 败 1 项 |
+| `send_long_data` 的下标写死成 0 | 败 7 项 | 败 2 项 |
+| 去掉占位符个数检查（`if (want != n)` 改成 `if (0)`） | 败 3 项 | 败 2 项 |
+
+第一条是开发过程中真踩到的：`calloc` 出来的 `MYSQL_BIND` 数组全零，
+而 `buffer_type == 0` 就是 `MYSQL_TYPE_DECIMAL`，于是服务器收到
+"每个参数都是数字 0"——语句成功、受影响行数正确，只有值不对。
+它说明"能执行"与"值对"是两件事，判据必须落在值上。
+
+第四条最不容易察觉：参数给少了不会报错，`bind` 数组只有 1 个元素而库按
+3 个占位符遍历，读越界的值恰好是 0（后面的栈槽是干净的），
+于是写入成功、值全错——只有"两个数字是否相等"这条断言能抓到。
+
+### 5.6 流式取数（游标）
 
 `test_stream` 56 项，同样由 `make check-live` 一并运行。七行数据覆盖：
 普通文本 / 空串 / 全 NULL / 内含 `'\0'` 的二进制 / 100 KiB 的值 /
@@ -924,7 +1075,7 @@ UTF-8 多字节文本 / 负数与 `INT` 上界。
 终端、`grep`、下游解析器都会受影响（`grep` 直接把整段输出当二进制）。
 所以列名不能用固定长度的缓冲区接，长度必须来自 `name_length`。
 
-### 5.6 百万行下的峰值内存
+### 5.7 百万行下的峰值内存
 
 `make check-scale`，5 项检查。1048576 行、每行 3 列（`INT` / `VARCHAR(32)` /
 `VARBINARY(16)` 含一个内嵌 `'\0'`），内容共 20 846 464 字节：
@@ -954,15 +1105,17 @@ ok    流式峰值内存低于 32 MiB（与 100 万行无关）
   几十 MB 的分配，这些开销在 100 万行上是可测的。流式省掉的是内存搬运，
   不是网络 I/O——两者的字节数完全相同。
 
-### 5.7 消毒剂
+### 5.8 消毒剂
 
-`make sanitize` 跑 99 + 20 项；把需要数据库的两套用例也放到插桩版上跑，用
-`make sanitize-live`（等价于 `sanitize` 再跑 `check-live` 与 `test_stream`）：
+`make sanitize` 跑 99 + 23 项；把需要数据库的三套用例也放到插桩版上跑，用
+`make sanitize-live`（等价于 `sanitize` 再跑 `check-live`、`test_params`
+与 `test_stream`）：
 
 ```
 --- 纯逻辑测试（ASan + UBSan）---   99 项检查，0 项失败
---- 接口测试（ASan + UBSan）---     20 项检查，0 项失败
---- check_live（ASan + LSan）---    检查项 55，失败 0
+--- 接口测试（ASan + UBSan）---     23 项检查，0 项失败
+--- check_live（ASan + LSan）---    检查项 83，失败 0
+--- test_params（ASan + LSan）---   65 项检查，0 项失败
 --- test_stream（ASan + LSan）---   56 项检查，0 项失败
 ```
 
@@ -973,19 +1126,23 @@ ok    流式峰值内存低于 32 MiB（与 100 万行无关）
 `mc_rows` 的 arena、每条语句的 `MYSQL_STMT`、连接句柄在三条失败路径上
 都要求释放，漏一处就会在 5 MiB 那一轮被放大成几 MB 的泄漏。
 流式路径上的泄漏点更密：每列一块缓冲区、四块指针数组，
-外加"回调提前停止"这条额外的退出路径——它在 5.5 节的用例里被走到。
+外加"回调提前停止"这条额外的退出路径——它在 5.6 节的用例里被走到。
 
-### 5.8 全仓
+### 5.9 全仓
+
+根 `make test` 按模块表顺序逐个跑，每个模块打印自己的汇总行。
+`mysql-client` 需要 `libmysqlclient`，在没有它的机器上用 `SKIP=mysql-client` 跳过：
 
 ```
-$ make test
-==> concurrent-lock   68 项检查，0 项失败
-==> contact-list     136 项检查，0 项失败
-==> mysql-client     119 项检查（99 + 20），0 项失败
-==> thread-pool       54 项检查，0 项失败
-==> word-count        40 项检查，0 项失败
-合计 417 项，0 项失败
+$ make SKIP=mysql-client test
+==> concurrent-lock     72 项检查，0 项失败
+==> contact-list       242 + 466 + 20 + 43 项检查，0 项失败
+==> thread-pool        215 项检查，0 项失败
+==> word-count          40 + 226 项检查，0 项失败
 ```
+
+合计 **1324** 项。本模块自己的 `make test` 另算 122 项（99 + 23），
+要连库的 204 项（83 + 65 + 56）由 `make check-live` 负责。
 
 ---
 
@@ -1134,6 +1291,31 @@ $ make test
 流式取数第一次能做"带表头的 CSV 导出"，而不必退回物化取数——
 后者在百万行上是几百 MB 的峰值内存（6.3 节的实测）。
 
+### 7.5 第三轮：通用参数绑定
+
+前两轮之后，`mc_exec` 与 `mc_blob_write` 是两条互不相干的写路径：
+前者完全没有参数，后者只认一个 `?` 且固定按长字段发。要写
+"INSERT 一行四个不同类型的值"就只能拼字符串，而那意味着 SQL 注入面
+（8.4 当时是这么记的）。
+
+这一轮的改动是补上 `mc_exec_params`（3.16 记录了四个实现上的坑），
+并把 `mc_blob_write` 收编成 `n == 1` 的包装。收益与代价不对称：
+
+- 收益：长字段分块只有一份实现；`mc_blob_write` 顺带获得占位符个数检查，
+  修掉了一个"`sql` 里有两个 `?` 时读越界"的既有隐患。
+- 代价：`mc_blob_write` 的错误码有一处变化（多占位符从 `MC_ERR_STMT`
+  变成 `MC_ERR_PARAM`），语义上更准确，但与旧行为不同。
+
+三处实现细节值得记下来，因为它们都是"看着对、跑起来不对"：
+`bind[i] = s->bind` 漏掉时所有值变成 0（`buffer_type == 0` 是
+`MYSQL_TYPE_DECIMAL`）；`is_unsigned` 在参数方向上看指针是否存在而不看值；
+零字节参数的 `buffer` 不能是 `NULL`。三条都是实测发现的，
+没有一条能靠读文档避免。
+
+驱动层同步加了 `exec-params` 子命令：`-a TYPE:VALUE` 可重复，六种类型，
+blob 写作 `@路径`。`blob-put` 的文件读取逻辑一并抽成 `load_file()`，
+两处共用。`-a` 与 `-n` 一样只对特定子命令有效，用在别处直接报用法错误。
+
 ---
 
 ## 8 已知局限
@@ -1162,13 +1344,17 @@ $ make test
 `memset_s` 可以做到，代价是与平台绑定；本模块暂时不做，
 因此"密码在进程内存里可被 core dump 带出"这个风险依然存在。
 
-### 8.4 `mc_exec` 的 SQL 是非参数化的
+### 8.4 参数绑定只覆盖"不返回结果集"的语句
 
-`mc_exec` 直接 `mysql_real_query` 一段字符串。若调用方用 `snprintf` 把用户输入
-拼进去，就有 SQL 注入——与 `mysql_real_query` 本身是否安全无关，
-问题在拼接。需要传值的场景应当走参数化路径（`mc_blob_write` 是其中的特例）。
-本模块不提供通用的"多参数绑定"接口，因为每个参数的类型都要单独声明，
-把它做成变参函数只会把类型错误从编译期推到运行期。
+`mc_exec_params` 能绑值，但只用于 `INSERT` / `UPDATE` / `DELETE` / DDL：
+语句返回结果集时它返回 `MC_ERR_RESULT`。查询方向（`mc_query`、
+`mc_query_each_ex`）的 `sql` 仍然只能是字面量，要传值得自己拼字符串，
+而那正是 SQL 注入的成因（问题在拼接，与 `mysql_real_query` 是否安全无关）。
+
+两条路都不难补，只是要各自定好接口：`mc_query_params` 要把参数数组
+递进 prepare → bind → execute → store 这条链；流式那条还要把
+`on_cols` 与行回调一起带过去，签名会长到看不下去，可能需要一个
+"语句对象"（`mc_stmt`）来承载。在定下来之前不急着加。
 
 ### 8.5 只支持 MySQL 8.0 及以上
 
@@ -1222,8 +1408,9 @@ $ make test
 
 - [x] 回调里给出列名：做成了 `mc_query_each_ex` 的 `on_cols` 回调（3.15），
       `mc_query_each` 保留为 `on_cols == NULL` 的包装，旧调用方不用改
-- [ ] 通用的参数绑定：`mc_exec_params(conn, sql, mc_param[], n)`，
-      支持 int / string / blob / NULL 四类
+- [x] 通用的参数绑定：做成了 `mc_exec_params(conn, sql, mc_param[], n)`，
+      六种 kind（null / int / uint / double / text / blob），
+      超长字段走 `send_long_data`（3.16），`mc_blob_write` 改为它的特例
 - [x] `mc_file_write` 保留权限位：`rename` 覆盖会把目标文件的权限改成临时文件的
       （`0666 & ~umask`），导出到已有文件时这一点会改变使用者预期（3.14 已完成；
       属主、ACL 等仍然不保留，见 8.9）
@@ -1233,5 +1420,9 @@ $ make test
 - [ ] 密码清零：`explicit_bzero` 版本，用 `#if defined(__GLIBC__)` 包起来
 - [ ] 把 `MC_BLOB_CHUNK` 做成可配置：现在的 16 KiB 是按"小于 MTU 的整数倍"选的，
       没有实测过不同块大小的吞吐差异
-- [ ] `mc_query_each` 的流式结果集不支持参数绑定：
-      目前 `sql` 只能是字面量，要传值仍得自己拼字符串（见 8.4）
+- [ ] 查询方向的参数绑定：`mc_query` / `mc_query_each_ex` 的 `sql` 仍只能是
+      字面量。难点是接口形状——把 `on_cols`、行回调、参数一起塞进签名之后
+      参数会到六七个，可能要引入 `mc_stmt` 语句对象（见 8.4）
+- [ ] 参数数组的个数校验提前到编译期：目前 `n` 与占位符个数在运行期比对，
+      而 `sql` 是字面量时编译器本可以数出 `?` 的个数（需要在字符串里跳过
+      引号与注释，只能做启发式——暂不做）

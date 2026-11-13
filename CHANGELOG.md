@@ -12,6 +12,60 @@
 
 ---
 
+## 2026-11-13
+
+### mysql-client（接口新增；`mc_blob_write` 有一处错误码变化）
+
+- 新增 `mc_param` / `mc_param_kind` 与
+  `mc_exec_params(conn, sql, params, n, affected)`：值按类型绑定，不再拼进 SQL 文本。
+  六种 kind——`NULL` / `INT`（有符号 64 位）/ `UINT` / `DOUBLE` / `TEXT` / `BLOB`，
+  `len` 超过 `MC_BLOB_CHUNK` 的 `TEXT` / `BLOB` 改走 `send_long_data` 分块。
+- 为什么要改：README 8.4 记的"`mc_exec` 的 SQL 是非参数化的"是本模块最后一个接口级
+  缺口。拼字符串写入是 SQL 注入的成因（拼接发生在客户端，与 `mysql_real_query`
+  是否安全无关），而且二进制值必须先转义、每个整数都要考虑引号，代价落在每个调用方身上。
+  同时 `mc_blob_write` 与 `mc_exec` 是两条互不相干的写路径：前者只认一个 `?`、
+  固定按长字段发，后者的分块逻辑因此只能有一份，等于把最容易出错的协议细节复制一遍。
+- `mc_blob_write` 改为 `n == 1` 的 `MC_PARAM_BLOB` 包装。错误码一处变化：`sql` 里有
+  多个 `?` 时从 `MC_ERR_STMT` 变成 `MC_ERR_PARAM`。这一变化顺带修掉一个既有隐患——
+  包装之前绑定数组只有一个元素，而 `mysql_stmt_bind_param` 按占位符个数遍历，
+  第二个参数落在栈上相邻内存里，值不确定、`execute` 却可能成功。
+- 实现要点（四条都是实测出来的，写进 README 3.16）：
+  ① 槽位里的 `MYSQL_BIND` 必须显式拷进交给库的数组（`bind[i] = s->bind`）。漏掉时
+  `calloc` 出来的数组全零，而 `buffer_type == 0` 是 `MYSQL_TYPE_DECIMAL`，
+  于是每个参数都变成数字 0——语句成功、受影响行数正确，只有值不对。
+  ② `is_unsigned` 在参数绑定方向只看指针是否存在、不看它指向的值：
+  `&false` 与 `&true` 都会把 `-42` 发成 `18446744073709551614`，服务端报
+  `Out of range value`；有符号必须让它保持 `NULL`。手工绑 `MYSQL_BIND` 三种组合各跑
+  一次确认过，而结果集方向的行为相反（会回填 `*is_unsigned`）。
+  ③ 零字节参数的 `buffer` 不能是 `NULL`（`execute` 期间会解引用），指到槽位自己的内存上。
+  ④ `MYSQL_BIND::buffer` 是 `void *`，把 `const` 转掉会触发 `-Wcast-qual`，
+  经 `uintptr_t` 中转，运行时值相同。
+- 占位符个数与 `n` 不等时返回 `MC_ERR_PARAM`，错误信息带两边的数字。不检查的后果不是
+  报错而是绑定错位：多给的被忽略、少给的读越界。
+- 驱动层新增 `exec-params -q SQL -a TYPE:VALUE`（`-a` 可重复，六种类型，
+  blob 写作 `@路径`）；`-a` 与 `-n` 一样只对特定子命令有效。`blob-put` 与
+  `-a blob:@file` 的文件读取抽成 `load_file()`，两处共用。
+- 验证环境：内网 Ubuntu（Linux 6.8 / gcc 11.4.0），MySQL 8.0.46 仍是 11-12 起的
+  那一份解包实例（端口 3306，无 root）。本机 Windows 不参与构建。
+- 验证：默认构建 0 警告；加严构建（`ci.yml` 那套八个 `-W`）**0 条**；
+  ASan+UBSan 无报告、无泄漏。新增 `tests/test_params.c` **65 项**；
+  `test_db` **20 → 23 项**、`check_live.sh` **55 → 83 项**；
+  `test_pure` 99、`test_stream` 56、`check_cli.sh` 41 不变，全部通过。
+  `make sanitize-live` 上 83 + 65 + 56 也全过。全仓 `make SKIP=mysql-client test`
+  **1324 项 0 失败**；`testdata` 未改；`git archive HEAD` 导出已提交树复验通过。
+- 反向验证四条注入，两层同时变红：
+
+  | 注入 | `test_params` | `check_live` |
+  |---|---|---|
+  | 注释掉 `bind[i] = s->bind` | 败 42 项 | 败 21 项 |
+  | 有符号整数也把 `is_unsigned` 指针给上 | 败 8 项 | 败 1 项 |
+  | `send_long_data` 的下标写死成 0 | 败 7 项 | 败 2 项 |
+  | 去掉占位符个数检查（`if (want != n)` → `if (0)`） | 败 3 项 | 败 2 项 |
+
+  第四条最不容易察觉：函数给少了参数不会报错，读越界的值恰好是 0（后面的栈槽是干净的），
+  于是写入成功、值全错——只有"占位符个数与参数个数相等"这条断言能抓到。
+  前三条的判据都落在取回的值上，而不是退出码：参数绑错时退出码照样是 0。
+
 ## 2026-11-12
 
 ### mysql-client（接口新增；`mc_query_each` 签名与行为不变）
