@@ -826,24 +826,263 @@ mc_status mc_query_each(mc_conn *conn, const char *sql,
 }
 
 /* ------------------------------------------------------------------
- * 大字段
+ * 参数绑定
  * ------------------------------------------------------------------ */
 
-mc_status mc_blob_write(mc_conn *conn, const char *sql,
-                        const void *data, size_t len) {
+/*
+ * 一个参数的绑定槽位。
+ *
+ * MYSQL_BIND 里的 length / is_null / is_unsigned 三个成员都是**指针**，
+ * 指向的存储必须活到 mysql_stmt_execute 返回。把它们放进同一个结构体
+ * 一次 calloc 出来，生命周期问题就只剩一处（一个 free）；
+ * 若在循环里用局部变量取地址，绑定数组里的指针会指向已经出栈的栈帧，
+ * 症状取决于那块栈之后被谁复用——可能是随机的长度、可能直接崩溃，
+ * 而且换个优化等级就换一种表现。
+ */
+typedef struct {
+	MYSQL_BIND         bind;
+	unsigned long      length;
+	bool               is_null;
+	bool               is_unsigned;
+	long long          sint;
+	unsigned long long uint;
+	double             dbl;
+} param_slot;
 
-	MYSQL_STMT *stmt = NULL;
-	MYSQL_BIND  param;
-	mc_status   st = MC_OK;
-	const char *bytes = (const char *)data;
-	size_t      off = 0;
+/*
+ * 参数数组的本地校验。全部与服务器无关，因此在 prepare 之前做：
+ * 为一个本地写错的值付一次网络往返没有意义，而且 prepare 失败
+ * 报的是 SQL 的问题，会把使用者引向错误的方向。
+ *
+ * 三种拒绝的理由：
+ *   - kind 不在枚举内：读哪个联合体成员无从判断，只能拒绝；
+ *   - TEXT / BLOB 的 data 为 NULL 而 len 非 0：读的是空指针；
+ *   - len 为 0 时 data 允许为 NULL，那是"零字节内容"，不是错误。
+ */
+static mc_status check_params(mc_conn *conn, const mc_param *params, size_t n) {
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		const mc_param *p = &params[i];
+
+		switch (p->kind) {
+		case MC_PARAM_NULL:
+		case MC_PARAM_INT:
+		case MC_PARAM_UINT:
+		case MC_PARAM_DOUBLE:
+			break;
+
+		case MC_PARAM_TEXT:
+		case MC_PARAM_BLOB:
+			if (p->v.bytes.data == NULL && p->v.bytes.len > 0) {
+				char detail[96];
+
+				(void)snprintf(detail, sizeof detail,
+				               "parameter %lu: data is NULL but len is %lu",
+				               (unsigned long)i,
+				               (unsigned long)p->v.bytes.len);
+				set_error(conn, "params", detail);
+				return MC_ERR_PARAM;
+			}
+			break;
+
+		default: {
+			char detail[96];
+
+			(void)snprintf(detail, sizeof detail,
+			               "parameter %lu: unknown kind %d",
+			               (unsigned long)i, (int)p->kind);
+			set_error(conn, "params", detail);
+			return MC_ERR_PARAM;
+		}
+		}
+	}
+
+	return MC_OK;
+}
+
+/*
+ * 把 mc_param 数组翻译成 MYSQL_BIND 数组。
+ *
+ * 两个分配：bind（真正交给库的数组）与 slots（每个参数的辅助存储）。
+ * 不能把 slots 直接当数组用——mysql_stmt_bind_param 要求的是连续的
+ * MYSQL_BIND，而 slots 的元素是 param_slot，步长不同。
+ *
+ * 失败时两个指针都留在 NULL，调用方无条件 free 即可。
+ */
+static mc_status bind_params(mc_conn *conn, const mc_param *params, size_t n,
+                             MYSQL_BIND **out_bind, param_slot **out_slots) {
+
+	MYSQL_BIND *bind;
+	param_slot *slots;
+	size_t      i;
+
+	*out_bind  = NULL;
+	*out_slots = NULL;
+
+	if (n == 0) return MC_OK;
+
+	/* n 来自调用方，乘 sizeof 之前先挡住回绕（C11 6.5p5：有符号溢出
+	 * 是未定义行为，无符号回绕虽良定义但分配出来的数组会比要用的短）。 */
+	if (n > SIZE_MAX / sizeof *slots || n > SIZE_MAX / sizeof *bind) {
+		set_error(conn, "bind_param", "too many parameters");
+		return MC_ERR_NOMEM;
+	}
+
+	slots = (param_slot *)calloc(n, sizeof *slots);
+	bind  = (MYSQL_BIND *)calloc(n, sizeof *bind);
+
+	if (slots == NULL || bind == NULL) {
+		free(slots);
+		free(bind);
+		set_error(conn, "bind_param", "out of memory");
+		return MC_ERR_NOMEM;
+	}
+
+	for (i = 0; i < n; i++) {
+		const mc_param *p = &params[i];
+		param_slot     *s = &slots[i];
+
+		/* 默认给出 length / is_null 指针，具体类型里再按需覆盖 */
+		s->bind.length  = &s->length;
+		s->bind.is_null = &s->is_null;
+
+		switch (p->kind) {
+		case MC_PARAM_NULL:
+			/* 声明成 NULL 类型即可，buffer 与 length 都不看 */
+			s->is_null          = true;
+			s->bind.buffer_type = MYSQL_TYPE_NULL;
+			break;
+
+		case MC_PARAM_INT:
+			s->sint                 = p->v.i;
+			s->length               = (unsigned long)sizeof s->sint;
+			s->bind.buffer_type     = MYSQL_TYPE_LONGLONG;
+			s->bind.buffer          = &s->sint;
+			s->bind.buffer_length   = (unsigned long)sizeof s->sint;
+
+			/*
+			 * is_unsigned 必须留成 NULL，不能指向一个值为 false 的 bool。
+			 *
+			 * 这一点与 libmysqlclient 的文档不符，是实测出来的：
+			 * 参数绑定这条路径只判断指针是否为空（"给了 is_unsigned
+			 * 就按无符号发"），不看它指向的真假。于是 &false 会把
+			 * -42 发成 18446744073709551614，服务端报
+			 * "Out of range value for column ..."；
+			 * 而 is_unsigned = NULL 才是"有符号"。
+			 * 直接手工绑 MYSQL_BIND 复现过三种组合：
+			 * &false 失败、&true 失败、NULL 成功。
+			 * 结果集绑定那条路径恰好相反（会读 *is_unsigned 回填），
+			 * 所以这个不一致只出现在参数方向上。
+			 */
+			break;
+
+		case MC_PARAM_UINT:
+			s->uint                 = p->v.u;
+			s->length               = (unsigned long)sizeof s->uint;
+			s->bind.buffer_type     = MYSQL_TYPE_LONGLONG;
+			s->bind.buffer          = &s->uint;
+			s->bind.buffer_length   = (unsigned long)sizeof s->uint;
+			s->is_unsigned          = true;
+			s->bind.is_unsigned     = &s->is_unsigned;
+			break;
+
+		case MC_PARAM_DOUBLE:
+			s->dbl                  = p->v.d;
+			s->length               = (unsigned long)sizeof s->dbl;
+			s->bind.buffer_type     = MYSQL_TYPE_DOUBLE;
+			s->bind.buffer          = &s->dbl;
+			s->bind.buffer_length   = (unsigned long)sizeof s->dbl;
+			break;
+
+		case MC_PARAM_TEXT:
+		case MC_PARAM_BLOB: {
+			const void *data = p->v.bytes.data;
+			size_t      len  = p->v.bytes.len;
+
+			/*
+			 * 长字段：绑一个"声明为长字段"的空参数，内容在 execute 之前
+			 * 由 send_long_data 分块送出。此时 length 与 is_null 必须
+			 * 留空——分块发送与绑定缓冲区是二选一的两种写法，
+			 * 同时给会让库按"绑定长度 0"发出去，长数据被丢掉。
+			 */
+			if (len > MC_BLOB_CHUNK) {
+				s->bind.buffer_type   = MYSQL_TYPE_LONG_BLOB;
+				s->bind.buffer        = NULL;
+				s->bind.buffer_length = 0;
+				s->bind.length        = NULL;
+				s->bind.is_null       = NULL;
+				break;
+			}
+
+			s->length = (unsigned long)len;
+			s->bind.buffer_type = (p->kind == MC_PARAM_TEXT)
+			                      ? MYSQL_TYPE_STRING
+			                      : MYSQL_TYPE_BLOB;
+			s->bind.buffer_length = (unsigned long)len;
+
+			/*
+			 * buffer 不能留成 NULL：客户端在 execute 时会解引用它，
+			 * 零字节参数也不例外。零字节时指到槽位自己的内存上即可，
+			 * 反正一个字节都不会被读。
+			 *
+			 * 非零时要把 const 转掉。MYSQL_BIND::buffer 的类型是 void *
+			 * （libmysqlclient 的 API 如此），而模块承诺不改调用方的数据。
+			 * 限定符只在赋值与解引用时参与匹配（C11 6.3.2.3p2），
+			 * 把 const 指针转成非 const 指针本身是良定义的，问题只在
+			 * GCC 的 -Wcast-qual 会告警。先转 uintptr_t 再转指针：
+			 * 整型不携带限定符，告警消失，运行时值与直接转换完全相同。
+			 */
+			s->bind.buffer = (len > 0) ? (void *)(uintptr_t)data
+			                           : (void *)&s->sint;
+			break;
+		}
+
+		default:
+			/* check_params 已经挡掉，这里不可达；仍然写成显式分支，
+			 * 免得以后加枚举值时静默落到某个已有分支上 */
+			free(slots);
+			free(bind);
+			set_error(conn, "bind_param", "unknown parameter kind");
+			return MC_ERR_PARAM;
+		}
+
+		/*
+		 * 槽位里的 bind 只是草稿，真正的数组是 bind[]。
+		 * 这一行漏掉时的症状极难判断：calloc 出来的 bind[] 全零，
+		 * 而 buffer_type == 0 就是 MYSQL_TYPE_DECIMAL，于是服务器
+		 * 收到"每个参数都是数字 0"——语句执行成功、受影响行数正确，
+		 * 只有值不对。本函数第一版就漏了这一行，是实测才发现的。
+		 */
+		bind[i] = s->bind;
+	}
+
+	*out_bind  = bind;
+	*out_slots = slots;
+
+	return MC_OK;
+}
+
+mc_status mc_exec_params(mc_conn *conn, const char *sql,
+                         const mc_param *params, size_t n,
+                         unsigned long long *affected) {
+
+	MYSQL_STMT    *stmt = NULL;
+	MYSQL_BIND    *bind = NULL;
+	param_slot    *slots = NULL;
+	unsigned long  want;
+	mc_status      st = MC_OK;
+	my_ulonglong   rows;
+	size_t         i;
 
 	if (conn == NULL || sql == NULL || sql[0] == '\0') return MC_ERR_PARAM;
-	if (data == NULL && len > 0) return MC_ERR_PARAM;
+	if (params == NULL && n > 0) return MC_ERR_PARAM;
+
+	st = check_params(conn, params, n);
+	if (st != MC_OK) return st;
 
 	stmt = mysql_stmt_init(conn->mysql);
 	if (stmt == NULL) {
-		/* 与语句无关的错误（内存不足），文本挂在连接上 */
 		set_error(conn, "stmt_init", mysql_error(conn->mysql));
 		return MC_ERR_STMT;
 	}
@@ -853,41 +1092,64 @@ mc_status mc_blob_write(mc_conn *conn, const char *sql,
 		goto out;
 	}
 
-	(void)memset(&param, 0, sizeof param);
-	param.buffer_type   = MYSQL_TYPE_LONG_BLOB;
-	param.buffer        = NULL;
-	param.buffer_length = 0;
-
 	/*
-	 * 这里声明的是"这个参数是个长字段"，而不是它的内容。
-	 * buffer_length 必须为 0：真正的字节由下面的 send_long_data 增量送出，
-	 * 库在 execute 时自己累计总长度。is_null 与 length 留空是允许的，
-	 * 前提是数据分块送（一次性 send 与绑定缓冲区二选一）。
+	 * 占位符个数必须与参数个数相等。这一条比"少给一个"要严重得多：
+	 * 库按占位符个数遍历绑定数组，参数给少了就是读越界——
+	 * 读到的可能是栈上别的变量，值不确定，而 execute 往往成功。
 	 */
-	if (mysql_stmt_bind_param(stmt, &param) != 0) {
+	want = mysql_stmt_param_count(stmt);
+	if (want != (unsigned long)n) {
+		char detail[128];
+
+		(void)snprintf(detail, sizeof detail,
+		               "statement needs %lu placeholder(s), got %lu",
+		               want, (unsigned long)n);
+		set_error(conn, "prepare", detail);
+		st = MC_ERR_PARAM;
+		goto out;
+	}
+
+	st = bind_params(conn, params, n, &bind, &slots);
+	if (st != MC_OK) goto out;
+
+	if (n > 0 && mysql_stmt_bind_param(stmt, bind) != 0) {
 		st = stmt_error(conn, stmt, "bind_param", MC_ERR_STMT);
 		goto out;
 	}
 
 	/*
-	 * 分块发送。send_long_data 的语义是"追加一段"，多次调用按顺序拼接，
-	 * 因此单次报文长度只受 max_allowed_packet 约束，而不受一次传入的长度约束。
-	 * 一次传整个 64 KiB 图片在当前网络下当然也能work，但一旦换成 100 MB
-	 * 的文件，单次调用就要求驱动在内存里再准备一份完整副本（或直接失败）；
-	 * 分块是唯一不需要为大字段额外分配内存的写法。
+	 * 长字段分块送。必须在 execute 之前、bind 之后：
+	 * send_long_data 的语义是"追加到第 i 个参数的缓冲区"，
+	 * 没有绑定过的参数没有缓冲区可追加。
 	 */
-	while (off < len) {
-		size_t chunk = len - off;
+	for (i = 0; i < n; i++) {
+		const void *data;
+		size_t      len;
+		size_t      off = 0;
 
-		if (chunk > MC_BLOB_CHUNK) chunk = MC_BLOB_CHUNK;
-
-		if (mysql_stmt_send_long_data(stmt, 0, bytes + off,
-		                              (unsigned long)chunk) != 0) {
-			st = stmt_error(conn, stmt, "send_long_data", MC_ERR_STMT);
-			goto out;
+		if (params[i].kind != MC_PARAM_TEXT && params[i].kind != MC_PARAM_BLOB) {
+			continue;
 		}
 
-		off += chunk;
+		len = params[i].v.bytes.len;
+		if (len <= MC_BLOB_CHUNK) continue;
+
+		data = params[i].v.bytes.data;
+
+		while (off < len) {
+			size_t chunk = len - off;
+
+			if (chunk > MC_BLOB_CHUNK) chunk = MC_BLOB_CHUNK;
+
+			if (mysql_stmt_send_long_data(stmt, (unsigned int)i,
+			                              (const char *)data + off,
+			                              (unsigned long)chunk) != 0) {
+				st = stmt_error(conn, stmt, "send_long_data", MC_ERR_STMT);
+				goto out;
+			}
+
+			off += chunk;
+		}
 	}
 
 	if (mysql_stmt_execute(stmt) != 0) {
@@ -895,17 +1157,67 @@ mc_status mc_blob_write(mc_conn *conn, const char *sql,
 		goto out;
 	}
 
-out:
 	/*
-	 * 无论成功失败都要 close；close 本身也可能失败（例如服务端在
-	 * 语句执行期间断开），失败信息保留，但不覆盖前面更具体的那一条。
+	 * 语句其实返回了结果集。先把结果集释放掉再报错：
+	 * 留在连接上的结果集会让下一条命令收到 "Commands out of sync"
+	 * （协议是半双工的，未读完的结果集占据着连接）。
 	 */
+	if (mysql_stmt_field_count(stmt) != 0) {
+		set_error(conn, "exec_params",
+		          "statement returns rows, use mc_query or mc_query_each");
+		(void)mysql_stmt_free_result(stmt);
+		st = MC_ERR_RESULT;
+		goto out;
+	}
+
+	if (affected != NULL) {
+		rows = mysql_stmt_affected_rows(stmt);
+
+		/* 与 mc_exec 同一处哨兵：(my_ulonglong)-1 表示失败 */
+		if (rows == (my_ulonglong)-1) {
+			set_error(conn, "affected_rows", mysql_stmt_error(stmt));
+			st = MC_ERR_QUERY;
+			goto out;
+		}
+
+		*affected = (unsigned long long)rows;
+	}
+
+out:
 	if (mysql_stmt_close(stmt) != 0 && st == MC_OK) {
 		set_error(conn, "stmt_close", mysql_error(conn->mysql));
 		st = MC_ERR_STMT;
 	}
 
+	free(bind);
+	free(slots);
+
 	return st;
+}
+
+/* ------------------------------------------------------------------
+ * 大字段
+ * ------------------------------------------------------------------ */
+
+mc_status mc_blob_write(mc_conn *conn, const char *sql,
+                        const void *data, size_t len) {
+
+	mc_param p;
+
+	if (conn == NULL || sql == NULL || sql[0] == '\0') return MC_ERR_PARAM;
+	if (data == NULL && len > 0) return MC_ERR_PARAM;
+
+	p.kind          = MC_PARAM_BLOB;
+	p.v.bytes.data  = data;
+	p.v.bytes.len   = len;
+
+	/*
+	 * 交给通用绑定：单参数、不关心受影响行数。
+	 * 这样"长字段分块"只有一份实现，不会出现两条路径各自演进的情况；
+	 * 代价是 SQL 里出现多个 ? 时从"读越界后执行成功"变成明确的
+	 * MC_ERR_PARAM（见头文件的说明）。
+	 */
+	return mc_exec_params(conn, sql, &p, 1, NULL);
 }
 
 mc_status mc_blob_read(mc_conn *conn, const char *sql,

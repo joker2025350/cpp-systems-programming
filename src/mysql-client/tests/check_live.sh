@@ -221,6 +221,118 @@ check_exit "blob-get 覆盖已存在的 0600 文件" 0 $?
 check_equal "覆盖后权限位仍是 600" "$(stat -c %a "$TMPD/perm.bin")" "600"
 
 # ------------------------------------------------------------
+# 2b. 参数绑定（exec-params）
+#
+# 与 2. 的 BLOB 用例分工：那里验的是"单个 ? 参数写大字段"（blob-put，
+# 走 mc_blob_write），这里验的是多参数、多类型混排以及 -a 的解析。
+# 判据尽量用"值原样取回"，而不是只看退出码——参数绑错时退出码照样是 0，
+# 只有取回的值能区分。
+# ------------------------------------------------------------
+
+"$CLI" exec-params -q "INSERT INTO $TBL(id, note) VALUES(?,?)" \
+	-a int:100 -a "text:it's ok" >/dev/null 2>&1
+check_exit "exec-params 插入含引号的文本" 0 $?
+check_equal "含引号的文本原样取回（不需要写 ''）" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=100" 2>/dev/null | tail -1)" \
+	"it's ok"
+
+# 同一份内容分别走 exec（字面量，需要 '' 转义）与 exec-params，
+# 两行必须完全一样：这条把"参数化与字面量写入等价"钉死。
+"$CLI" exec -q "INSERT INTO $TBL(id, note) VALUES (101, 'it''s ok')" >/dev/null 2>&1
+check_equal "字面量与参数绑定写入同一个值" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=101" 2>/dev/null | tail -1)" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=100" 2>/dev/null | tail -1)"
+
+OUT=$("$CLI" exec-params -q "UPDATE $TBL SET note=? WHERE id=100" \
+	-a "text:a b	c" 2>/dev/null)
+check_equal "exec-params 把受影响行数打到 stdout" "$OUT" "1"
+check_equal "制表符也按值传递" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=100" 2>/dev/null | tail -1)" \
+	"a b	c"
+
+"$CLI" exec-params -q "UPDATE $TBL SET note=? WHERE id=100" -a null \
+	>/dev/null 2>&1
+check_exit "写 NULL 参数" 0 $?
+check_equal "NULL 参数写成 SQL NULL 而不是空串" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=100" 2>/dev/null | tail -1)" \
+	"NULL"
+
+# 无符号 64 位上界：这一条同时钉住"有符号/无符号"两边的方向。
+# 若 is_unsigned 的处理反了，-1 会被写成 18446744073709551615，
+# 或者 18446744073709551615 报 out of range。
+"$CLI" exec-params -q "UPDATE $TBL SET note=? WHERE id=100" \
+	-a uint:18446744073709551615 >/dev/null 2>&1
+check_exit "写 uint 上界" 0 $?
+check_equal "uint 上界取回" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=100" 2>/dev/null | tail -1)" \
+	"18446744073709551615"
+
+"$CLI" exec-params -q "UPDATE $TBL SET note=? WHERE id=100" -a int:-42 \
+	>/dev/null 2>&1
+check_exit "写有符号负数" 0 $?
+check_equal "有符号负数取回" \
+	"$("$CLI" sql -q "SELECT note FROM $TBL WHERE id=100" 2>/dev/null | tail -1)" \
+	"-42"
+
+# 大字段：64 KiB 远大于 MC_BLOB_CHUNK（16 KiB），走 send_long_data
+dd if=/dev/urandom of="$TMPD/p64k.bin" bs=1024 count=64 2>/dev/null
+"$CLI" exec-params -q "INSERT INTO $TBL(id, u_img) VALUES(?,?)" \
+	-a int:102 -a "blob:@$TMPD/p64k.bin" >/dev/null 2>&1
+check_exit "exec-params 写入 64 KiB BLOB" 0 $?
+"$CLI" blob-get -q "SELECT u_img FROM $TBL WHERE id=102" \
+	-o "$TMPD/p64k.out" >/dev/null 2>&1
+CHECKS=$((CHECKS + 1))
+if cmp -s "$TMPD/p64k.bin" "$TMPD/p64k.out"; then
+	printf 'ok    exec-params 的长字段往返逐字节相同\n'
+else
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-46s 字节不一致\n' "exec-params 的长字段往返"
+fi
+
+# 零字节：与"没给参数"是两件事
+: > "$TMPD/pzero.bin"
+"$CLI" exec-params -q "INSERT INTO $TBL(id, u_img) VALUES(?,?)" \
+	-a int:103 -a "blob:@$TMPD/pzero.bin" >/dev/null 2>&1
+check_exit "exec-params 写零字节 BLOB" 0 $?
+check_equal "零字节 BLOB 的长度是 0" \
+	"$("$CLI" sql -q "SELECT LENGTH(u_img) FROM $TBL WHERE id=103" 2>/dev/null | tail -1)" \
+	"0"
+
+# ---- 失败路径：都必须在连库之前或执行之前给出可读的原因 ----
+
+OUT=$("$CLI" exec-params -q "INSERT INTO $TBL(id, note) VALUES(?,?)" \
+	-a int:200 2>&1)
+check_exit "占位符多于参数时退出码 1" 1 $?
+check_contains "占位符个数不符的原因" "placeholder" "$OUT"
+
+"$CLI" exec-params -q "SELECT ?" -a int:1 >"$TMPD/params.out" 2>"$TMPD/params.err"
+check_exit "把 SELECT 交给 exec-params 时退出码 1" 1 $?
+check_contains "提示改用可返回结果集的接口" "mc_query" "$(cat "$TMPD/params.err")"
+CHECKS=$((CHECKS + 1))
+if [ -s "$TMPD/params.out" ]; then
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-46s 失败时 stdout 仍输出内容\n' "失败时 stdout 为空"
+else
+	printf 'ok    失败时 stdout 为空\n'
+fi
+
+OUT=$("$CLI" sql -q "SELECT 1" -a int:1 2>&1)
+check_exit "-a 用于 sql 时退出码 2" 2 $?
+check_contains "-a 只用于 exec-params" "exec-params" "$OUT"
+
+OUT=$("$CLI" exec-params -q "SELECT 1" -a bogus:1 2>&1)
+check_exit "未知参数类型退出码 2" 2 $?
+check_contains "未知类型列出可用类型" "int" "$OUT"
+
+OUT=$("$CLI" exec-params -q "SELECT 1" -a uint:-1 2>&1)
+check_exit "uint 负数退出码 2" 2 $?
+check_contains "uint 负数给出解释" "负数" "$OUT"
+
+OUT=$("$CLI" exec-params -q "SELECT 1" -a blob:nope 2>&1)
+check_exit "blob 缺 @ 退出码 2" 2 $?
+check_contains "blob 的写法提示" "@" "$OUT"
+
+# ------------------------------------------------------------
 # 3. 失败路径（需要服务器才能触发的那几种）
 # ------------------------------------------------------------
 

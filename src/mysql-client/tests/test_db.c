@@ -81,6 +81,12 @@ int main(void) {
 	check_long("mc_query_each(NULL)",
 	           mc_query_each(NULL, "SELECT 1", noop_row, NULL, NULL), MC_ERR_PARAM);
 	check_long("mc_exec 空 SQL",  mc_exec(NULL, "", NULL),             MC_ERR_PARAM);
+	check_long("mc_exec_params(NULL)",
+	           mc_exec_params(NULL, "SELECT ?", NULL, 0, NULL),        MC_ERR_PARAM);
+	check_long("mc_exec_params 空 SQL",
+	           mc_exec_params(NULL, "", NULL, 0, NULL),                MC_ERR_PARAM);
+	check_long("mc_exec_params 参数数组为 NULL 而 n 非 0",
+	           mc_exec_params(NULL, "SELECT ?", NULL, 1, NULL),        MC_ERR_PARAM);
 	check_long("mc_blob_write(NULL)",
 	           mc_blob_write(NULL, "x", buf, 1), MC_ERR_PARAM);
 	check_long("mc_blob_read(NULL)",

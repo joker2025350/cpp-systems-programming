@@ -73,6 +73,7 @@ CLI      := $(OUT)/mysqlclient
 TESTPURE := $(OUT)/test_pure
 TESTDB   := $(OUT)/test_db
 TESTSTRM := $(OUT)/test_stream
+TESTPARM := $(OUT)/test_params
 BENCHBIN := $(OUT)/bench_file
 
 # 库的成员。file.o / options.o / status.o 不引用任何 mysql_* 符号，
@@ -121,6 +122,10 @@ $(BENCHBIN): tests/bench_file.c $(LIB) | $(OUT)
 $(TESTSTRM): tests/test_stream.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -o $@
 
+# 参数绑定的测试：值的最终形态由服务端的类型转换决定，必须连真库
+$(TESTPARM): tests/test_params.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -o $@
+
 test: $(TESTPURE) $(TESTDB)
 	@echo
 	@$(TESTPURE)
@@ -134,9 +139,11 @@ check: $(CLI)
 # 需要一台连得上的数据库。连接参数走环境变量，与驱动层的默认值来源一致：
 #   MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root make check-live
 # 不并进 make check：没有数据库的机器上它必然全红，那样的目标没人会跑。
-check-live: $(CLI) $(TESTSTRM)
+check-live: $(CLI) $(TESTSTRM) $(TESTPARM)
 	@echo
 	@sh tests/check_live.sh $(CLI)
+	@echo "\n--- 参数绑定：类型往返与失败路径 ---"
+	@$(TESTPARM)
 	@echo "\n--- 流式取数：与物化逐格比对 ---"
 	@$(TESTSTRM)
 
@@ -181,9 +188,11 @@ sanitize-live:
 		MYSQL_CFLAGS='$(MYSQL_CFLAGS)' MYSQL_LIBS='$(MYSQL_LIBS)' \
 		sanitize-live-run
 
-sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM)
+sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM) $(TESTPARM)
 	@echo "\n--- 真实数据库往返（ASan + UBSan）---"
 	@sh tests/check_live.sh $(CLI)
+	@echo "\n--- 参数绑定（ASan + UBSan）---"
+	@$(TESTPARM)
 	@echo "\n--- 流式取数（ASan + UBSan）---"
 	@$(TESTSTRM)
 

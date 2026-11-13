@@ -63,7 +63,8 @@ static void usage(FILE *out, const char *prog) {
 	    "  sql   -q SQL              执行查询，把结果按制表符分隔打印到 stdout\n"
 	    "  each  -q SQL [-n N]       逐行取数并打印，内存占用与行数无关\n"
 	    "  exec  -q SQL              执行不返回结果集的语句，打印受影响行数\n"
-	    "  blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的第一个 ? 参数\n"
+	    "  exec-params -q SQL -a P   同上，但值走参数绑定而不是拼进 SQL\n"
+	    "  blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的唯一一个 ? 参数\n"
 	    "  blob-get -q SQL -o FILE   把单行单列的查询结果写成 FILE\n"
 	    "\n"
 	    "Options:\n"
@@ -74,6 +75,14 @@ static void usage(FILE *out, const char *prog) {
 	    "  -d DB      默认库名\n"
 	    "  -s BYTES   blob 缓冲区上限，0 表示按文件大小自动\n"
 	    "  -h         显示本说明\n"
+	    "\n"
+	    "exec-params 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：\n"
+	    "  -a int:-42        有符号 64 位整数\n"
+	    "  -a uint:18446...  无符号 64 位整数\n"
+	    "  -a double:2.5     双精度浮点\n"
+	    "  -a text:hello     文本（UTF-8，值里的引号不需要转义）\n"
+	    "  -a blob:@photo.jpg  二进制，@ 之后是文件路径\n"
+	    "  -a null           SQL NULL\n"
 	    "\n"
 	    "stdout 只输出数据，行数等摘要在 stderr，因此可以安全地接管道。\n"
 	    "sql 与 each 的输出格式相同（表头 + 制表符分隔的行），\n"
@@ -176,6 +185,187 @@ static int parse_limit(const char *text, unsigned long long *out) {
 	if ((v = getenv("MC_DB")) != NULL && v[0] != '\0') {
 		(void)copy_field(opt->database, MC_DBNAME_MAX, v, "MC_DB");
 	}
+}
+
+/* ------------------------------------------------------------------
+ * exec-params 的参数表
+ *
+ * -a 可以重复出现，个数由 SQL 里 ? 的个数决定（由库核对）。
+ * 容量直接取 argc：每个 -a 至少占两个 argv 元素，参数个数不可能超过它，
+ * 于是不需要扩容逻辑，也就没有"翻倍时溢出"这类问题要防。
+ *
+ * blob 参数需要把文件读进内存，那几块缓冲区记在 owned 里统一释放：
+ * mc_param 只保存指针，模块不拷贝数据，所以它们必须活到 exec 返回之后。
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+	mc_param *items;
+	void    **owned;
+	size_t    n;
+	size_t    owned_n;
+} param_list;
+
+static void param_list_free(param_list *list) {
+	size_t i;
+
+	for (i = 0; i < list->owned_n; i++) free(list->owned[i]);
+	free(list->owned);
+	free(list->items);
+}
+
+/*
+ * 分配一块按上限计的缓冲区。
+ *
+ * cap 为 0 时不能用 malloc(0)：C11 7.22.3.1 规定它要么返回空指针，
+ * 要么返回一个不能解引用的唯一指针，两种结果都不适合后续的读取。
+ */
+static void *alloc_payload(size_t cap, const char *what) {
+	void *p = malloc(cap);
+
+	if (p == NULL) {
+		(void)fprintf(stderr, PROG ": %s: 无法分配 %lu 字节\n",
+		              what, (unsigned long)cap);
+	}
+	return p;
+}
+
+/* 把整个文件读进一段新分配的缓冲区。cap 为 0 表示按文件大小自动。
+ * 成功返回 0 且 *out_buf 由调用方负责 free；失败已打印原因。 */
+static int load_file(const char *path, size_t cap, void **out_buf, size_t *out_len) {
+	mc_status st;
+	void     *buf;
+
+	if (cap == 0) {
+		struct stat info;
+
+		/* stat 只用来给缓冲区选一个合理的初值。失败不算错误：
+		 * 路径可能是管道，此时用默认上限。 */
+		cap = STREAM_BLOB_CAP;
+		if (stat(path, &info) == 0 && S_ISREG(info.st_mode) && info.st_size > 0) {
+			cap = (size_t)info.st_size;
+		}
+	}
+
+	buf = alloc_payload(cap, path);
+	if (buf == NULL) return -1;
+
+	st = mc_file_read(path, buf, cap, out_len);
+	if (st != MC_OK) {
+		(void)fprintf(stderr, PROG ": %s: %s: %s\n", path,
+		              mc_status_string(st), strerror(errno));
+		free(buf);
+		return -1;
+	}
+
+	*out_buf = buf;
+	return 0;
+}
+
+/* 比较 TYPE:VALUE 里冒号前的那一段 */
+static int key_is(const char *key, size_t keylen, const char *name) {
+	return strlen(name) == keylen && strncmp(key, name, keylen) == 0;
+}
+
+/*
+ * 解析一个 -a TYPE:VALUE。
+ *
+ * 类型名与 mc_param_kind 一一对应，但只覆盖"命令行能表达"的那部分：
+ * 二进制必须从文件来（argv 里放不下 '\0'），所以 blob 的写法是 @路径。
+ * 这些都不是库的设计，是驱动的选择——库里 mc_param 只有 kind 与联合体，
+ * 值的来源由调用方决定。
+ */
+static int parse_param(param_list *list, const char *text,
+                       int have_cap, size_t cap) {
+	mc_param   *p = &list->items[list->n];
+	const char *colon = strchr(text, ':');
+	const char *value;
+	size_t      keylen;
+
+	if (colon == NULL) {
+		/* 只有 null 可以省略冒号：其余类型没有"默认值"可言 */
+		keylen = strlen(text);
+		value  = "";
+	} else {
+		keylen = (size_t)(colon - text);
+		value  = colon + 1;
+	}
+
+	if (key_is(text, keylen, "null")) {
+		p->kind = MC_PARAM_NULL;
+	} else if (key_is(text, keylen, "int")) {
+		char      *end = NULL;
+		long long  v;
+
+		errno = 0;
+		v = strtoll(value, &end, 10);
+		if (value[0] == '\0' || errno != 0 || end == value || *end != '\0') {
+			(void)fprintf(stderr, PROG ": -a int 需要一个十进制整数：%s\n", text);
+			return -1;
+		}
+		p->kind = MC_PARAM_INT;
+		p->v.i  = v;
+	} else if (key_is(text, keylen, "uint")) {
+		char               *end = NULL;
+		unsigned long long  v;
+
+		/* strtoull 接受负号并回绕，这一条必须自己挡：
+		 * -a uint:-1 会变成 18446744073709551615，赋给无符号列时
+		 * 看起来"成功"了，值却不可能是使用者想要的。 */
+		if (value[0] == '-') {
+			(void)fprintf(stderr, PROG ": -a uint 不接受负数：%s\n", text);
+			return -1;
+		}
+		errno = 0;
+		v = strtoull(value, &end, 10);
+		if (value[0] == '\0' || errno != 0 || end == value || *end != '\0') {
+			(void)fprintf(stderr, PROG ": -a uint 需要一个非负整数：%s\n", text);
+			return -1;
+		}
+		p->kind = MC_PARAM_UINT;
+		p->v.u  = v;
+	} else if (key_is(text, keylen, "double")) {
+		char   *end = NULL;
+		double  v;
+
+		errno = 0;
+		v = strtod(value, &end);
+		if (value[0] == '\0' || errno != 0 || end == value || *end != '\0') {
+			(void)fprintf(stderr, PROG ": -a double 需要一个浮点数：%s\n", text);
+			return -1;
+		}
+		p->kind = MC_PARAM_DOUBLE;
+		p->v.d  = v;
+	} else if (key_is(text, keylen, "text")) {
+		/* 指向 argv，进程活着就有效；含 '\0' 的文本写不出来，
+		 * 那是 argv 的限制（C11 5.1.2.2.1：argv 的字符串以 '\0' 结尾），
+		 * 二进制内容要走 blob。 */
+		p->kind         = MC_PARAM_TEXT;
+		p->v.bytes.data = value;
+		p->v.bytes.len  = strlen(value);
+	} else if (key_is(text, keylen, "blob")) {
+		void  *buf = NULL;
+		size_t len = 0;
+
+		if (value[0] != '@' || value[1] == '\0') {
+			(void)fprintf(stderr, PROG ": -a blob 的写法是 @路径：%s\n", text);
+			return -1;
+		}
+		if (load_file(value + 1, have_cap ? cap : 0, &buf, &len) != 0) return -1;
+
+		list->owned[list->owned_n++] = buf;
+
+		p->kind         = MC_PARAM_BLOB;
+		p->v.bytes.data = buf;
+		p->v.bytes.len  = len;
+	} else {
+		(void)fprintf(stderr, PROG ": 未知的参数类型 %.*s"
+		              "（可用 int / uint / double / text / blob / null）\n",
+		              (int)keylen, text);
+		return -1;
+	}
+
+	list->n++;
+	return 0;
 }
 
 /* ------------------------------------------------------------------
@@ -321,7 +511,8 @@ static int cmd_each(mc_conn *conn, const char *sql, unsigned long long limit) {
 	return 0;
 }
 
-static int cmd_exec(mc_conn *conn, const char *sql) {	unsigned long long affected = 0;
+static int cmd_exec(mc_conn *conn, const char *sql) {
+	unsigned long long affected = 0;
 	mc_status          st = mc_exec(conn, sql, &affected);
 
 	if (st != MC_OK) {
@@ -332,22 +523,6 @@ static int cmd_exec(mc_conn *conn, const char *sql) {	unsigned long long affecte
 
 	(void)printf("%llu\n", affected);
 	return 0;
-}
-
-/*
- * 分配一块按上限计的缓冲区。
- *
- * cap 为 0 时不能用 malloc(0)：C11 7.22.3.1 规定它要么返回空指针，
- * 要么返回一个不能解引用的唯一指针，两种结果都不适合后续的读取。
- */
-static void *alloc_payload(size_t cap, const char *what) {
-	void *p = malloc(cap);
-
-	if (p == NULL) {
-		(void)fprintf(stderr, PROG ": %s: 无法分配 %lu 字节\n",
-		              what, (unsigned long)cap);
-	}
-	return p;
 }
 
 static int cmd_blob_put(mc_conn *conn, const char *sql,
@@ -361,6 +536,22 @@ static int cmd_blob_put(mc_conn *conn, const char *sql,
 	}
 
 	(void)fprintf(stderr, "写入 %lu 字节\n", (unsigned long)len);
+	return 0;
+}
+
+/* exec-params：值走参数绑定，不再拼进 SQL 文本。 */
+static int cmd_exec_params(mc_conn *conn, const char *sql,
+                           const mc_param *params, size_t n) {
+	unsigned long long affected = 0;
+	mc_status          st = mc_exec_params(conn, sql, params, n, &affected);
+
+	if (st != MC_OK) {
+		(void)fprintf(stderr, PROG ": %s (%s)\n",
+		              mc_error(conn), mc_status_string(st));
+		return 1;
+	}
+
+	(void)printf("%llu\n", affected);
 	return 0;
 }
 
@@ -418,10 +609,20 @@ int main(int argc, char *argv[]) {
 	size_t     size_hint = 0;
 	int        have_limit = 0;
 	unsigned long long limit = 0;
+	param_list plist;
 	const char *cmd;
 	const char *sql = NULL;
 	const char *infile = NULL;
 	const char *outfile = NULL;
+
+	/*
+	 * 参数表按需分配：不用 exec-params 的调用不付这份内存，
+	 * 也不会在 -h 之类的路径上留下待释放的块。
+	 */
+	plist.n       = 0;
+	plist.owned_n = 0;
+	plist.items   = NULL;
+	plist.owned   = NULL;
 
 	mc_options_init(&opt);
 	(void)copy_field(opt.host, MC_HOST_MAX, KING_DB_SERVER_IP, "host");
@@ -490,22 +691,48 @@ int main(int argc, char *argv[]) {
 
 	cmd = argv[i++];
 
-	/* 命令自己的选项：-q / -f / -o / -n，同样手工解析 */
+	/* 命令自己的选项：-q / -f / -o / -n / -a，同样手工解析 */
 	for (; i < argc; i++) {
 		const char *a = argv[i];
 
 		if (strcmp(a, "-q") == 0 || strcmp(a, "-f") == 0 ||
-		    strcmp(a, "-o") == 0 || strcmp(a, "-n") == 0) {
+		    strcmp(a, "-o") == 0 || strcmp(a, "-n") == 0 ||
+		    strcmp(a, "-a") == 0) {
 			if (i + 1 >= argc) {
 				(void)fprintf(stderr, PROG ": 选项 %s 缺少参数\n", a);
+				param_list_free(&plist);
 				return 2;
 			}
 
 			if (a[1] == 'q')      sql     = argv[++i];
 			else if (a[1] == 'f') infile  = argv[++i];
 			else if (a[1] == 'o') outfile = argv[++i];
-			else {
-				if (parse_limit(argv[++i], &limit) != 0) return 2;
+			else if (a[1] == 'a') {
+				/*
+				 * 容量取 argc：每个 -a 至少占两个 argv 元素，
+				 * 参数个数不可能超过它，因此不需要扩容逻辑，
+				 * 也就没有"翻倍时溢出"这类问题要防。
+				 */
+				if (plist.items == NULL) {
+					plist.items = (mc_param *)calloc((size_t)argc,
+					                                 sizeof *plist.items);
+					plist.owned = (void **)calloc((size_t)argc,
+					                              sizeof *plist.owned);
+					if (plist.items == NULL || plist.owned == NULL) {
+						(void)fprintf(stderr, PROG ": 无法分配参数表\n");
+						param_list_free(&plist);
+						return 1;
+					}
+				}
+				if (parse_param(&plist, argv[++i], have_size, size_hint) != 0) {
+					param_list_free(&plist);
+					return 2;
+				}
+			} else {
+				if (parse_limit(argv[++i], &limit) != 0) {
+					param_list_free(&plist);
+					return 2;
+				}
 				have_limit = 1;
 			}
 
@@ -513,6 +740,7 @@ int main(int argc, char *argv[]) {
 		}
 
 		(void)fprintf(stderr, PROG ": 无法识别的参数 %s\n", a);
+		param_list_free(&plist);
 		return 2;
 	}
 
@@ -520,44 +748,70 @@ int main(int argc, char *argv[]) {
 	if (strcmp(cmd, "ping") == 0) {
 		if (sql != NULL || infile != NULL || outfile != NULL) {
 			(void)fprintf(stderr, PROG ": ping 不接受 -q / -f / -o\n");
+			param_list_free(&plist);
 			return 2;
 		}
 	} else if (strcmp(cmd, "sql") == 0 || strcmp(cmd, "exec") == 0) {
 		if (sql == NULL || sql[0] == '\0') {
 			(void)fprintf(stderr, PROG ": %s 需要 -q SQL\n", cmd);
+			param_list_free(&plist);
 			return 2;
 		}
 	} else if (strcmp(cmd, "each") == 0) {
 		if (sql == NULL || sql[0] == '\0') {
 			(void)fprintf(stderr, PROG ": each 需要 -q SQL\n");
+			param_list_free(&plist);
 			return 2;
 		}
 		if (infile != NULL || outfile != NULL) {
 			(void)fprintf(stderr, PROG ": each 不接受 -f / -o\n");
+			param_list_free(&plist);
+			return 2;
+		}
+	} else if (strcmp(cmd, "exec-params") == 0) {
+		if (sql == NULL || sql[0] == '\0') {
+			(void)fprintf(stderr, PROG ": exec-params 需要 -q SQL\n");
+			param_list_free(&plist);
+			return 2;
+		}
+		if (infile != NULL || outfile != NULL) {
+			(void)fprintf(stderr, PROG ": exec-params 不接受 -f / -o\n");
+			param_list_free(&plist);
 			return 2;
 		}
 	} else if (strcmp(cmd, "blob-put") == 0) {
 		if (sql == NULL || infile == NULL) {
 			(void)fprintf(stderr, PROG ": blob-put 需要 -q SQL 与 -f FILE\n");
+			param_list_free(&plist);
 			return 2;
 		}
 	} else if (strcmp(cmd, "blob-get") == 0) {
 		if (sql == NULL || outfile == NULL) {
 			(void)fprintf(stderr, PROG ": blob-get 需要 -q SQL 与 -o FILE\n");
+			param_list_free(&plist);
 			return 2;
 		}
 	} else {
 		(void)fprintf(stderr, PROG ": 未知命令 %s\n", cmd);
 		usage(stderr, argv[0]);
+		param_list_free(&plist);
 		return 2;
 	}
 
 	/*
 	 * -n 只对 each 有意义。若允许别的子命令静默忽略它，
 	 * "sql -n 10" 这种写法看起来限制了行数，实际一行也没少。
+	 * -a 同理：它不是通用选项，静默忽略等于让使用者以为值绑上了。
 	 */
 	if (have_limit && strcmp(cmd, "each") != 0) {
 		(void)fprintf(stderr, PROG ": -n 只用于 each\n");
+		param_list_free(&plist);
+		return 2;
+	}
+
+	if (plist.n > 0 && strcmp(cmd, "exec-params") != 0) {
+		(void)fprintf(stderr, PROG ": -a 只用于 exec-params\n");
+		param_list_free(&plist);
 		return 2;
 	}
 
@@ -571,29 +825,9 @@ int main(int argc, char *argv[]) {
 		size_t payload_len = 0;
 
 		if (strcmp(cmd, "blob-put") == 0) {
-			size_t cap = STREAM_BLOB_CAP;
-
-			if (have_size && size_hint > 0) {
-				cap = size_hint;
-			} else {
-				struct stat info;
-
-				/* stat 只用来给缓冲区选一个合理的初值。
-				 * 失败不算错误：路径可能是管道，此时用默认上限。 */
-				if (stat(infile, &info) == 0 && S_ISREG(info.st_mode) &&
-				    info.st_size > 0) {
-					cap = (size_t)info.st_size;
-				}
-			}
-
-			payload = alloc_payload(cap, "blob-put");
-			if (payload == NULL) return 1;
-
-			st = mc_file_read(infile, payload, cap, &payload_len);
-			if (st != MC_OK) {
-				(void)fprintf(stderr, PROG ": %s: %s: %s\n", infile,
-				              mc_status_string(st), strerror(errno));
-				free(payload);
+			if (load_file(infile, have_size ? size_hint : 0,
+			              &payload, &payload_len) != 0) {
+				param_list_free(&plist);
 				return 1;
 			}
 		}
@@ -604,6 +838,7 @@ int main(int argc, char *argv[]) {
 			(void)fprintf(stderr, PROG ": %s (%s)\n",
 			              mc_error(NULL), mc_status_string(st));
 			free(payload);
+			param_list_free(&plist);
 			return 1;
 		}
 
@@ -615,6 +850,8 @@ int main(int argc, char *argv[]) {
 			rc = cmd_each(conn, sql, have_limit ? limit : 0);
 		} else if (strcmp(cmd, "exec") == 0) {
 			rc = cmd_exec(conn, sql);
+		} else if (strcmp(cmd, "exec-params") == 0) {
+			rc = cmd_exec_params(conn, sql, plist.items, plist.n);
 		} else if (strcmp(cmd, "blob-put") == 0) {
 			rc = cmd_blob_put(conn, sql, payload, payload_len);
 		} else {
@@ -628,5 +865,6 @@ int main(int argc, char *argv[]) {
 	}
 
 	mc_close(conn);
+	param_list_free(&plist);
 	return rc;
 }

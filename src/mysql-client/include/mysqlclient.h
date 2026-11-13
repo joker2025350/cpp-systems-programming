@@ -263,13 +263,111 @@ mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
                            size_t *out_rows);
 
 /* ------------------------------------------------------------------
+ * 参数绑定
+ *
+ * 术语：参数化语句（parameterized statement）指 SQL 文本里用 ?
+ * 占位、值在执行之前单独绑定的写法。服务器先把语句编译成执行计划
+ * （这一步叫 prepare），值在协议上是另一种报文，永远不会被当作 SQL
+ * 文本解析。因此值里出现引号、反斜杠、注释符都不会改变语句结构——
+ * 把值拼进 SQL 字符串则是另一回事：拼接发生在客户端，服务器看到的
+ * 已经是"一条带值的语句"，值里带的引号就会闭合字符串常量，
+ * 语句结构随之改变，这就是 SQL 注入（SQL injection）的成因。
+ *
+ * 值不拼字符串还带来两个性质：二进制数据（含 '\0'）不需要转义，
+ * 同一个值绑定到不同类型的列上也不需要再考虑字面量的写法。
+ * ------------------------------------------------------------------ */
+
+/* 参数类型。取值的语义见下面 mc_param 的注释。 */
+typedef enum {
+    MC_PARAM_NULL   = 0,  /* SQL NULL，忽略 v */
+    MC_PARAM_INT    = 1,  /* v.i，有符号 64 位 */
+    MC_PARAM_UINT   = 2,  /* v.u，无符号 64 位 */
+    MC_PARAM_DOUBLE = 3,  /* v.d，双精度浮点 */
+    MC_PARAM_TEXT   = 4,  /* v.bytes，按文本发送（MYSQL_TYPE_STRING） */
+    MC_PARAM_BLOB   = 5   /* v.bytes，按二进制发送（MYSQL_TYPE_BLOB） */
+} mc_param_kind;
+
+/*
+ * 一个参数。
+ *
+ * kind 决定读联合体里的哪个成员——这是本结构唯一的隐性约定，
+ * 也是设计上最弱的一处：C 没有"带标签的联合"的类型系统支持，
+ * 编译器不会检查"kind 与 v 的成员是否匹配"。换成六个构造函数
+ * （mc_param_int、mc_param_text……）可以把这条约定收进库里，
+ * 代价是每个类型多一个函数、多一份文档，而且调用方仍然可能在
+ * 栈上直接初始化结构体绕过它。这里选择直接暴露结构体，
+ * 用指定初始化器写出来可读性足够：
+ *
+ *     mc_param p[2] = {
+ *         { .kind = MC_PARAM_INT,  .v.i = 42 },
+ *         { .kind = MC_PARAM_TEXT, .v.bytes = { "x", 1 } },
+ *     };
+ *
+ * data 的**生命周期**：模块不拷贝数据，只把它绑上去。指针必须在
+ * mc_exec_params 返回之前一直有效（包括其中的长字段分块发送阶段）。
+ * 这一条与 mc_rows / 行回调的语义相反，用的时候容易记混，故写明。
+ *
+ * len 大于 MC_BLOB_CHUNK 的 TEXT / BLOB 参数改走 send_long_data：
+ * 内容分块送出，服务端负责拼接。此时 len 仍按字节计，
+ * 一次报文的上限由 max_allowed_packet 决定，与单次传入的长度无关。
+ */
+typedef struct {
+    mc_param_kind kind;
+    union {
+        long long          i;
+        unsigned long long u;
+        double             d;
+        struct {
+            const void *data;   /* len 为 0 时可以是 NULL */
+            size_t      len;    /* 字节数，不是字符数 */
+        } bytes;
+    } v;
+} mc_param;
+
+/* 执行一条带参数的、不返回结果集的语句（INSERT / UPDATE / DELETE / DDL）。
+ *
+ * params 的长度 n 必须与 SQL 里 ? 的个数相等，否则返回 MC_ERR_PARAM
+ * 并在 mc_error 里给出两边的数字。不检查的后果不是报错而是绑定错位：
+ * mysql_stmt_bind_param 按数组顺序填参，多给的被忽略、少给的读越界，
+ * 两种都可能让 execute 成功，只是值落到了别的列上。
+ *
+ * n 为 0 且 params 为 NULL 是合法的（等价于 mc_exec，只是多走一次
+ * prepare）。params 为 NULL 而 n 非 0 返回 MC_ERR_PARAM。
+ *
+ * kind 不在 mc_param_kind 之内、或 TEXT / BLOB 的 data 为 NULL 而 len
+ * 非 0 时返回 MC_ERR_PARAM。这两个检查在 prepare 之前完成：
+ * 它们与服务器无关，先检查就不必为一个本地错误付一次网络往返。
+ *
+ * affected 可以为 NULL；非 NULL 时只在成功路径被写入，语义与 mc_exec 相同。
+ *
+ * 与 mc_exec 的差异（都是刻意的）：
+ *   - 语句由服务器编译后执行。同一条语句反复执行时服务端可以复用执行
+ *     计划，但本接口每次调用都重新 prepare，不缓存语句句柄。
+ *   - 语句返回结果集时返回 MC_ERR_RESULT（提示改用 mc_query），
+ *     不会把行留在连接上。mc_exec 走 mysql_real_query，同样会报这个错，
+ *     但它是从 mysql_field_count 发现的，这里是 mysql_stmt_field_count。
+ *   - SQL 的长度仍按 strlen 计，因此 SQL 文本本身不能含 '\0'；
+ *     需要传二进制请放参数，不要拼进语句。
+ */
+mc_status mc_exec_params(mc_conn *conn, const char *sql,
+                         const mc_param *params, size_t n,
+                         unsigned long long *affected);
+
+/* ------------------------------------------------------------------
  * 大字段（BLOB）
  * ------------------------------------------------------------------ */
 
-/* 把 data[0..len) 写入 sql 的第一个 ? 参数。
+/* 把 data[0..len) 写入 sql 的**唯一**一个 ? 参数。
  * 数据分 MC_BLOB_CHUNK 大小的块依次发送，服务端负责拼接，
  * 因此不受单次报文长度限制——这是 send_long_data 的用途。
- * len 为 0 是合法的（写入零长度 BLOB）。 */
+ * len 为 0 是合法的（写入零长度 BLOB），data 可以同时为 NULL。
+ *
+ * 本函数是 mc_exec_params 的包装：一个 MC_PARAM_BLOB 参数、n = 1。
+ * SQL 里出现多个 ? 时返回 MC_ERR_PARAM（占位符个数与参数个数不等），
+ * 而不是只绑第一个。这条在包装之前是个隐患：那时绑定数组只有 1 个元素，
+ * mysql_stmt_bind_param 却会按占位符个数去读，第二个参数落在栈上
+ * 相邻的内存里——值不确定，却可能 execute 成功。
+ * 需要多参数时直接用 mc_exec_params。 */
 mc_status mc_blob_write(mc_conn *conn, const char *sql,
                         const void *data, size_t len);
 
