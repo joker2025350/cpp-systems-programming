@@ -25,6 +25,7 @@ const char *mc_status_string(mc_status status) {
 	case MC_ERR_STMT:       return "statement failed";
 	case MC_ERR_TOOBIG:     return "data larger than buffer";
 	case MC_ERR_NODATA:     return "no data";
+	case MC_ERR_STATE:      return "wrong object state";
 	}
 
 	/*

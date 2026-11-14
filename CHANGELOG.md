@@ -12,6 +12,77 @@
 
 ---
 
+## 2026-11-14
+
+### mysql-client（接口新增：语句对象；`mc_query_each_ex` 的内部实现被抽成共用函数，行为不变）
+
+- 新增不透明类型 `mc_stmt` 与七个函数：`mc_stmt_prepare` / `mc_stmt_param_count` /
+  `mc_stmt_columns` / `mc_stmt_execute` / `mc_stmt_rows` / `mc_stmt_each` /
+  `mc_stmt_close`。prepare 一次、execute N 次，参数在每次 execute 时给出，
+  语句可以返回结果集。
+- 新增状态码 `MC_ERR_STATE`（`wrong object state`）：未 execute 就取数、
+  结果集已经交付过再取，都返回它。
+- 为什么要改：README 8.4 记的"参数绑定只覆盖不返回结果集的语句"是最后一个接口缺口。
+  查询方向要传值仍得拼字符串，而那正是 SQL 注入的成因。补法有两种——给
+  `mc_query` / `mc_query_each_ex` 各加一个参数数组，或引入语句对象。
+  选后者：前者的签名会到七八个参数，且"参数在返回之后还有效吗""绑定失败算哪一步"
+  这类问题没有唯一答案；语句对象把这些都收在对象状态里。
+- 取数逻辑抽成 `static stream_deliver(conn, stmt, on_cols, fn, ctx, out_rows)`，
+  `mc_query_each_ex` 与 `mc_stmt_rows` / `mc_stmt_each` 共用一份。截断处理、
+  列名时机、NULL 与空串的区分只有一处实现——两条路径各自演进是这类代码最容易
+  分叉的地方。
+- 对象状态用两个布尔量（`executed` / `consumed`）表达，不用
+  `mysql_stmt_field_count()` 推断：`free_result` 之后 `field_count` 仍是 2，
+  照它判断会把"已经取过"误判成"可以再取"，交付一个 0 行的空结果集，
+  与"查询确实没有行"混成同一个结果。
+- `affected` 只在 `st->cols == 0` 时写入。返回结果集的语句不碰它——那种语句在
+  服务端的"受影响行数"与"交付了几行"含义不同，共用一个出参会被读成同一个数。
+- `mc_stmt_execute` 在绑定新参数之前显式丢弃上一轮没读完的结果集。8.0.46 的
+  `mysql_stmt_execute` 自己也会丢弃，因此这次调用没有可观测差异；
+  保留它是把"丢弃"写成显式意图，而 README 3.17 明确记录了这一点，
+  不声称断言覆盖了它。
+- 驱动层新增 `stmt -q SQL [-a P] [-r N]`：`-r` 是"执行 N 次"，只对 `stmt` 有效，
+  用在别的子命令上退出码 2。`cmd_sql` 的输出排版抽成 `print_rows()`，`sql` /
+  `each` / `stmt` 三条路径的输出逐字节一致。
+- 新增 `tests/test_stmt.c`（100 项，自建自删 `mc_stmt_db.s`）与 `check_live.sh`
+  的 2c 组（13 项）。`test_stmt --bench N` 顺带做 prepare 复用的计时。
+- 验证环境：内网 Ubuntu（Linux 6.8.0-149 / gcc 11.4.0），MySQL 8.0.46。
+  **实例是今天重建的**：验证机重启后 `/tmp` 被清、mysqld 已退出，重新从 tuna
+  镜像取七个 deb 解包到 `/tmp/mcdeps`，`--initialize-insecure` 到 `/tmp/mcdata`，
+  再在 3306 上起服务。本机 Windows 不参与构建。
+- 验证：在一份**干净工作树**上做（`tar` 打包时排除 `.git` / `bin` / `config.h`，
+  解到 `/tmp/v1114`，等价于新克隆）——默认构建 0 警告；加严构建
+  （`ci.yml` 那套十二个 `-W`，含 `-Wpedantic`）**0 条**；
+  `make test` 99 + 23、`make check` 41 全过；
+  `make check-live` **96 + 65 + 56 + 100** 全过（`check_live.sh` 83 → 96，
+  `test_stmt` 新增 100）；`make sanitize` 99 + 23 无 ASan/UBSan 报告；
+  `make sanitize-live` 96 + 65 + 56 + 100 无 ASan/UBSan/LSan 报告。
+  全仓 `make SKIP=mysql-client test` **1324 项 0 失败**，`check` 42 / 64 全绿；
+  `testdata` 未改。
+- 性能（20000 次只读 `SELECT 1, 2`，四轮）：每次 prepare 的 `mc_query_each_ex`
+  1409 ~ 1466 ms（72.2 ~ 72.7 µs/次），prepare 一次的 `mc_stmt` 589 ~ 630 ms
+  （29.8 ~ 31.5 µs/次），比值 2.31 / 2.43 / 2.33 / 2.40，**每次省 41 ~ 43 µs**。
+  前两版基准都失败：InnoDB 单行 `INSERT` 比值 1.01（每次提交等一次 `fsync`），
+  换 MEMORY 表仍是 0.94——等的是 `sync_binlog = 1` 的 binlog 落盘，与存储引擎无关。
+  基准要测"省了几次往返"，必须把写路径整个排除。
+- 反向验证四条注入：
+
+  | 注入 | `test_stmt` | `check_live` |
+  |---|---|---|
+  | 去掉 `!st->consumed` 判据 | 败 2 项 | 0 |
+  | `affected` 的写入不判 `st->cols == 0` | 败 1 项 | 0 |
+  | 删掉 `stmt_discard_result(st)` 调用 | **0** | 0 |
+
+  前两条说明"0 行"与"已经取过"必须是两个结果、`affected` 不能被结果集语句改写。
+  第三条**没有**变红：8.0.46 的 `mysql_stmt_execute` 自己会丢弃未读完的结果集，
+  两件事在这个版本上无法用行为区分。这一条没有归入"已验证覆盖"，
+  而是在 `test_stmt.c` 与 README 3.17 写明那组断言证明的是"复用不被半读破坏"。
+- 注入过程中另有一处定位值得记：`test_stmt` 首次运行时段错误（rc 139），原因是
+  `mc_query("SELECT LENGTH(s), COUNT(*) …")` 在 `sql_mode=only_full_group_by` 下
+  失败，`mc_rows` 被清零后仍访问 `cell[1]`。验证机没有 gdb，用一次临时 ASan 构建
+  定位到行号，修法是断言里加 `st == MC_OK &&` 保护、查询改成
+  `SELECT MIN(LENGTH(s)), MAX(LENGTH(s)), COUNT(*)`。
+
 ## 2026-11-13
 
 ### mysql-client（接口新增；`mc_blob_write` 有一处错误码变化）

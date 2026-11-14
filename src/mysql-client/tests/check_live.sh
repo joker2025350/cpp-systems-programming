@@ -333,6 +333,72 @@ check_exit "blob 缺 @ 退出码 2" 2 $?
 check_contains "blob 的写法提示" "@" "$OUT"
 
 # ------------------------------------------------------------
+# 2c. 语句对象（stmt）：prepare 一次、执行多次
+#
+# 与 exec-params 的差别只有 prepare 的次数，因此最有力的判据是
+# "同一份结果用 stmt 与 sql 打印出来的字节完全一致"——一旦语句对象的
+# 取数路径（二进制协议、逐行读）在 NULL / 空串 / 表头上与文本协议
+# 有一点不同，cmp 就会红。
+# ------------------------------------------------------------
+
+"$CLI" stmt -q "SELECT ? AS a, ? AS b, NULL AS c" \
+	-a int:-7 -a text:xyz > "$TMPD/stmt.out" 2>/dev/null
+check_exit "stmt 带参数取数" 0 $?
+
+"$CLI" sql -q "SELECT -7 AS a, 'xyz' AS b, NULL AS c" \
+	> "$TMPD/sql_ref.out" 2>/dev/null
+check_exit "sql 取同一结果" 0 $?
+
+CHECKS=$((CHECKS + 1))
+if cmp -s "$TMPD/stmt.out" "$TMPD/sql_ref.out"; then
+	printf 'ok    %s\n' "stmt 与 sql 的输出逐字节相同"
+else
+	FAILS=$((FAILS + 1))
+	printf 'FAIL  %-46s 两份输出不同\n' "stmt 与 sql 的输出逐字节相同"
+	diff "$TMPD/sql_ref.out" "$TMPD/stmt.out" | head -5
+fi
+
+# 无参数语句也走同一条路径
+check_equal "stmt 执行无参数语句" \
+	"$("$CLI" stmt -q "SELECT 1+1 AS v" 2>/dev/null | tail -1)" "2"
+
+# 空结果集：表头照打，一行数据也没有
+check_equal "stmt 空结果集只打印表头" \
+	"$("$CLI" stmt -q "SELECT note FROM $TBL WHERE 1=0" 2>/dev/null)" "note"
+
+# 复用：同一条 INSERT 执行 5 次，表里应当多 5 行。
+# 这条是"复用"唯一无法伪造的判据——只 prepare 一次却只执行一次，
+# 行数不会变；执行了 5 次但每次都重新 prepare，行数也会变，
+# 所以行数只管"执行了几次"，prepare 的次数由 6.4 的计时回答。
+BEFORE=$("$CLI" sql -q "SELECT COUNT(*) FROM $TBL" 2>/dev/null | tail -1)
+OUT=$("$CLI" stmt -q "INSERT INTO $TBL(note) VALUES(?)" -a text:reuse -r 5 \
+	2>&1 >/dev/null)
+check_exit "stmt -r 5 写入" 0 $?
+check_contains "摘要报告执行次数" "5 次执行" "$OUT"
+AFTER=$("$CLI" sql -q "SELECT COUNT(*) FROM $TBL" 2>/dev/null | tail -1)
+check_equal "表里多了 5 行" "$AFTER" "$((BEFORE + 5))"
+
+# 复用 + 结果集：3 次执行应当打印 3 份表头与 3 份数据。
+# 这条同时验证"上一次的结果集没读完就不能再执行"这个协议约束
+# 在驱动层是被处理过的（每次执行后都取尽了）。
+OUT=$("$CLI" stmt -q "SELECT ? AS v" -a int:9 -r 3 2>/dev/null)
+check_equal "SELECT -r 3 打印 3 份表头与 3 行数据" \
+	"$(printf '%s\n' "$OUT" | wc -l)" "6"
+
+# 参数个数不符：语句已经 prepare 成功，错在 execute 之前。
+# 用 UPDATE 而不是 INSERT：INSERT 的"占位符个数与列数不一致"会被服务端
+# 在 prepare 阶段就以 "Column count doesn't match value count" 拒掉，
+# 那样测到的是服务端的语法检查，不是本模块的占位符核对。
+OUT=$("$CLI" stmt -q "UPDATE $TBL SET note=? WHERE id=?" -a text:x 2>&1)
+check_exit "占位符多于参数时退出码 1" 1 $?
+check_contains "语句对象也报占位符个数" "placeholder" "$OUT"
+
+# -r 只对 stmt 有意义
+OUT=$("$CLI" sql -q "SELECT 1" -r 2 2>&1)
+check_exit "-r 用于 sql 时退出码 2" 2 $?
+check_contains "-r 只用于 stmt" "stmt" "$OUT"
+
+# ------------------------------------------------------------
 # 3. 失败路径（需要服务器才能触发的那几种）
 # ------------------------------------------------------------
 

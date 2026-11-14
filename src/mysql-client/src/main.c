@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /*
  * config.h 由使用者从 config.h.example 复制生成，含真实凭据，
@@ -64,6 +65,9 @@ static void usage(FILE *out, const char *prog) {
 	    "  each  -q SQL [-n N]       逐行取数并打印，内存占用与行数无关\n"
 	    "  exec  -q SQL              执行不返回结果集的语句，打印受影响行数\n"
 	    "  exec-params -q SQL -a P   同上，但值走参数绑定而不是拼进 SQL\n"
+	    "  stmt  -q SQL [-a P] [-r N]\n"
+	    "                            预编译一次、执行 N 次（默认 1），\n"
+	    "                            返回结果集的语句按 sql 的格式打印\n"
 	    "  blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的唯一一个 ? 参数\n"
 	    "  blob-get -q SQL -o FILE   把单行单列的查询结果写成 FILE\n"
 	    "\n"
@@ -76,7 +80,7 @@ static void usage(FILE *out, const char *prog) {
 	    "  -s BYTES   blob 缓冲区上限，0 表示按文件大小自动\n"
 	    "  -h         显示本说明\n"
 	    "\n"
-	    "exec-params 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：\n"
+	    "exec-params 与 stmt 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：\n"
 	    "  -a int:-42        有符号 64 位整数\n"
 	    "  -a uint:18446...  无符号 64 位整数\n"
 	    "  -a double:2.5     双精度浮点\n"
@@ -85,8 +89,8 @@ static void usage(FILE *out, const char *prog) {
 	    "  -a null           SQL NULL\n"
 	    "\n"
 	    "stdout 只输出数据，行数等摘要在 stderr，因此可以安全地接管道。\n"
-	    "sql 与 each 的输出格式相同（表头 + 制表符分隔的行），\n"
-	    "同一查询用这两个子命令打印出来的字节完全一致。\n"
+	    "sql / each / stmt 的输出格式相同（表头 + 制表符分隔的行），\n"
+	    "同一查询用这三个子命令打印出来的字节完全一致。\n"
 	    "\n"
 	    "Example:\n"
 	    "  %s -H 127.0.0.1 -u root sql -q 'SELECT 1'\n"
@@ -387,27 +391,26 @@ static int cmd_ping(mc_conn *conn) {
 	return 0;
 }
 
-static int cmd_sql(mc_conn *conn, const char *sql) {
-	mc_rows   set;
-	mc_status st = mc_query(conn, sql, &set);
-	size_t    i;
-	size_t    j;
-
-	if (st != MC_OK) {
-		(void)fprintf(stderr, PROG ": %s (%s)\n",
-		              mc_error(conn), mc_status_string(st));
-		return 1;
-	}
+/*
+ * 把一个物化结果集打印成"表头 + 制表符分隔的行"。
+ *
+ * 抽出来是为了让 sql 与 stmt 两个子命令共用同一份排版：
+ * 同一查询走文本协议（sql）与走语句对象（stmt）应当逐字节相同，
+ * 两份各自拼格式的代码迟早会出现一处改了、另一处没改。
+ */
+static void print_rows(const mc_rows *set) {
+	size_t i;
+	size_t j;
 
 	/* 表头。列数为 0 时（空结果集）只报告行数，不打印空行。 */
-	for (j = 0; j < set.cols; j++) {
-		(void)printf("%s%s", (j == 0) ? "" : "\t", set.names[j]);
+	for (j = 0; j < set->cols; j++) {
+		(void)printf("%s%s", (j == 0) ? "" : "\t", set->names[j]);
 	}
-	if (set.cols > 0) (void)printf("\n");
+	if (set->cols > 0) (void)printf("\n");
 
-	for (i = 0; i < set.rows; i++) {
-		for (j = 0; j < set.cols; j++) {
-			const char *c = MC_CELL(&set, i, j);
+	for (i = 0; i < set->rows; i++) {
+		for (j = 0; j < set->cols; j++) {
+			const char *c = MC_CELL(set, i, j);
 
 			/*
 			 * SQL NULL 与空串必须打印成两种东西。都输出空的话，
@@ -418,6 +421,19 @@ static int cmd_sql(mc_conn *conn, const char *sql) {
 		}
 		(void)printf("\n");
 	}
+}
+
+static int cmd_sql(mc_conn *conn, const char *sql) {
+	mc_rows   set;
+	mc_status st = mc_query(conn, sql, &set);
+
+	if (st != MC_OK) {
+		(void)fprintf(stderr, PROG ": %s (%s)\n",
+		              mc_error(conn), mc_status_string(st));
+		return 1;
+	}
+
+	print_rows(&set);
 
 	/* 摘要走 stderr：stdout 只留数据，才能直接接 cut / awk */
 	(void)fprintf(stderr, "%lu 行\n", (unsigned long)set.rows);
@@ -555,6 +571,85 @@ static int cmd_exec_params(mc_conn *conn, const char *sql,
 	return 0;
 }
 
+/*
+ * stmt：预编译一次、执行 repeat 次。
+ *
+ * -r 不是为了省事，而是让"复用"这件事能被脚本与文档观察到：每次执行
+ * 的结果都会打印，因此 3 次执行应当出现 3 份表头与 3 份数据；耗时与
+ * 行数摘要在 stderr，stdout 仍然只有数据。
+ *
+ * 与 exec-params 的差别只在"prepare 了几次"：同样的 SQL、同样的参数，
+ * 两者写进库里的值必须完全一样，因此它也是校验语句对象没有改变语义的
+ * 对照物（check_live.sh 里有一条整份 cmp）。
+ */
+static int cmd_stmt(mc_conn *conn, const char *sql, const mc_param *params,
+                    size_t n, unsigned long long repeat) {
+
+	mc_stmt           *st = NULL;
+	mc_status          s;
+	unsigned long long i;
+	unsigned long long total_affected = 0;
+	size_t             total_rows = 0;
+	struct timespec    t0;
+	struct timespec    t1;
+	double             ms;
+
+	if (repeat == 0) repeat = 1;
+
+	s = mc_stmt_prepare(conn, sql, &st);
+	if (s != MC_OK) {
+		(void)fprintf(stderr, PROG ": %s (%s)\n",
+		              mc_error(conn), mc_status_string(s));
+		return 1;
+	}
+
+	(void)clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	for (i = 0; i < repeat; i++) {
+		unsigned long long affected = 0;
+
+		s = mc_stmt_execute(st, params, n, &affected);
+		if (s != MC_OK) {
+			(void)fprintf(stderr, PROG ": 第 %llu 次执行：%s (%s)\n",
+			              i + 1, mc_error(conn), mc_status_string(s));
+			mc_stmt_close(st);
+			return 1;
+		}
+
+		total_affected += affected;
+
+		if (mc_stmt_columns(st) > 0) {
+			mc_rows set;
+
+			s = mc_stmt_rows(st, &set);
+			if (s != MC_OK) {
+				(void)fprintf(stderr, PROG ": 第 %llu 次取数：%s (%s)\n",
+				              i + 1, mc_error(conn), mc_status_string(s));
+				mc_stmt_close(st);
+				return 1;
+			}
+
+			print_rows(&set);
+			total_rows += set.rows;
+			mc_rows_free(&set);
+		}
+	}
+
+	(void)clock_gettime(CLOCK_MONOTONIC, &t1);
+
+	/* 两个时钟域相减要按"秒差 + 纳秒差"合成：tv_nsec 的差可以是负数，
+	 * 单独取绝对值会算错跨越整秒的那一次。 */
+	ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+	     (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+	(void)fprintf(stderr,
+	              "%llu 次执行，%lu 行，影响 %llu 行，耗时 %.3f ms\n",
+	              repeat, (unsigned long)total_rows, total_affected, ms);
+
+	mc_stmt_close(st);
+	return 0;
+}
+
 static int cmd_blob_get(mc_conn *conn, const char *sql,
                         const char *path, size_t cap) {
 	void     *buf = alloc_payload(cap, "blob-get");
@@ -609,6 +704,8 @@ int main(int argc, char *argv[]) {
 	size_t     size_hint = 0;
 	int        have_limit = 0;
 	unsigned long long limit = 0;
+	int        have_repeat = 0;
+	unsigned long long repeat = 0;
 	param_list plist;
 	const char *cmd;
 	const char *sql = NULL;
@@ -697,7 +794,7 @@ int main(int argc, char *argv[]) {
 
 		if (strcmp(a, "-q") == 0 || strcmp(a, "-f") == 0 ||
 		    strcmp(a, "-o") == 0 || strcmp(a, "-n") == 0 ||
-		    strcmp(a, "-a") == 0) {
+		    strcmp(a, "-r") == 0 || strcmp(a, "-a") == 0) {
 			if (i + 1 >= argc) {
 				(void)fprintf(stderr, PROG ": 选项 %s 缺少参数\n", a);
 				param_list_free(&plist);
@@ -729,11 +826,20 @@ int main(int argc, char *argv[]) {
 					return 2;
 				}
 			} else {
-				if (parse_limit(argv[++i], &limit) != 0) {
+				unsigned long long v;
+
+				if (parse_limit(argv[++i], &v) != 0) {
 					param_list_free(&plist);
 					return 2;
 				}
-				have_limit = 1;
+
+				if (a[1] == 'n') {
+					limit      = v;
+					have_limit = 1;
+				} else {            /* -r：执行次数 */
+					repeat      = v;
+					have_repeat = 1;
+				}
 			}
 
 			continue;
@@ -779,6 +885,17 @@ int main(int argc, char *argv[]) {
 			param_list_free(&plist);
 			return 2;
 		}
+	} else if (strcmp(cmd, "stmt") == 0) {
+		if (sql == NULL || sql[0] == '\0') {
+			(void)fprintf(stderr, PROG ": stmt 需要 -q SQL\n");
+			param_list_free(&plist);
+			return 2;
+		}
+		if (infile != NULL || outfile != NULL) {
+			(void)fprintf(stderr, PROG ": stmt 不接受 -f / -o\n");
+			param_list_free(&plist);
+			return 2;
+		}
 	} else if (strcmp(cmd, "blob-put") == 0) {
 		if (sql == NULL || infile == NULL) {
 			(void)fprintf(stderr, PROG ": blob-put 需要 -q SQL 与 -f FILE\n");
@@ -802,6 +919,7 @@ int main(int argc, char *argv[]) {
 	 * -n 只对 each 有意义。若允许别的子命令静默忽略它，
 	 * "sql -n 10" 这种写法看起来限制了行数，实际一行也没少。
 	 * -a 同理：它不是通用选项，静默忽略等于让使用者以为值绑上了。
+	 * -r 只对 stmt 有意义，理由相同。
 	 */
 	if (have_limit && strcmp(cmd, "each") != 0) {
 		(void)fprintf(stderr, PROG ": -n 只用于 each\n");
@@ -809,8 +927,15 @@ int main(int argc, char *argv[]) {
 		return 2;
 	}
 
-	if (plist.n > 0 && strcmp(cmd, "exec-params") != 0) {
-		(void)fprintf(stderr, PROG ": -a 只用于 exec-params\n");
+	if (have_repeat && strcmp(cmd, "stmt") != 0) {
+		(void)fprintf(stderr, PROG ": -r 只用于 stmt\n");
+		param_list_free(&plist);
+		return 2;
+	}
+
+	if (plist.n > 0 && strcmp(cmd, "exec-params") != 0 &&
+	    strcmp(cmd, "stmt") != 0) {
+		(void)fprintf(stderr, PROG ": -a 只用于 exec-params 与 stmt\n");
 		param_list_free(&plist);
 		return 2;
 	}
@@ -852,6 +977,9 @@ int main(int argc, char *argv[]) {
 			rc = cmd_exec(conn, sql);
 		} else if (strcmp(cmd, "exec-params") == 0) {
 			rc = cmd_exec_params(conn, sql, plist.items, plist.n);
+		} else if (strcmp(cmd, "stmt") == 0) {
+			rc = cmd_stmt(conn, sql, plist.items, plist.n,
+			              have_repeat ? repeat : 1);
 		} else if (strcmp(cmd, "blob-put") == 0) {
 			rc = cmd_blob_put(conn, sql, payload, payload_len);
 		} else {

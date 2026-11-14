@@ -59,7 +59,9 @@ typedef enum {
     MC_ERR_RESULT     = 8,   /* 结果集的行列数与接口约定不符 */
     MC_ERR_STMT       = 9,   /* 语句句柄的创建、绑定、取数环节失败 */
     MC_ERR_TOOBIG     = 10,  /* 数据超出调用方给出的缓冲区容量 */
-    MC_ERR_NODATA     = 11   /* 期望有一行数据，实际没有（或该列为 SQL NULL） */
+    MC_ERR_NODATA     = 11,  /* 期望有一行数据，实际没有（或该列为 SQL NULL） */
+    MC_ERR_STATE      = 12   /* 对象状态不允许这次操作：未执行就取数、
+                                结果集已经消费过 */
 } mc_status;
 
 /* ------------------------------------------------------------------
@@ -343,7 +345,7 @@ typedef struct {
  * 与 mc_exec 的差异（都是刻意的）：
  *   - 语句由服务器编译后执行。同一条语句反复执行时服务端可以复用执行
  *     计划，但本接口每次调用都重新 prepare，不缓存语句句柄。
- *   - 语句返回结果集时返回 MC_ERR_RESULT（提示改用 mc_query），
+ *   - 语句返回结果集时返回 MC_ERR_RESULT（提示改用 mc_query / mc_stmt），
  *     不会把行留在连接上。mc_exec 走 mysql_real_query，同样会报这个错，
  *     但它是从 mysql_field_count 发现的，这里是 mysql_stmt_field_count。
  *   - SQL 的长度仍按 strlen 计，因此 SQL 文本本身不能含 '\0'；
@@ -352,6 +354,121 @@ typedef struct {
 mc_status mc_exec_params(mc_conn *conn, const char *sql,
                          const mc_param *params, size_t n,
                          unsigned long long *affected);
+
+/* ------------------------------------------------------------------
+ * 语句对象：预编译一次，执行多次
+ *
+ * 术语：预编译语句（prepared statement）是服务器端保存的一条已编译语句。
+ * 准备（prepare）是一次往返——客户端发 COM_STMT_PREPARE，服务器解析语句、
+ * 生成执行计划，回一个语句编号与"这条语句返回什么形状"的元数据；
+ * 此后每次执行（execute）只发语句编号与参数值，SQL 文本不再出现在报文里，
+ * 服务器也不再解析。
+ *
+ * 本模块此前的接口都是"prepare 一次 → execute 一次 → 关掉"的形状：
+ * mc_exec_params、mc_query_each_ex 每次调用都重新 prepare。一问一答时这样
+ * 没有浪费，但同一条语句要执行很多次时（批量写入、按主键逐条查询、分页取数），
+ * 每次多付一次往返与一次解析。mc_stmt 把这两步拆开：prepare 得到对象，
+ * execute 调用 N 次。
+ *
+ * 两类接口的分工：
+ *   mc_exec_params / mc_query_each_ex  一次性的语句，调用方不管生命周期；
+ *   mc_stmt                            可复用的语句，调用方负责关闭。
+ * 前者等价于"prepare、执行一次、关闭"，因此两者在**结果**上没有差异，
+ * 差别只有往返次数（性能一节有实测）与对象的所有权。
+ * ------------------------------------------------------------------ */
+
+/* 语句对象（不透明）。与 mc_conn 同理：内部持有 MYSQL_STMT，
+ * 公开出去就等于把 libmysqlclient 的 ABI 写进本模块的头文件。 */
+typedef struct mc_stmt mc_stmt;
+
+/* 预编译一条语句。成功时 *out 指向新对象，失败时 *out 为 NULL。
+ *
+ * SQL 的长度按 strlen 计，因此语句文本本身不能含 '\0'；二进制值请走参数。
+ * 语法错误、表或列不存在、权限不足都在这里暴露，返回 MC_ERR_STMT，
+ * mc_error 以 "prepare: " 开头——这些错误与"执行时才知道"的错误
+ * （主键冲突、除零）不属于同一层，分开放才能让调用方决定要不要重试。
+ *
+ * 调用方必须用 mc_stmt_close 释放。对象**借用**连接：conn 必须活得比 st 长，
+ * 顺序是先 mc_stmt_close 再 mc_close——mysql_close 只会释放连接，
+ * 之后对语句句柄的任何调用都是未定义行为。
+ */
+mc_status mc_stmt_prepare(mc_conn *conn, const char *sql, mc_stmt **out);
+
+/* 语句里 ? 占位符的个数。prepare 之后即可读，用于在执行前核对参数个数。 */
+size_t mc_stmt_param_count(const mc_stmt *st);
+
+/* 结果集的列数；0 表示这条语句不返回结果集（INSERT / UPDATE / DDL）。
+ *
+ * 与 mc_exec_params 的差异在这里：那个接口把"返回结果集"当错误，
+ * 因为它的职责只是执行写语句；语句对象事先就知道形状，于是由调用方
+ * 按这个值决定走 mc_stmt_rows / mc_stmt_each 还是只读受影响行数。
+ */
+size_t mc_stmt_columns(const mc_stmt *st);
+
+/* 执行一次。params / n 的约定与 mc_exec_params 完全相同：
+ * n 必须等于 mc_stmt_param_count()，参数个数不符返回 MC_ERR_PARAM；
+ * kind 非法、TEXT / BLOB 的 data 为 NULL 而 len 非 0 在动网络之前就被拒。
+ *
+ * 参数只在本次调用期间被读取（含长字段的 send_long_data 分块阶段），
+ * execute 返回之后调用方可以立刻释放它指向的内存。语句对象**不**保存
+ * 参数缓冲区——这与 mc_query_each 的回调"只在回调期间有效"是同一类约定，
+ * 但与 mc_param 的注释并不冲突：那里说的"活到 mc_exec_params 返回之前"
+ * 在这里换成"活到 mc_stmt_execute 返回之前"。
+ *
+ * 允许语句返回结果集。返回结果集时，行由 mc_stmt_rows / mc_stmt_each 取，
+ * 二者取走的就是**这次**执行的结果；在取完（或丢弃）之前再 execute 是允许的，
+ * 实现会先把上一次的剩余行读掉丢弃——协议是半双工的，未读完的结果集占着
+ * 连接，此时直接发下一条命令会得到 "Commands out of sync"，
+ * 而"只取前 N 行就复用语句"是合法用法，报错不合适。
+ *
+ * affected 可以为 NULL；非 NULL 时**只在语句不返回结果集时**被写入
+ * （INSERT / UPDATE / DELETE 的受影响行数，语义与 mc_exec 相同）。
+ * 返回结果集时不改写它：那种语句的"受影响行数"在服务端是行数，
+ * 而"取了几行"由 *out_rows 给出，两个数含义不同，混用会误导。
+ *
+ * 执行失败（主键冲突、超出范围、断线）返回 MC_ERR_QUERY 或 MC_ERR_STMT，
+ * 对象本身仍然可用：上一次的绑定数组已经在内部释放，再 execute 不受影响。
+ * 这一点对批量写入很重要——单行失败不该让整批作废。
+ */
+mc_status mc_stmt_execute(mc_stmt *st, const mc_param *params, size_t n,
+                          unsigned long long *affected);
+
+/* 把本次执行的结果集一次取回内存，形状与 mc_query 的 mc_rows 完全一致
+ * （行优先、cell 以 '\0' 结尾、SQL NULL 为 NULL 指针、真实长度看 length）。
+ * 成功时调用方必须 mc_rows_free(out)；失败时 out 已清零，free 一次也安全。
+ *
+ * 与 mc_query 的差别在取数协议：mc_query 走文本协议并把结果集一次读进
+ * libmysqlclient 的内部缓冲，这里走二进制协议、逐行读并追加到自己的缓冲区，
+ * 两种实现的内存布局相同（名字与单元格各一段连续内存，指针数组只存偏移）。
+ * 前一列的宽度不影响后一列，单元格按"本行本列的字节数"追加，
+ * 因此不为最宽的那一列预留空间，峰值内存约等于结果集本身的字节数。
+ *
+ * 三条状态约束，违反时返回 MC_ERR_STATE 而不是给一个空结果集：
+ *   - 必须先 execute 成功；
+ *   - 语句必须返回结果集（否则返回 MC_ERR_RESULT）；
+ *   - 同一个结果集只能取一次。取过之后再调，行已经在协议层被读走，
+ *     实现无法给出第二份——返回 0 行会与"查询确实没有行"混淆。
+ * 想再读一遍就再 execute 一次：语句已经编译好，代价只有一次往返。
+ */
+mc_status mc_stmt_rows(mc_stmt *st, mc_rows *out);
+
+/* 逐行取数，语义与 mc_query_each_ex 完全相同（含 on_cols 的时机、
+ * 行回调返回非 0 表示调用方主动停止、*out_rows 计数口径、
+ * 回调里不能对同一个 conn 再发命令），只是语句由调用方预先准备好。
+ *
+ * 状态约束与 mc_stmt_rows 相同：先 execute、必须返回结果集、结果集只交付一次。
+ * 提前停止（fn 或 on_cols 返回非 0）算作已交付：剩下的行以后不再可用，
+ * 但下一次 execute 会把它们读掉丢弃，因此复用不受影响。
+ */
+mc_status mc_stmt_each(mc_stmt *st, mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                       size_t *out_rows);
+
+/* 关闭并释放语句对象。传 NULL 是安全的空操作。
+ *
+ * 调用它之前不需要把结果集读完：mysql_stmt_close 会连同未读的行一起丢掉。
+ * 但**必须先于 mc_close(conn)**——见 mc_stmt_prepare 的说明。
+ */
+void mc_stmt_close(mc_stmt *st);
 
 /* ------------------------------------------------------------------
  * 大字段（BLOB）

@@ -74,6 +74,7 @@ TESTPURE := $(OUT)/test_pure
 TESTDB   := $(OUT)/test_db
 TESTSTRM := $(OUT)/test_stream
 TESTPARM := $(OUT)/test_params
+TESTSTMT := $(OUT)/test_stmt
 BENCHBIN := $(OUT)/bench_file
 
 # 库的成员。file.o / options.o / status.o 不引用任何 mysql_* 符号，
@@ -126,6 +127,11 @@ $(TESTSTRM): tests/test_stream.c $(LIB) | $(OUT)
 $(TESTPARM): tests/test_params.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -o $@
 
+# 语句对象的测试：复用、状态约束、丢弃未读完的结果集都落在协议上。
+# 同一个二进制另有 --bench N 模式，对比"每次 prepare"与"prepare 一次"。
+$(TESTSTMT): tests/test_stmt.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -o $@
+
 test: $(TESTPURE) $(TESTDB)
 	@echo
 	@$(TESTPURE)
@@ -139,13 +145,15 @@ check: $(CLI)
 # 需要一台连得上的数据库。连接参数走环境变量，与驱动层的默认值来源一致：
 #   MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root make check-live
 # 不并进 make check：没有数据库的机器上它必然全红，那样的目标没人会跑。
-check-live: $(CLI) $(TESTSTRM) $(TESTPARM)
+check-live: $(CLI) $(TESTSTRM) $(TESTPARM) $(TESTSTMT)
 	@echo
 	@sh tests/check_live.sh $(CLI)
 	@echo "\n--- 参数绑定：类型往返与失败路径 ---"
 	@$(TESTPARM)
 	@echo "\n--- 流式取数：与物化逐格比对 ---"
 	@$(TESTSTRM)
+	@echo "\n--- 语句对象：复用与状态约束 ---"
+	@$(TESTSTMT)
 
 # 百万行下的峰值内存对照。单独一个目标是因为它要造 100 万行数据、
 # 占用几十秒和几百 MB 磁盘，不适合每次改代码都跑。
@@ -188,13 +196,15 @@ sanitize-live:
 		MYSQL_CFLAGS='$(MYSQL_CFLAGS)' MYSQL_LIBS='$(MYSQL_LIBS)' \
 		sanitize-live-run
 
-sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM) $(TESTPARM)
+sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM) $(TESTPARM) $(TESTSTMT)
 	@echo "\n--- 真实数据库往返（ASan + UBSan）---"
 	@sh tests/check_live.sh $(CLI)
 	@echo "\n--- 参数绑定（ASan + UBSan）---"
 	@$(TESTPARM)
 	@echo "\n--- 流式取数（ASan + UBSan）---"
 	@$(TESTSTRM)
+	@echo "\n--- 语句对象（ASan + UBSan）---"
+	@$(TESTSTMT)
 
 clean:
 	rm -rf $(OUT)

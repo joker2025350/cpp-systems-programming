@@ -45,9 +45,10 @@ src/mysql-client/
 │   ├── test_pure.c       纯逻辑单元测试，99 项，不链接 libmysqlclient
 │   ├── test_db.c         接口层测试，23 项，含真实建连失败路径
 │   ├── check_cli.sh      命令行端到端检查，41 项，不需要数据库
-│   ├── check_live.sh     真实数据库往返验证，83 项，需要数据库
+│   ├── check_live.sh     真实数据库往返验证，96 项，需要数据库
 │   ├── test_params.c     参数绑定，65 项，需要数据库
 │   ├── test_stream.c     流式取数，正确性 56 项 / 内存测量，需要数据库
+│   ├── test_stmt.c       语句对象，100 项，需要数据库
 │   ├── check_scale.sh    百万行下的峰值内存对照，需要数据库
 │   └── bench_file.c      文件读写吞吐测量
 ├── config.h.example      连接参数模板（config.h 不入库）
@@ -246,7 +247,70 @@ if (mc_exec_params(conn, "INSERT INTO t(a,b) VALUES(?,?)", p, 2, NULL) != MC_OK)
 
 `mc_blob_write` 现在是 `n == 1` 的 `MC_PARAM_BLOB` 包装，接口与行为保持兼容。
 
-### 2.6 大字段
+### 2.6 语句对象
+
+```c
+typedef struct mc_stmt mc_stmt;
+
+mc_status mc_stmt_prepare(mc_conn *conn, const char *sql, mc_stmt **out);
+size_t    mc_stmt_param_count(const mc_stmt *st);
+size_t    mc_stmt_columns(const mc_stmt *st);
+mc_status mc_stmt_execute(mc_stmt *st, const mc_param *params, size_t n,
+                          unsigned long long *affected);
+mc_status mc_stmt_rows(mc_stmt *st, mc_rows *out);
+mc_status mc_stmt_each(mc_stmt *st, mc_cols_fn on_cols, mc_row_fn fn,
+                       void *ctx, size_t *out_rows);
+void      mc_stmt_close(mc_stmt *st);
+```
+
+术语：**预编译语句**（prepared statement）是服务器端保存的一条已编译语句。
+准备（prepare）是一次往返——客户端发 `COM_STMT_PREPARE`，服务器解析语句、
+生成执行计划，回一个语句编号与"这条语句返回什么形状"的元数据；
+此后每次执行只发语句编号与参数值，SQL 文本不再出现在报文里，服务器也不再解析。
+
+2.5 的那些接口都是"prepare → execute → close"一步到位。一问一答时这没有浪费，
+但同一条语句要执行很多次时（批量写入、按主键逐条查询），每次多付一次往返
+与一次解析。`mc_stmt` 把三步拆开：
+
+```c
+mc_stmt *st;
+mc_param p[2] = { { .kind = MC_PARAM_INT,  .v.i = 1 },
+                  { .kind = MC_PARAM_TEXT, .v.bytes = { "x", 1 } } };
+
+if (mc_stmt_prepare(conn, "SELECT a FROM t WHERE id=? AND s=?", &st) != MC_OK) {
+        puts(mc_error(conn));
+} else {
+        mc_rows set;
+
+        if (mc_stmt_execute(st, p, 2, NULL) == MC_OK &&
+            mc_stmt_rows(st, &set) == MC_OK) {
+                /* 形状与 mc_query 的 mc_rows 完全一致 */
+                mc_rows_free(&set);
+        }
+        mc_stmt_close(st);
+}
+```
+
+七条契约（完整版在头文件）：
+
+- **对象借用连接。** `conn` 必须活得比 `st` 长，顺序是先 `mc_stmt_close`
+  再 `mc_close`——`mysql_close` 之后语句句柄失效。
+- **参数在每次 execute 时给出**，对象不保存参数缓冲区，execute 返回后即可释放。
+  个数必须等于 `mc_stmt_param_count()`，否则在动网络之前返回 `MC_ERR_PARAM`。
+- **允许返回结果集**，这与 `mc_exec_params` 相反：后者把"语句返回行"当错误，
+  因为它的职责只是执行写语句；语句对象在 prepare 时就知道形状
+  （`mc_stmt_columns`，0 表示不返回行）。
+- **结果集只能取一次。** 未 execute 就取、取过之后再取，都返回 `MC_ERR_STATE`
+  而不是给一个"0 行"——后者会与"查询确实没有行"混淆。要给同一个结果两次，
+  就再 execute 一次：语句已经编译好，代价只有一次往返。
+- **上一次没读完就再 execute 是允许的**，实现先把剩余行读掉丢弃（3.17）。
+- **执行失败不毁掉对象。** 主键冲突之后再 execute 一次正常参数仍然成功——
+  批量写入要的正是这个性质：单行失败不该让整批作废。
+- **`affected` 只在语句不返回结果集时被写入。** 返回结果集时不改写它：
+  那种语句的"受影响行数"在服务端是行数，与"交付了几行"含义不同，共用一个出参
+  会让人以为两者可以互换。
+
+### 2.7 大字段
 
 ```c
 mc_status mc_blob_write(mc_conn *conn, const char *sql,
@@ -268,7 +332,7 @@ mc_status mc_blob_read(mc_conn *conn, const char *sql,
 比"取到几行算几行"严格，是因为被覆盖的那几行不会留下任何痕迹：
 循环体每轮都从头写同一块缓冲区，最后只剩下最后一行的内容，而函数看起来是成功的。
 
-### 2.7 文件辅助
+### 2.8 文件辅助
 
 ```c
 mc_status mc_file_read(const char *path, void *buf, size_t cap, size_t *out_len);
@@ -293,7 +357,7 @@ $ ./bin/mysqlclient blob-get -q 'SELECT u_img FROM T WHERE id=1' -o export.bin
 $ ls -l export.bin          # 仍然是 0600
 ```
 
-### 2.8 驱动层
+### 2.9 驱动层
 
 ```
 Usage: mysqlclient [OPTIONS] COMMAND [COMMAND-OPTIONS]
@@ -304,13 +368,14 @@ Commands:
   each  -q SQL [-n N]       逐行取数并打印，内存占用与行数无关
   exec  -q SQL              执行不返回结果集的语句，打印受影响行数
   exec-params -q SQL -a P   同上，值走参数绑定（-a 可重复）
+  stmt  -q SQL [-a P] [-r N] 预编译一次、执行 N 次（默认 1）
   blob-put -q SQL -f FILE   把 FILE 的字节写入 SQL 的唯一一个 ? 参数
   blob-get -q SQL -o FILE   把单行单列的查询结果写成 FILE
 
 Options:
   -H HOST  -P PORT  -u USER  -p PASS  -d DB  -s BYTES  -h
 
-exec-params 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：
+exec-params 与 stmt 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：
   -a int:-42  -a uint:18446744073709551615  -a double:2.5
   -a text:hello  -a blob:@photo.jpg  -a null
 ```
@@ -321,14 +386,21 @@ exec-params 的 -a TYPE:VALUE 按出现顺序对应 SQL 里的 ?：
 `exec-params` 与 `exec` 的区别只在值的传递方式：前者把值当参数交给服务器，
 后者把值拼进 SQL 文本。前者的值里出现单引号不需要写成两个，
 `check_live.sh` 用同一份内容分别走这两条路，验证写入结果逐字相同。
-`-a` 只对 `exec-params` 有效，用在别的子命令上直接报用法错误——
+`-a` 只对 `exec-params` 与 `stmt` 有效，用在别的子命令上直接报用法错误——
 静默忽略会让使用者以为值绑上去了，而语句里其实还留着未绑定的 `?`。
 
-`sql` 与 `each` 的输出格式相同：都先打一行表头（列名，制表符分隔），再打数据行。
-因此同一查询经两个子命令打印出来的**字节完全一致**，`check_live.sh` 直接用 `cmp`
-比对整份输出。列名由 `mc_query_each_ex` 的列名回调在交付第一行之前给出，
-0 行的结果集同样打表头——表头来自元数据，与有没有行无关。
-`-n` 只对 `each` 有效，别的子命令用了它直接报用法错误——
+`stmt` 与 `exec-params` 的区别只在 prepare 的次数：同一个二进制、同一份 SQL、
+同样的参数，两者写进库里的值必须完全一样。`-r N` 让"复用"这件事可被脚本观察：
+每次执行的结果都会打印，因此 `stmt -q 'SELECT ?' -a int:9 -r 3` 的输出是
+三份"表头 + 一行"；stderr 给出执行次数、行数、受影响行数与总耗时。
+
+`sql` / `each` / `stmt` 的输出格式相同：都先打一行表头（列名，制表符分隔），
+再打数据行。因此同一查询经三个子命令打印出来的**字节完全一致**，`check_live.sh`
+直接用 `cmp` 比对整份输出——`stmt` 走的是二进制协议、逐行读，
+一旦它在 NULL、空串、表头或列名上与文本协议有一点不同，`cmp` 就会红。
+列名由 `mc_query_each_ex` 的列名回调在交付第一行之前给出，0 行的结果集同样打表头
+——表头来自元数据，与有没有行无关。
+`-n` 只对 `each` 有效、`-r` 只对 `stmt` 有效，别的子命令用了它们直接报用法错误——
 静默忽略会让 `sql -n 10` 看起来限制了行数，实际一行也没少。
 
 ---
@@ -765,6 +837,64 @@ $ ls -l out.bin    # -rw-rw-r--   0664
 `it's; DROP TABLE p; -- 注释`）。这是参数化的全部意义，与
 "`mysql_real_query` 本身是否安全"无关——拼接发生在客户端。
 
+### 3.17 语句对象：复用的是一次往返与一次解析
+
+**省下来的到底是什么。** prepare 与 execute 各占一次往返，prepare 那次还多一次
+服务端解析与优化。同一条语句执行 N 次，`mc_exec_params` 要付 2N 次往返、
+N 次解析；语句对象付 N+1 次往返、1 次解析。表观收益是"接近 2 倍"，
+但这句话只在**往返本身比语句执行便宜**时成立——所以 6.4 的量法必须把
+语句的其它成本（刷盘、锁）拿掉，否则测的是磁盘而不是协议。
+
+**为什么不用 INSERT 量。** 最初的基准是 20000 次单行 INSERT，两次运行都由
+"prepare 每次"取胜不了：每次 6.0~6.6 ms，比值 0.94~1.01。换成 MEMORY 引擎
+之后仍然是 6 ms——因为刷的是 **binlog**，不是表：8.0 默认开着 binlog 且
+`sync_binlog = 1`，每次写语句提交都要等一次 `fsync`。一次 `fsync` 是毫秒量级，
+而 prepare 省下的往返是几十微秒，信号被淹掉两个数量级。
+最终改成只读语句（`SELECT 1, 2`）才测出干净的数（6.4）。
+
+这条教训与 11-09 记的"`yes` 参数超 `MAX_ARG_STRLEN` 造出 0 字节输入"是同一类：
+**基准要先确认它量的是想量的那个东西**。测出一个 1.0 倍的比值时，
+先怀疑被测量，再怀疑实现。
+
+**取数路径只有一份。** `mc_query_each_ex` 的循环被抽成 `stream_deliver`：
+它假定语句已经 execute 成功、结果集已就绪，只做 `bind_result`、交付列名、
+逐行 fetch 与截断处理。`mc_query_each_ex` 与 `mc_stmt_each` 都调它，
+因此"数据被截断时怎么办""列名什么时候交付""SQL NULL 与空串怎么区分"
+只有一处实现。两处各写一遍的话，这些细节会各自演进，最后同一份数据在两条
+路径上给出不同的 `cell` / `length`。
+
+**物化结果集不调 `store_result`。** `mc_stmt_rows` 走的是与流式相同的逐行
+fetch，一边读一边把单元格追加到一段增长的缓冲区里；`mc_query` 则是
+`mysql_store_result` + 两遍遍历（3.3）。两者最终的内存布局一致
+（名字与单元格各一段连续内存、指针数组只存偏移），但前者不需要事先知道行数。
+收集器里记的是**偏移**而不是指针：arena 增长时 `realloc` 会让指针失效，偏移不会。
+
+**状态只有两个布尔量。**
+
+| 动作 | 前置 | 之后 |
+|---|---|---|
+| prepare 成功 | — | `executed = 0`、`consumed = 0` |
+| execute 成功 | 参数个数与 kind 合法 | `executed = 1`、`consumed = 0` |
+| 取数（rows / each）返回 | `executed && !consumed` | `consumed = 1` |
+| 再次 execute | 任意 | 先丢弃旧结果集，再置成上表第二行 |
+
+取数前判 `executed && !consumed`，任一不成立就返回 `MC_ERR_STATE`。
+不用"0 行 + MC_OK"表示这两种情况，是因为它与"查询确实没有行"不可区分——
+一个静默的空结果集比一个明确的错误码难查得多。
+
+**未读完就再执行。** 实现里在 execute 之前显式 `mysql_stmt_free_result`，
+依据是协议是半双工的：未读完的结果集占着连接，直接发下一条命令会得到
+"Commands out of sync"。但注入验证给出了一个必须写下来的反例：把这行删掉，
+`test_stmt` 的 100 项**仍然全绿**——8.0.46 的 `mysql_stmt_execute` 自己就会丢弃
+上一次没读完的行。所以那组断言能证明的是"复用不被半读破坏"，不是"显式释放被执行"。
+显式调用保留，理由是文档语义而不是实测差异；真正能区分两者的情形是服务端游标
+（`MYSQL_STMT_ATTR_CURSOR_TYPE`），本模块没有用。
+
+**`affected` 只在没有结果集时写。** 返回结果集的语句调 `mysql_stmt_affected_rows`
+拿到的是服务端报告的行数，与"交付了几行"含义不同（提前停止时两者就不等）。
+把它写进同一个出参，调用方迟早会把两者当成一回事，于是干脆不写：
+`affected` 为 NULL 或保持调用方原值，行数走 `*out_rows`。
+
 ---
 
 ## 4 构建
@@ -775,10 +905,10 @@ make lib          # 只构建静态库
 make cli          # 只构建命令行工具
 make test         # 纯逻辑 99 项 + 接口层 23 项
 make check        # 命令行端到端 41 项（不需要数据库）
-make check-live   # 真实数据库往返 83 项 + 参数绑定 65 项 + 流式比对 56 项（需要数据库，见下）
+make check-live   # 真实数据库往返 96 项 + 参数绑定 65 项 + 流式比对 56 项 + 语句对象 100 项（需要数据库，见下）
 make check-scale  # 百万行下的峰值内存对照（需要数据库，约 30 秒）
 make sanitize     # ASan + UBSan 重新构建并跑测试，产物在 bin/sanitize/
-make sanitize-live # 同上，另跑需要数据库的两套用例（需要数据库）
+make sanitize-live # 同上，另跑需要数据库的四套用例（需要数据库）
 make bench        # 文件读写吞吐
 make clean        # 删除 bin/（含全部变体）
 ```
@@ -974,7 +1104,8 @@ ok    环境变量 MC_PORT 生效
 
 ### 5.4 真实数据库往返
 
-`make check-live`，83 项（2b 组另见 5.5）。需要一台连得上的 MySQL/MariaDB：
+`make check-live`，96 项（2b 组另见 5.5，2c 组另见 5.10）。需要一台连得上的
+MySQL/MariaDB：
 
 ```bash
 MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
@@ -995,6 +1126,7 @@ MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root MC_PASSWORD= make check-live
 | 语句错误 | 表不存在 → `query`；用 `sql` / `each` 跑 UPDATE → 提示改用 `mc_exec` |
 | 绑定 | 含单引号的文本经 SQL 字面量写入后原样取回 |
 | 参数绑定 | `exec-params` 的六种类型、长字段往返、五条用法错误（28 项，明细见 5.5） |
+| 语句对象 | `stmt` 与 `sql` 的输出 `cmp` 逐字节相同、`-r 5` 多 5 行、`-r 3` 打 6 行、`-r` 只用于 `stmt`（13 项，明细见 5.10） |
 
 5 MiB 那一项同时验证了分块协议：`MC_BLOB_CHUNK` 是 16 KiB，5 MiB 要 320 次
 `send_long_data`，读回则是一次 `fetch_column`。
@@ -1108,15 +1240,16 @@ ok    流式峰值内存低于 32 MiB（与 100 万行无关）
 ### 5.8 消毒剂
 
 `make sanitize` 跑 99 + 23 项；把需要数据库的三套用例也放到插桩版上跑，用
-`make sanitize-live`（等价于 `sanitize` 再跑 `check-live`、`test_params`
-与 `test_stream`）：
+`make sanitize-live`（等价于 `sanitize` 再跑 `check-live`、`test_params`、
+`test_stream` 与 `test_stmt`）：
 
 ```
 --- 纯逻辑测试（ASan + UBSan）---   99 项检查，0 项失败
 --- 接口测试（ASan + UBSan）---     23 项检查，0 项失败
---- check_live（ASan + LSan）---    检查项 83，失败 0
+--- check_live（ASan + LSan）---    检查项 96，失败 0
 --- test_params（ASan + LSan）---   65 项检查，0 项失败
 --- test_stream（ASan + LSan）---   56 项检查，0 项失败
+--- test_stmt（ASan + LSan）---    100 项检查，0 项失败
 ```
 
 `sanitize-live` 单独一个目标而不是并进 `sanitize`，因为它要求一台连得上的
@@ -1127,6 +1260,11 @@ ok    流式峰值内存低于 32 MiB（与 100 万行无关）
 都要求释放，漏一处就会在 5 MiB 那一轮被放大成几 MB 的泄漏。
 流式路径上的泄漏点更密：每列一块缓冲区、四块指针数组，
 外加"回调提前停止"这条额外的退出路径——它在 5.6 节的用例里被走到。
+
+语句对象又添了两处：`mc_stmt` 自己那个结构体，以及它持有的 `MYSQL_STMT`。
+`test_stmt` 里有 17 处 `mc_stmt_prepare` 与同样数量的 `mc_stmt_close` 成对出现，
+prepare 失败的那几处不会产生句柄、因此不需要 close——"哪些路径要 close"
+少判一处，LeakSanitizer 就会在进程退出时把漏掉的 `MYSQL_STMT` 连分配栈一起报出来。
 
 ### 5.9 全仓
 
@@ -1142,7 +1280,57 @@ $ make SKIP=mysql-client test
 ```
 
 合计 **1324** 项。本模块自己的 `make test` 另算 122 项（99 + 23），
-要连库的 204 项（83 + 65 + 56）由 `make check-live` 负责。
+要连库的 317 项（96 + 65 + 56 + 100）由 `make check-live` 负责。
+
+### 5.10 语句对象
+
+两部分：`test_stmt`（100 项，库层）与 `check_live.sh` 的 2c 组（13 项，驱动层），
+都由 `make check-live` 一并运行。
+
+`test_stmt` 自建自删一个 `mc_stmt_db.s` 库，五组：
+
+| 组 | 项数 | 内容 |
+|---|---|---|
+| prepare 与元数据 | 29 | 占位符个数、结果集列数（`SELECT ?, ?` 是 2 列）、`sql` 为 NULL / 空串 → `PARAM`、表不存在在 prepare 阶段暴露成 `STMT` 且错误信息以 `prepare:` 开头、写语句的列数为 0、未 execute 就取数 → `STATE`、结果集取第二遍 → `STATE`、同一对象再次 execute 能再取一遍 |
+| 参数 | 15 | 少给一个参数 → `PARAM` 且错误信息带两边的个数、补上参数后同一对象仍能执行、未知 kind 先于任何网络往返被拒、跨三块的长文本连续写两次 |
+| 结果集 | 33 | 与 `mc_query` 的同一份数据逐格比对（NULL 性质、长度、内容、列名）、NULL 与空串不混、内嵌 `'\0'` 的 BLOB、空结果集也有列名、`mc_stmt_each` 与 `mc_stmt_rows` 的文本输出相同、`on_cols` 与行回调的调用次数、提前停止后丢弃、丢弃之后仍能取到完整的两行、返回结果集时不写 `affected` |
+| 复用 | 12 | 同一条 `INSERT` 执行 50 次、每次 `affected` 都是 1、表里正好 50 行且 `MIN` / `MAX` 是 0 / 49、主键冲突 → `QUERY` 且报在 `execute:` 环节、失败之后同一对象仍可执行并存进 1 行 |
+| 空操作与边界 | 11 | 七个函数在句柄为 NULL 时的返回值、`params` 为 NULL 而 `n` 非 0 → `PARAM`、无参数语句用 `n == 0` + `params == NULL` 执行 |
+
+驱动层 2c 组 13 项：
+
+| 用例 | 判据 |
+|---|---|
+| 带参数取数 | `stmt` 打印 `SELECT ? AS a, ? AS b, NULL AS c`，与 `sql` 跑等价字面量的输出 `cmp` **逐字节**相同 |
+| 无参数语句 | `SELECT 1+1` 出 `2` |
+| 空结果集 | 只打表头 |
+| `-r 5` 写入 | 退出码 0、stderr 含"5 次执行"、表里多 5 行 |
+| `-r 3` 查结果集 | 打出 3 份表头 + 3 行数据共 6 行——上一次的结果集若没取尽，第二次 execute 会撞上 `Commands out of sync` |
+| 占位符个数不符 | 退出码 1、信息含 `placeholder` |
+| `-r` 用于 `sql` | 退出码 2、提示里出现 `stmt` |
+
+"逐字节相同"这条是本节最重要的判据：语句对象走的是**二进制协议**，
+`sql` 走文本协议，两条路径在 NULL、空串、数字格式化、表头时机上任何一点
+不一致都会被 `cmp` 抓住。行数、行内容各自相等不代表字节相同。
+
+三条注入（前两条让 `test_stmt` 变红，第三条没有）：
+
+| 注入 | `test_stmt` | `check_live` |
+|---|---|---|
+| 去掉 `!st->consumed` 判据（结果集可以取第二遍） | 败 2 项 | 0 |
+| `affected` 的写入不再判 `st->cols == 0` | 败 1 项 | 0 |
+| 删掉 `stmt_discard_result(st)` 调用 | **0** | 0 |
+
+第一条失败的是"结果集取第二遍返回 STATE"与"错误信息说明已消费"。
+去掉判据之后第二遍取数走的是 `free_result` 之后的空结果集，
+返回 `MC_OK` 与 0 行——这正是"0 行"和"已经取过"必须分开报告的理由。
+第二条失败的是"执行带参数的查询"，`affected` 实际被写成 7、期望 0。
+
+第三条**没有**变红：8.0.46 的 `mysql_stmt_execute` 自己会丢弃未读完的结果集，
+显式 `free_result` 与依赖库的实现在这里没有行为差异。那组断言
+（"没读完就再执行，之后仍能取到完整两行"）证明的是**复用不被半读破坏**，
+不是"显式 `free_result` 被执行"。两件事只能靠读实现代码区分，
+所以记在 3.17，而不是声称 100 项覆盖了它。
 
 ---
 
@@ -1211,6 +1399,48 @@ $ make SKIP=mysql-client test
 
 > 数字来自 `make check-scale`。它造数据用自连接倍增（20 条语句到 100 万行），
 > 造完即删，不依赖外部 SQL 文件。
+
+### 6.4 prepare 复用的实测
+
+`test_stmt --bench N` 把两条路径交替跑 N 次，取各自总耗时：
+
+| 路径 | 每次做什么 |
+|---|---|
+| A（`mc_query_each_ex`） | `stmt_init` → `prepare` → `execute` → 取尽 → `free_result` → `close` |
+| B（`mc_stmt`） | prepare 一次；循环里 `execute` → 取尽 |
+
+语句是只读的 `SELECT 1 AS a, 2 AS b`（A）与 `SELECT ? AS a, ? AS b`（B），
+两边都返回一行两列。20000 次，四轮：
+
+```
+                 总耗时(ms)            折算每次
+A（每次 prepare）  1409 ~ 1466          72.2 ~ 72.7 µs
+B（prepare 一次）   589 ~  630          29.8 ~ 31.5 µs
+
+四轮比值：2.31 / 2.43 / 2.33 / 2.40
+```
+
+折算到每一次，B 比 A 省 **41 ~ 43 µs**，比值稳定在 2.3 ~ 2.4。
+省下的是每个语句一次 `COM_STMT_PREPARE` 往返加上服务端的一次解析——
+B 只付一次。
+
+这个数字**不是**"查询快了一倍"：两条路径执行的是同一类语句，服务端做的活一样，
+差的是每次多出来的那趟往返。真正的查询耗时（索引、扫描、聚合）两边相同，
+所以语句数越多、单语句越简单，比值越接近 2；单语句越重，比值越接近 1。
+
+两版失败的基准值得记下来，因为它们各自说明了一个坑：
+
+| 版本 | 测到的比值 | 原因 |
+|---|---|---|
+| InnoDB 单行 `INSERT` | 1.01 | 每次提交等一次 `fsync`（约 6 ms），比值里全是磁盘 |
+| MEMORY 表单行 `INSERT` | 0.94 | 换引擎没用：等的是 **binlog** 的 `sync_binlog = 1`，同样每次一次 `fsync` |
+
+第二版尤其容易误判——换掉存储引擎看起来已经排除了刷盘因素，实际上
+`--log-bin` 开着的时候，任何写语句的提交都要等 binlog 落盘。
+基准要测"prepare 省了几次往返"，就必须把写路径整个排除掉，只留只读语句。
+
+> 数字来自 `make check-live` 跑完之后手工执行
+> `MC_HOST=127.0.0.1 MC_USER=root ./test_stmt --bench 20000`。
 
 ---
 
@@ -1316,6 +1546,44 @@ $ make SKIP=mysql-client test
 blob 写作 `@路径`。`blob-put` 的文件读取逻辑一并抽成 `load_file()`，
 两处共用。`-a` 与 `-n` 一样只对特定子命令有效，用在别处直接报用法错误。
 
+### 7.6 第四轮：语句对象
+
+第三轮之后 8.4 记的是"参数绑定只覆盖不返回结果集的语句"。
+这一轮把查询方向也补上了，形状是 `mc_stmt` 而不是
+`mc_query_params`——理由在 3.17，这里记实现过程。
+
+先做的是取数的复用。`mc_query_each_ex` 原来把
+`bind_result` → 交付列名 → 循环 fetch 这三十行写在函数体里，
+语句对象要用完全一样的一段。抽成 `stream_deliver(conn, stmt, on_cols, fn, ctx, out_rows)`
+之后两条路径共用一份实现：截断处理、列名时机、NULL 与空串的区分
+不会在两条路径上各自演进——这正是"两条路径、一个语义"最容易分叉的地方。
+
+状态用两个布尔量表达（`executed` / `consumed`），而不是靠
+`mysql_stmt_field_count()` 之类的库内状态去推断。理由是库不知道
+"调用方是否还指望那份结果集"：`free_result` 之后 `field_count` 仍然是 2，
+照它判断就会把"已经取过"误判成"可以再取"，交付一个 0 行的空结果集。
+现在这条路径返回 `MC_ERR_STATE`，错误信息里带 `consumed` 一词。
+
+三处"注入才看得出"的地方：
+
+- 删掉 `mc_stmt_execute` 里的 `stmt_discard_result`，100 项仍全绿。
+  8.0.46 的 `mysql_stmt_execute` 自己会丢弃未读完的结果集，
+  所以这里没有可观测差异。保留这次调用是因为它把"丢弃"写成了显式意图，
+  而不是依赖库的实现细节——但断言不能声称覆盖了它（3.17）。
+- 去掉 `affected` 只在 `st->cols == 0` 时写入这个判据，
+  一条断言立刻变红：返回结果集的查询会把上一次写语句的 `affected`
+  留在调用方的变量里，看起来"查询影响了 7 行"。
+- 去掉 `!st->consumed` 判据，两条断言变红（第二遍取数、错误信息）。
+
+驱动层的 `stmt` 子命令是这一轮的验收工具：`-r N` 是唯一能测"prepare 一次、
+执行 N 次"的参数，而它的判据落在**输出字节**上——`stmt` 与 `sql` 跑同一份
+数据，用 `cmp` 比整份输出（5.10）。`-r` 只对 `stmt` 有效，用在 `sql` 上
+退出码 2，与 `-a` / `-n` 的处理一致。
+
+代价是多了一个不透明类型和七个函数，以及 8.4 划的那条边界向后挪了位置：
+现在"查询方向要传值"有解了，但解法的形状是语句对象，不是给
+`mc_query` 加参数。
+
 ---
 
 ## 8 已知局限
@@ -1344,17 +1612,27 @@ blob 写作 `@路径`。`blob-put` 的文件读取逻辑一并抽成 `load_file(
 `memset_s` 可以做到，代价是与平台绑定；本模块暂时不做，
 因此"密码在进程内存里可被 core dump 带出"这个风险依然存在。
 
-### 8.4 参数绑定只覆盖"不返回结果集"的语句
+### 8.4 参数绑定分在两条路径上
 
-`mc_exec_params` 能绑值，但只用于 `INSERT` / `UPDATE` / `DELETE` / DDL：
-语句返回结果集时它返回 `MC_ERR_RESULT`。查询方向（`mc_query`、
-`mc_query_each_ex`）的 `sql` 仍然只能是字面量，要传值得自己拼字符串，
-而那正是 SQL 注入的成因（问题在拼接，与 `mysql_real_query` 是否安全无关）。
+`mc_exec_params` 只用于不返回结果集的语句（返回结果集时 `MC_ERR_RESULT`）；
+查询方向要传值得用 `mc_stmt`（2.6）——`mc_query` 与 `mc_query_each_ex`
+的 `sql` 仍然只能是字面量。
 
-两条路都不难补，只是要各自定好接口：`mc_query_params` 要把参数数组
-递进 prepare → bind → execute → store 这条链；流式那条还要把
-`on_cols` 与行回调一起带过去，签名会长到看不下去，可能需要一个
-"语句对象"（`mc_stmt`）来承载。在定下来之前不急着加。
+这不是遗漏，是接口形状决定的：`mc_query` 的签名是"给我 SQL，还你结果集"，
+把参数数组塞进去之后还要决定"参数在返回之后还有没有效"、"绑定失败算哪一步"，
+而这些问题在有语句对象时都有唯一答案（参数只在 `mc_stmt_execute` 期间被读）。
+所以现在的关系是：
+
+| 场景 | 接口 |
+|---|---|
+| 无参数的查询 | `mc_query` / `mc_query_each_ex`，一次调用完成 |
+| 有参数的写语句 | `mc_exec_params` |
+| 有参数的查询、或同一语句要执行多次 | `mc_stmt_prepare` + `mc_stmt_execute` |
+
+仍然局限的是 `mc_stmt` 不做连接池、不做语句缓存，也没有 `mc_stmt_reset`
+之类的"清掉绑定状态"接口；每次 `mc_stmt_execute` 都要重新给全 `params`
+（不允许"这次只改第 2 个参数"），因为部分绑定会让"哪些槽位是上一轮的值"
+变成隐式状态。
 
 ### 8.5 只支持 MySQL 8.0 及以上
 
@@ -1420,9 +1698,12 @@ blob 写作 `@路径`。`blob-put` 的文件读取逻辑一并抽成 `load_file(
 - [ ] 密码清零：`explicit_bzero` 版本，用 `#if defined(__GLIBC__)` 包起来
 - [ ] 把 `MC_BLOB_CHUNK` 做成可配置：现在的 16 KiB 是按"小于 MTU 的整数倍"选的，
       没有实测过不同块大小的吞吐差异
-- [ ] 查询方向的参数绑定：`mc_query` / `mc_query_each_ex` 的 `sql` 仍只能是
-      字面量。难点是接口形状——把 `on_cols`、行回调、参数一起塞进签名之后
-      参数会到六七个，可能要引入 `mc_stmt` 语句对象（见 8.4）
+- [x] 查询方向的参数绑定：做成了 `mc_stmt` 语句对象（2.6 / 3.17），
+      查询与写语句共用一条取数路径（`stream_deliver`），
+      prepare 一次可执行多次（6.4 的实测：每次省 41 ~ 43 µs）
 - [ ] 参数数组的个数校验提前到编译期：目前 `n` 与占位符个数在运行期比对，
       而 `sql` 是字面量时编译器本可以数出 `?` 的个数（需要在字符串里跳过
       引号与注释，只能做启发式——暂不做）
+- [ ] `mc_stmt` 的部分绑定：现在每次 execute 都要给全 `params`。
+      做"只改第 2 个参数"需要清掉哪些槽位是上一轮值的隐式状态，
+      先想清楚语义（见 8.4）

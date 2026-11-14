@@ -582,54 +582,42 @@ static mc_status column_names_copy(mc_conn *conn, MYSQL_STMT *stmt, size_t cols,
 	return MC_OK;
 }
 
-mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
-                           mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
-                           size_t *out_rows) {
+/*
+ * 在一个已经 execute 成功、且确定返回结果集的语句上取数。
+ *
+ * 从 mc_query_each_ex 里抽出来的原因：语句对象（mc_stmt）要在同一条已编译
+ * 语句上反复取数，取数逻辑必须只有一份。两处各写一遍的话，
+ * "数据被截断时该怎么办""列名什么时候交付"这类细节会各自演进，
+ * 最后两条路径对同一份数据给出不同的 cell / length。
+ *
+ * 分工：调用方负责 prepare、execute 与关闭；这里只做 bind_result、
+ * 交付列名、循环 fetch。结果集不在这里释放——它属于调用方，
+ * 由它在下一次 execute 或 close 之前释放。
+ *
+ * cols 由调用方先判掉 0（本函数再判一次作为守卫，返回 MC_ERR_RESULT）。
+ */
+static mc_status stream_deliver(mc_conn *conn, MYSQL_STMT *stmt,
+                                mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                                size_t *out_rows) {
 
-	MYSQL_STMT   *stmt = NULL;
 	MYSQL_BIND   *bind = NULL;
 	stream_col   *col = NULL;
 	const char  **cell = NULL;
 	size_t       *length = NULL;
 	char        **names = NULL;
 	char         *name_arena = NULL;
-	size_t        cols = 0;
+	size_t        cols = (size_t)mysql_stmt_field_count(stmt);
 	size_t        j;
 	size_t        delivered = 0;
-	bool          executed = false;
 	mc_status     st = MC_OK;
 	int           ret;
 
 	/* 先写 0：后面每条失败路径都不必再操心这个出参 */
 	if (out_rows != NULL) *out_rows = 0;
 
-	if (conn == NULL || sql == NULL || sql[0] == '\0' || fn == NULL) {
-		set_error(conn, "query_each", "invalid argument");
-		return MC_ERR_PARAM;
-	}
-
-	stmt = mysql_stmt_init(conn->mysql);
-	if (stmt == NULL) {
-		set_error(conn, "stmt_init", mysql_error(conn->mysql));
-		return MC_ERR_STMT;
-	}
-
-	if (mysql_stmt_prepare(stmt, sql, (unsigned long)strlen(sql)) != 0) {
-		st = stmt_error(conn, stmt, "prepare", MC_ERR_STMT);
-		goto out;
-	}
-
-	/*
-	 * 列数来自服务器发回的元数据，prepare 之后就有。
-	 * 为 0 说明这条语句不产生结果集，与 mc_query 里的判据一致：
-	 * 把它报成错误，比让调用方对着一个空回调序列以为"没有数据"要好。
-	 */
-	cols = (size_t)mysql_stmt_field_count(stmt);
 	if (cols == 0) {
-		set_error(conn, "query_each",
-		          "statement returns no result set, use mc_exec");
-		st = MC_ERR_RESULT;
-		goto out;
+		set_error(conn, "query_each", "statement returns no result set");
+		return MC_ERR_RESULT;
 	}
 
 	bind   = (MYSQL_BIND *)calloc(cols, sizeof *bind);
@@ -672,11 +660,9 @@ mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
 		goto out;
 	}
 
-	if (mysql_stmt_execute(stmt) != 0) {
-		st = stmt_error(conn, stmt, "execute", MC_ERR_QUERY);
-		goto out;
-	}
-	executed = true;
+	/* 语句此时已经 execute 过（由调用方完成），结果集在协议层已经就绪。
+	 * bind_result 必须在 execute 之后：它绑定的是"行往哪里写"，
+	 * 而服务器发回第一行的时机由 execute 触发。 */
 
 	/*
 	 * 列名必须在第一行之前交付：驱动层打印表头要用它，而表头一旦晚于
@@ -788,6 +774,73 @@ mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
 	st = MC_OK;
 
 out:
+	if (col != NULL) {
+		for (j = 0; j < cols; j++) free(col[j].buf);
+	}
+	free(col);
+	free(bind);
+	free(cell);
+	free(length);
+	free(names);
+	free(name_arena);
+
+	if (out_rows != NULL) *out_rows = delivered;
+
+	return st;
+}
+
+mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
+                           mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                           size_t *out_rows) {
+
+	MYSQL_STMT *stmt = NULL;
+	size_t      cols;
+	bool        executed = false;
+	mc_status   st = MC_OK;
+
+	if (out_rows != NULL) *out_rows = 0;
+
+	if (conn == NULL || sql == NULL || sql[0] == '\0' || fn == NULL) {
+		set_error(conn, "query_each", "invalid argument");
+		return MC_ERR_PARAM;
+	}
+
+	stmt = mysql_stmt_init(conn->mysql);
+	if (stmt == NULL) {
+		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		return MC_ERR_STMT;
+	}
+
+	if (mysql_stmt_prepare(stmt, sql, (unsigned long)strlen(sql)) != 0) {
+		st = stmt_error(conn, stmt, "prepare", MC_ERR_STMT);
+		goto out;
+	}
+
+	/*
+	 * 列数来自服务器发回的元数据，prepare 之后就有。
+	 * 为 0 说明这条语句不产生结果集，与 mc_query 里的判据一致：
+	 * 把它报成错误，比让调用方对着一个空回调序列以为"没有数据"要好。
+	 *
+	 * 这条判据在 execute 之前，因此不动网络也就没有结果集要丢弃；
+	 * 语句对象那条路径（mc_stmt_each）判的是 prepare 时记下的列数。
+	 */
+	cols = (size_t)mysql_stmt_field_count(stmt);
+	if (cols == 0) {
+		set_error(conn, "query_each",
+		          "statement returns no result set, use mc_exec");
+		st = MC_ERR_RESULT;
+		goto out;
+	}
+
+	if (mysql_stmt_execute(stmt) != 0) {
+		st = stmt_error(conn, stmt, "execute", MC_ERR_QUERY);
+		goto out;
+	}
+	executed = true;
+
+	st = stream_deliver(conn, stmt, on_cols, fn, ctx, out_rows);
+
+out:
 	/*
 	 * free_result 不能省。提前停止时结果集里还有没读的行，
 	 * 此时直接发下一条命令会得到 "Commands out of sync"；
@@ -804,18 +857,6 @@ out:
 			st = MC_ERR_STMT;
 		}
 	}
-
-	if (col != NULL) {
-		for (j = 0; j < cols; j++) free(col[j].buf);
-	}
-	free(col);
-	free(bind);
-	free(cell);
-	free(length);
-	free(names);
-	free(name_arena);
-
-	if (out_rows != NULL) *out_rows = delivered;
 
 	return st;
 }
@@ -1193,6 +1234,484 @@ out:
 	free(slots);
 
 	return st;
+}
+
+/* ------------------------------------------------------------------
+ * 语句对象
+ *
+ * 与 mc_exec_params 的关系：后者是"prepare、执行一次、关闭"，本节把三步
+ * 拆开。参数绑定那一半直接复用 check_params / bind_params，
+ * 因此"is_unsigned 只能留 NULL""buffer_type 为 0 就是 DECIMAL"
+ * 这些实测出来的坑只有一份解释，不会在两条路径上各说一套。
+ * ------------------------------------------------------------------ */
+
+struct mc_stmt {
+	MYSQL_STMT   *stmt;
+	mc_conn      *conn;       /* 借用，不拥有 */
+	unsigned long nparams;    /* prepare 时的 ? 个数 */
+	size_t        cols;       /* 结果集列数；0 表示不返回行 */
+	bool          executed;   /* 最近一次 execute 成功 */
+	bool          consumed;   /* 那次执行的结果集已经交付完（或被丢弃） */
+};
+
+mc_status mc_stmt_prepare(mc_conn *conn, const char *sql, mc_stmt **out) {
+
+	mc_stmt *st;
+
+	if (out == NULL) return MC_ERR_PARAM;
+	*out = NULL;
+
+	if (conn == NULL || sql == NULL || sql[0] == '\0') {
+		set_error(conn, "stmt_prepare", "invalid argument");
+		return MC_ERR_PARAM;
+	}
+
+	st = (mc_stmt *)calloc(1, sizeof *st);
+	if (st == NULL) {
+		set_error(conn, "alloc", "out of memory");
+		return MC_ERR_NOMEM;
+	}
+
+	st->stmt = mysql_stmt_init(conn->mysql);
+	if (st->stmt == NULL) {
+		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		free(st);
+		return MC_ERR_STMT;
+	}
+
+	if (mysql_stmt_prepare(st->stmt, sql, (unsigned long)strlen(sql)) != 0) {
+		mc_status code = stmt_error(conn, st->stmt, "prepare", MC_ERR_STMT);
+
+		/* 错误文本必须在这里取走：close 之后 mysql_stmt_error 返回的
+		 * 指针指向已释放的内存（见本文件顶部关于错误存放位置的说明）。 */
+		(void)mysql_stmt_close(st->stmt);
+		free(st);
+		return code;
+	}
+
+	st->conn    = conn;
+	st->nparams = mysql_stmt_param_count(st->stmt);
+	st->cols    = (size_t)mysql_stmt_field_count(st->stmt);
+
+	*out = st;
+	return MC_OK;
+}
+
+size_t mc_stmt_param_count(const mc_stmt *st) {
+	return (st != NULL) ? (size_t)st->nparams : 0;
+}
+
+size_t mc_stmt_columns(const mc_stmt *st) {
+	return (st != NULL) ? st->cols : 0;
+}
+
+void mc_stmt_close(mc_stmt *st) {
+	if (st == NULL) return;
+
+	/* 未读的行由 close 一起丢掉，不必先取尽 */
+	(void)mysql_stmt_close(st->stmt);
+	free(st);
+}
+
+/*
+ * 丢弃上一次执行留下的结果集。
+ *
+ * 只在"执行过、还没取完"时才有事可做。协议是半双工的：未读完的结果集
+ * 占着这条连接，此时直接发下一条命令会得到 "Commands out of sync"。
+ * 主动丢弃而不是报错，是因为"只取前 N 行就复用语句"是合法用法。
+ */
+static void stmt_discard_result(mc_stmt *st) {
+	if (!st->executed) return;
+
+	(void)mysql_stmt_free_result(st->stmt);
+	st->executed = false;
+	st->consumed = true;
+}
+
+mc_status mc_stmt_execute(mc_stmt *st, const mc_param *params, size_t n,
+                          unsigned long long *affected) {
+
+	MYSQL_BIND    *bind = NULL;
+	param_slot    *slots = NULL;
+	mc_conn       *conn;
+	mc_status      s;
+	size_t         i;
+	my_ulonglong   rows;
+
+	if (st == NULL) return MC_ERR_PARAM;
+	if (params == NULL && n > 0) return MC_ERR_PARAM;
+
+	conn = st->conn;
+
+	/* 本地校验放在丢弃结果集之前：参数写错时不该顺手把上一次的结果集
+	 * 也丢掉，那会让"改一个参数重试"变成一次静默的数据损失。 */
+	s = check_params(conn, params, n);
+	if (s != MC_OK) return s;
+
+	if ((unsigned long)n != st->nparams) {
+		char detail[128];
+
+		(void)snprintf(detail, sizeof detail,
+		               "statement needs %lu placeholder(s), got %lu",
+		               st->nparams, (unsigned long)n);
+		set_error(conn, "execute", detail);
+		return MC_ERR_PARAM;
+	}
+
+	stmt_discard_result(st);
+
+	s = bind_params(conn, params, n, &bind, &slots);
+	if (s != MC_OK) return s;
+
+	if (n > 0 && mysql_stmt_bind_param(st->stmt, bind) != 0) {
+		s = stmt_error(conn, st->stmt, "bind_param", MC_ERR_STMT);
+		goto out;
+	}
+
+	/*
+	 * 长字段分块送。顺序与 mc_exec_params 相同：bind 之后、execute 之前。
+	 * 参数缓冲区只在本次调用期间被读，因此 execute 返回后就能释放——
+	 * 语句对象不持有它们，这是"可复用"与"不用管生命周期"能同时成立的
+	 * 前提（见头文件）。
+	 */
+	for (i = 0; i < n; i++) {
+		const void *data;
+		size_t      len;
+		size_t      off = 0;
+
+		if (params[i].kind != MC_PARAM_TEXT && params[i].kind != MC_PARAM_BLOB) {
+			continue;
+		}
+
+		len = params[i].v.bytes.len;
+		if (len <= MC_BLOB_CHUNK) continue;
+
+		data = params[i].v.bytes.data;
+
+		while (off < len) {
+			size_t chunk = len - off;
+
+			if (chunk > MC_BLOB_CHUNK) chunk = MC_BLOB_CHUNK;
+
+			if (mysql_stmt_send_long_data(st->stmt, (unsigned int)i,
+			                              (const char *)data + off,
+			                              (unsigned long)chunk) != 0) {
+				s = stmt_error(conn, st->stmt, "send_long_data", MC_ERR_STMT);
+				goto out;
+			}
+
+			off += chunk;
+		}
+	}
+
+	if (mysql_stmt_execute(st->stmt) != 0) {
+		s = stmt_error(conn, st->stmt, "execute", MC_ERR_QUERY);
+		goto out;
+	}
+
+	st->executed = true;
+	st->consumed = false;
+
+	/*
+	 * affected 只在语句不返回结果集时写入。有结果集时服务端报告的是
+	 * 行数，而"取了几行"由 *out_rows 给出——两个数含义不同，
+	 * 共用一个出参会让调用方以为 INSERT 与 SELECT 可以同样对待。
+	 */
+	if (affected != NULL && st->cols == 0) {
+		rows = mysql_stmt_affected_rows(st->stmt);
+
+		/* 与 mc_exec 同一处哨兵：(my_ulonglong)-1 表示失败 */
+		if (rows == (my_ulonglong)-1) {
+			set_error(conn, "affected_rows", mysql_stmt_error(st->stmt));
+			s = MC_ERR_QUERY;
+			goto out;
+		}
+
+		*affected = (unsigned long long)rows;
+	}
+
+	s = MC_OK;
+
+out:
+	free(bind);
+	free(slots);
+
+	return s;
+}
+
+/* ------------------------------------------------------------------
+ * mc_stmt_rows 的收集器
+ *
+ * 不能用 mc_query 那套"两遍遍历 + 一次分配"：那里靠 mysql_store_result
+ * 事先知道行数，而这里逐行 fetch（不 store，峰值内存才与结果集的字节数
+ * 成正比而不是与行数成正比）。行数未知，于是单元格按到达顺序追加到一段
+ * 增长中的内存里。
+ *
+ * 记的是**偏移**而不是指针：arena 增长时会 realloc，指针随之失效，偏移不会。
+ * 这正是 mc_rows 里 arena 与 cell 的关系，只是把"偏移换成指针"推迟到最后。
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+	mc_conn *conn;
+	size_t   cols;
+	size_t  *off;     /* 单元格在 arena 里的偏移；SIZE_MAX 表示 SQL NULL */
+	size_t  *len;     /* 单元格字节数 */
+	size_t   cells;
+	size_t   cap;     /* off / len 的容量，按元素个数计 */
+	char    *arena;
+	size_t   used;
+	size_t   acap;
+	mc_status fail;   /* 回调自己停下时的状态码；MC_OK 表示没停 */
+} rows_builder;
+
+static void builder_free(rows_builder *b) {
+	free(b->off);
+	free(b->len);
+	free(b->arena);
+
+	b->off   = NULL;
+	b->len   = NULL;
+	b->arena = NULL;
+	b->cells = 0;
+	b->cap   = 0;
+	b->used  = 0;
+	b->acap  = 0;
+}
+
+/* 让 off / len 至少能再放 need 个元素。返回 0 成功，-1 表示内存不足。 */
+static int builder_reserve_cells(rows_builder *b, size_t need) {
+	size_t  want;
+	size_t *off;
+	size_t *len;
+
+	if (need <= b->cap) return 0;
+
+	want = (b->cap != 0) ? b->cap : 64;
+	while (want < need) {
+		if (want > SIZE_MAX / 2) { want = need; break; }
+		want *= 2;
+	}
+
+	/* want * sizeof 的回绕检查：无符号乘法回绕是良定义的，但分配出来的
+	 * 数组会比要用的短，之后越界写（C11 6.5.6p8 的未定义行为）。 */
+	if (want > SIZE_MAX / sizeof *off) return -1;
+
+	off = (size_t *)realloc(b->off, want * sizeof *off);
+	if (off == NULL) return -1;
+	b->off = off;
+
+	len = (size_t *)realloc(b->len, want * sizeof *len);
+	if (len == NULL) return -1;
+	b->len = len;
+
+	b->cap = want;
+	return 0;
+}
+
+static int builder_reserve_arena(rows_builder *b, size_t need) {
+	size_t want;
+	char  *p;
+
+	if (need <= b->acap) return 0;
+
+	want = (b->acap != 0) ? b->acap : 65536;
+	while (want < need) {
+		if (want > SIZE_MAX / 2) { want = need; break; }
+		want *= 2;
+	}
+
+	p = (char *)realloc(b->arena, want);
+	if (p == NULL) return -1;
+
+	b->arena = p;
+	b->acap  = want;
+	return 0;
+}
+
+/* 行回调：把一行追加到收集器。返回非 0 让取数循环提前停止。 */
+static int rows_collect(void *ctx, const char *const *cell,
+                        const size_t *length, size_t cols) {
+	rows_builder *b = (rows_builder *)ctx;
+	size_t        total = b->used;
+	size_t        j;
+
+	if (cols != b->cols) {
+		/* 结果集的形状与 prepare 时不一致。按 b->cols 继续写会算出错误的
+		 * 行数（cells / cols），不如直接停下。 */
+		set_error(b->conn, "collect", "column count changed");
+		b->fail = MC_ERR_RESULT;
+		return 1;
+	}
+
+	/* 先把这一行需要的字节数算出来，一次扩容：逐格 realloc 会让
+	 * 十万行的查询变成十万次分配，且每次都可能失败。 */
+	for (j = 0; j < cols; j++) {
+		if (cell[j] == NULL) continue;   /* SQL NULL 不占空间 */
+		if (length[j] == SIZE_MAX || total > SIZE_MAX - (length[j] + 1)) {
+			set_error(b->conn, "alloc", "result set too large");
+			b->fail = MC_ERR_NOMEM;
+			return 1;
+		}
+		total += length[j] + 1;
+	}
+
+	if (builder_reserve_cells(b, b->cells + cols) != 0 ||
+	    builder_reserve_arena(b, total) != 0) {
+		set_error(b->conn, "alloc", "out of memory");
+		b->fail = MC_ERR_NOMEM;
+		return 1;
+	}
+
+	for (j = 0; j < cols; j++) {
+		if (cell[j] == NULL) {
+			b->off[b->cells] = SIZE_MAX;
+			b->len[b->cells] = 0;
+		} else {
+			b->off[b->cells] = b->used;
+			b->len[b->cells] = length[j];
+			(void)memcpy(b->arena + b->used, cell[j], length[j]);
+			b->arena[b->used + length[j]] = '\0';
+			b->used += length[j] + 1;
+		}
+		b->cells++;
+	}
+
+	return 0;
+}
+
+/* 把收集器的内容交给 mc_rows。成功时 arena 的所有权一并转移。 */
+static mc_status builder_take(rows_builder *b, mc_rows *out, size_t cols,
+                              char **names, char *name_arena) {
+	char   **cell = NULL;
+	size_t  *length = NULL;
+	size_t   i;
+
+	if (b->cells > 0) {
+		cell   = (char **)calloc(b->cells, sizeof *cell);
+		length = (size_t *)calloc(b->cells, sizeof *length);
+
+		if (cell == NULL || length == NULL) {
+			set_error(b->conn, "alloc", "out of memory");
+			free(cell);
+			free(length);
+			return MC_ERR_NOMEM;
+		}
+	}
+
+	for (i = 0; i < b->cells; i++) {
+		length[i] = b->len[i];
+		cell[i]   = (b->off[i] == SIZE_MAX) ? NULL : b->arena + b->off[i];
+	}
+
+	out->rows       = (cols != 0) ? (b->cells / cols) : 0;
+	out->cols       = cols;
+	out->names      = names;
+	out->cell       = cell;
+	out->length     = length;
+	out->arena      = b->arena;
+	out->name_arena = name_arena;
+
+	b->arena = NULL;    /* 所有权已转移，别再 free 一次 */
+	return MC_OK;
+}
+
+mc_status mc_stmt_rows(mc_stmt *st, mc_rows *out) {
+
+	rows_builder b;
+	char        **names = NULL;
+	char         *name_arena = NULL;
+	mc_status     s;
+	size_t        cols;
+
+	if (out == NULL) return MC_ERR_PARAM;
+	(void)memset(out, 0, sizeof *out);
+	if (st == NULL) return MC_ERR_PARAM;
+
+	if (!st->executed || st->consumed) {
+		set_error(st->conn, "stmt_rows",
+		          st->consumed ? "result set already consumed"
+		                       : "statement has not been executed");
+		return MC_ERR_STATE;
+	}
+
+	if (st->cols == 0) {
+		set_error(st->conn, "stmt_rows", "statement returns no result set");
+		return MC_ERR_RESULT;
+	}
+
+	cols = st->cols;
+
+	/* 列名先取：元数据在 execute 之后仍然有效，而这与取数顺序无关。
+	 * 空结果集也要有列名，因此不能等第一行。 */
+	s = column_names_copy(st->conn, st->stmt, cols, &names, &name_arena);
+	if (s != MC_OK) return s;
+
+	(void)memset(&b, 0, sizeof b);
+	b.conn = st->conn;
+	b.cols = cols;
+
+	s = stream_deliver(st->conn, st->stmt, NULL, rows_collect, &b, NULL);
+
+	/*
+	 * 无论成功与否，这次执行的结果集都算已消费：失败时它可能只读了一部分，
+	 * 再让调用方重试 mc_stmt_rows 会拿到半份数据。想重来就再 execute。
+	 */
+	st->consumed = true;
+
+	if (s != MC_OK) {
+		free(names);
+		free(name_arena);
+		builder_free(&b);
+		return s;
+	}
+
+	if (b.fail != MC_OK) {
+		/* 收集器自己停下（内存不足、列数变了），错误已由回调写进 conn */
+		free(names);
+		free(name_arena);
+		builder_free(&b);
+		return b.fail;
+	}
+
+	s = builder_take(&b, out, cols, names, name_arena);
+
+	/* builder_take 成功时 arena 已转移，这里只释放 off / len */
+	builder_free(&b);
+
+	if (s != MC_OK) {
+		free(names);
+		free(name_arena);
+	}
+
+	return s;
+}
+
+mc_status mc_stmt_each(mc_stmt *st, mc_cols_fn on_cols, mc_row_fn fn, void *ctx,
+                       size_t *out_rows) {
+
+	mc_status s;
+
+	if (out_rows != NULL) *out_rows = 0;
+	if (st == NULL || fn == NULL) return MC_ERR_PARAM;
+
+	if (!st->executed || st->consumed) {
+		set_error(st->conn, "stmt_each",
+		          st->consumed ? "result set already consumed"
+		                       : "statement has not been executed");
+		return MC_ERR_STATE;
+	}
+
+	if (st->cols == 0) {
+		set_error(st->conn, "stmt_each", "statement returns no result set");
+		return MC_ERR_RESULT;
+	}
+
+	s = stream_deliver(st->conn, st->stmt, on_cols, fn, ctx, out_rows);
+
+	/* 与 mc_stmt_rows 同理：交付过一次就不再交付第二次 */
+	st->consumed = true;
+
+	return s;
 }
 
 /* ------------------------------------------------------------------
