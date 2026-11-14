@@ -57,7 +57,7 @@
   `make check-live` **96 + 65 + 56 + 100** 全过（`check_live.sh` 83 → 96，
   `test_stmt` 新增 100）；`make sanitize` 99 + 23 无 ASan/UBSan 报告；
   `make sanitize-live` 96 + 65 + 56 + 100 无 ASan/UBSan/LSan 报告。
-  全仓 `make SKIP=mysql-client test` **1324 项 0 失败**，`check` 42 / 64 全绿；
+  全仓 `make SKIP=mysql-client test` **1324 项 0 失败**，`check` 42 / 50 / 64 全绿；
   `testdata` 未改。
 - 性能（20000 次只读 `SELECT 1, 2`，四轮）：每次 prepare 的 `mc_query_each_ex`
   1409 ~ 1466 ms（72.2 ~ 72.7 µs/次），prepare 一次的 `mc_stmt` 589 ~ 630 ms
