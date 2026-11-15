@@ -1,16 +1,19 @@
 /*
  * counter.h —— 并发计数器模块的公开接口
  *
- * 模块职责：提供同一个"原子/非原子自增"语义的五种实现，
+ * 模块职责：提供同一个"原子/非原子自增"语义的六种实现，
  * 让调用方在同一套接口下比较它们的正确性与吞吐。
  *
- * 五种实现：
- *   raw     裸自增，没有任何同步。数据竞争，结果必然小于期望值。
- *           存在的意义只有一个：证明竞态确实会丢更新。
- *   mutex   pthread_mutex_lock / unlock
- *   spin    pthread_spin_lock / unlock
- *   atomic  编译器 builtin __atomic_add_fetch，可移植
- *   asm     x86 内联汇编 lock; xaddq，仅在 x86 上可用
+ * 六种实现：
+ *   raw      裸自增，没有任何同步。数据竞争，结果必然小于期望值。
+ *            存在的意义只有一个：证明竞态确实会丢更新。
+ *   mutex    pthread_mutex_lock / unlock
+ *   spin     pthread_spin_lock / unlock
+ *   atomic   编译器 builtin __atomic_add_fetch，可移植
+ *   asm      x86 内联汇编 lock; xaddq，仅在 x86 上可用
+ *   adaptive 有界自旋后转阻塞：先做 COUNTER_ADAPTIVE_SPINS 次
+ *            pthread_mutex_trylock，全部失败才调 pthread_mutex_lock。
+ *            语义与 mutex 完全相同，差别只在等待策略。
  *
  * 为什么用不透明句柄（opaque handle）而不像 04/05 那样公开结构体：
  * 内部要放 pthread_mutex_t 与 pthread_spinlock_t（1.1.0 起改为指向它们的指针，
@@ -38,24 +41,25 @@ extern "C" {
 #endif
 
 #define COUNTER_VERSION_MAJOR 1
-#define COUNTER_VERSION_MINOR 1
+#define COUNTER_VERSION_MINOR 2
 #define COUNTER_VERSION_PATCH 0
 
-#define COUNTER_VERSION_STRING "1.1.0"
+#define COUNTER_VERSION_STRING "1.2.0"
 
 /* ------------------------------------------------------------------
  * 实现种类
  * ------------------------------------------------------------------ */
 
 typedef enum {
-	COUNTER_KIND_RAW    = 0,   /* 无同步，仅用于演示数据竞争 */
-	COUNTER_KIND_MUTEX  = 1,
-	COUNTER_KIND_SPIN   = 2,
-	COUNTER_KIND_ATOMIC = 3,   /* __atomic_* builtin */
-	COUNTER_KIND_ASM    = 4    /* x86 内联汇编 */
+	COUNTER_KIND_RAW      = 0,   /* 无同步，仅用于演示数据竞争 */
+	COUNTER_KIND_MUTEX    = 1,
+	COUNTER_KIND_SPIN     = 2,
+	COUNTER_KIND_ATOMIC   = 3,   /* __atomic_* builtin */
+	COUNTER_KIND_ASM      = 4,   /* x86 内联汇编 */
+	COUNTER_KIND_ADAPTIVE = 5    /* 有界自旋后转阻塞的互斥锁 */
 } counter_kind;
 
-#define COUNTER_KIND_COUNT 5
+#define COUNTER_KIND_COUNT 6
 
 /* ------------------------------------------------------------------
  * 状态码
@@ -118,8 +122,18 @@ long long counter_get(const counter *c);
  * 辅助
  * ------------------------------------------------------------------ */
 
-/* 种类的短名："raw" / "mutex" / "spin" / "atomic" / "asm" */
+/* 种类的短名："raw" / "mutex" / "spin" / "atomic" / "asm" / "adaptive" */
 const char *counter_kind_name(counter_kind kind);
+
+/*
+ * adaptive 实现的自旋上限，单位是"失败的 trylock 次数"。
+ *
+ * 这个值是编译期常量（counter.c 里的 COUNTER_ADAPTIVE_SPINS，可用 -D 覆盖），
+ * 运行期只能读、不能改。做成函数而不是把宏放进头文件，是因为阈值属于实现
+ * 细节：调用方不该据此写逻辑，但基准与测试需要把"这一轮用的是哪个阈值"
+ * 打进输出，否则两次不同阈值的运行无法区分。
+ */
+int counter_adaptive_spins(void);
 
 /* 当前平台上这种实现是否可编译、可运行 */
 int counter_kind_supported(counter_kind kind);

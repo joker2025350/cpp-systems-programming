@@ -1,8 +1,8 @@
 /*
  * counter.c —— 并发计数器模块的实现
  *
- * 五种实现共用同一个结构体，靠 kind 分派。这里用 switch 而不是函数指针表，
- * 是因为分派只有这一处，表带来的间接跳转反而让 5 个分支更难读；
+ * 六种实现共用同一个结构体，靠 kind 分派。这里用 switch 而不是函数指针表，
+ * 是因为分派只有这一处，表带来的间接跳转反而让 6 个分支更难读；
  * 等实现多到十几个、或者需要运行时注册时再换表。
  */
 
@@ -29,6 +29,36 @@
 #endif
 
 /* ------------------------------------------------------------------
+ * adaptive 的自旋阈值
+ * ------------------------------------------------------------------ */
+
+/*
+ * 失败多少次 trylock 之后放弃自旋、转入阻塞等待。
+ *
+ * 为什么是编译期常量：阈值只在"临界区有多长"这个前提确定时才有意义，
+ * 而临界区长度是调用方的属性，模块自己测不出来。做成运行期参数会让人
+ * 以为存在一个通用最优值；做成编译期常量则要求使用它的人先回答
+ * "我的临界区有多长"，再用 -D 覆盖去量。
+ *
+ * 默认值 1 是量出来的，不是抄来的。README 6.3 的扫描（10 线程、临界区
+ * 只有一条 +=）显示：阈值 1 比 mutex 慢 11%，8 慢 1.9 倍，64（glibc 的
+ * PTHREAD_MUTEX_ADAPTIVE_NP 是 100 的量级）慢 6.2 倍，线程越多差距越大。
+ * 原因是每次失败的 trylock 都要把锁所在的缓存行抢到自己手里，持锁方反而
+ * 因此变慢——等待方自旋不增加自己的成功率，却把别人的临界区拖长了。
+ * 所以默认取"试一次就睡"，把自旋留成显式选择。
+ *
+ * 下界 1 用 #error 挡住：0 会让 adaptive 退化成 mutex，而两者在功能上完全
+ * 不可区分——那样的"通过"是假的，必须在编译期拒绝。
+ */
+#ifndef COUNTER_ADAPTIVE_SPINS
+#define COUNTER_ADAPTIVE_SPINS 1
+#endif
+
+#if COUNTER_ADAPTIVE_SPINS < 1
+#error "COUNTER_ADAPTIVE_SPINS 必须 >= 1（0 等价于 mutex，没有意义）"
+#endif
+
+/* ------------------------------------------------------------------
  * 内部结构
  * ------------------------------------------------------------------ */
 
@@ -51,13 +81,17 @@
  * 于是只读接口不需要任何转型。
  *
  * 代价是 mutex / spin 两种实现各多一次分配（每个 counter 一次，不在热路径上）。
+ *
+ * adaptive 复用 mtx 那一格：它与 mutex 的状态完全相同（一把互斥锁 + 一个值），
+ * 差别只在 counter_add 的等待策略——那是行为，不是状态。给它单开一格会让
+ * union 里出现两个布局相同的成员，多出一处"两者必须同步修改"的维护点。
  */
 struct counter {
 	counter_kind kind;
 	union {
 		long long raw;
 		struct {
-			pthread_mutex_t *lock;   /* 单独分配，理由见上 */
+			pthread_mutex_t *lock;   /* 单独分配，理由见上；mutex 与 adaptive 共用 */
 			long long        value;
 		} mtx;
 		struct {
@@ -145,7 +179,8 @@ counter_status counter_create(counter_kind kind, long long initial, counter **ou
 	c->kind = kind;
 
 	switch (kind) {
-	case COUNTER_KIND_MUTEX: {
+	case COUNTER_KIND_MUTEX:
+	case COUNTER_KIND_ADAPTIVE: {
 		/*
 		 * 锁先分配、再初始化。失败路径要按"分配成功但 init 失败"回滚：
 		 * 只 free(c) 会漏掉这块锁对象，只 free(lock) 会把 c 留在半初始化
@@ -213,6 +248,7 @@ void counter_destroy(counter *c) {
 
 	switch (c->kind) {
 	case COUNTER_KIND_MUTEX:
+	case COUNTER_KIND_ADAPTIVE:
 		(void)pthread_mutex_destroy(c->u.mtx.lock);
 		free(c->u.mtx.lock);
 		break;
@@ -245,6 +281,47 @@ long long counter_add(counter *c, long long delta) {
 		{
 			long long value = c->u.mtx.value;
 			(void)pthread_mutex_unlock(c->u.mtx.lock);
+			return value;
+		}
+
+	case COUNTER_KIND_ADAPTIVE:
+		{
+			pthread_mutex_t *lock = c->u.mtx.lock;
+			long long        value;
+			int              spins;
+
+			/*
+			 * 有界自旋：最多做 COUNTER_ADAPTIVE_SPINS 次 trylock，
+			 * 全失败才转入阻塞。pthread_mutex_trylock 只区分"拿到"（0）
+			 * 与"没拿到"（非 0），按 POSIX 对普通互斥量的规定后者就是
+			 * EBUSY。这里不按错误码分支：真要出现 EINVAL 这类持久错误，
+			 * 自旋到头之后的 pthread_mutex_lock 会走同一条失败路径，
+			 * 不会因为"只认 EBUSY"而把它掩盖掉。
+			 *
+			 * 循环体里没有 pause / yield。教科书建议自旋时插一条 pause，
+			 * 但在这台 Zen 3 上量了 A/B：阈值 64 时加 pause 反而慢 4~10%
+			 * （README 6.3）。差异成因没查清，就没有为它留下一条分支——
+			 * 一条量不出收益的指令，只有在能解释它为什么该在的时候才值得留。
+			 */
+			for (spins = 0; spins < COUNTER_ADAPTIVE_SPINS; spins++) {
+				if (pthread_mutex_trylock(lock) == 0) {
+					break;
+				}
+			}
+
+			/*
+			 * 退出循环有两种原因，只能用 spins 的值区分：
+			 * 抢到了（spins < 上限，锁已在手）与自旋耗尽（spins == 上限，
+			 * 还没拿到）。再开一个 found 标志位就多一个可能写错的状态，
+			 * 而循环变量本身已经带着这个信息。
+			 */
+			if (spins == COUNTER_ADAPTIVE_SPINS) {
+				(void)pthread_mutex_lock(lock);
+			}
+
+			c->u.mtx.value += delta;
+			value = c->u.mtx.value;
+			(void)pthread_mutex_unlock(lock);
 			return value;
 		}
 
@@ -295,7 +372,12 @@ long long counter_add(counter *c, long long delta) {
 long long counter_get(const counter *c) {
 	switch (c->kind) {
 	case COUNTER_KIND_MUTEX:
+	case COUNTER_KIND_ADAPTIVE:
 		/*
+		 * adaptive 的读路径不跟着写路径自旋：读只在一轮结束时发生一次，
+		 * 自旋省下的等待时间摊到整轮里量不出来，反而多一条要维护的路径。
+		 * 若将来出现读远多于写的用法，这里应当也改成有界自旋（README 9.7）。
+		 *
 		 * 从 const counter * 上读 c->u.mtx.lock，得到的类型是
 		 * pthread_mutex_t *const（const 限定的是这个指针值，不是它指向的锁），
 		 * 拷进一个普通指针即可，不需要转型。上一版这里写的是
@@ -348,13 +430,18 @@ long long counter_get(const counter *c) {
 
 const char *counter_kind_name(counter_kind kind) {
 	switch (kind) {
-	case COUNTER_KIND_RAW:    return "raw";
-	case COUNTER_KIND_MUTEX:  return "mutex";
-	case COUNTER_KIND_SPIN:   return "spin";
-	case COUNTER_KIND_ATOMIC: return "atomic";
-	case COUNTER_KIND_ASM:    return "asm";
-	default:                  return "unknown";
+	case COUNTER_KIND_RAW:      return "raw";
+	case COUNTER_KIND_MUTEX:    return "mutex";
+	case COUNTER_KIND_SPIN:     return "spin";
+	case COUNTER_KIND_ATOMIC:   return "atomic";
+	case COUNTER_KIND_ASM:      return "asm";
+	case COUNTER_KIND_ADAPTIVE: return "adaptive";
+	default:                    return "unknown";
 	}
+}
+
+int counter_adaptive_spins(void) {
+	return COUNTER_ADAPTIVE_SPINS;
 }
 
 int counter_kind_supported(counter_kind kind) {
@@ -363,6 +450,7 @@ int counter_kind_supported(counter_kind kind) {
 	case COUNTER_KIND_MUTEX:
 	case COUNTER_KIND_SPIN:
 	case COUNTER_KIND_ATOMIC:
+	case COUNTER_KIND_ADAPTIVE:
 		return 1;
 	case COUNTER_KIND_ASM:
 		return COUNTER_HAVE_ASM;

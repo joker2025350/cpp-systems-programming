@@ -9,7 +9,7 @@
  *   演示模式          -s，每次自增后睡 1 ms，把竞态窗口放到肉眼可见
  *
  * 为什么要分两种：加 sleep 之后总耗时由 sleep 决定，完全掩盖了
- * 五种实现之间的差异，没法当性能数据用；但只有加了 sleep，raw 的
+ * 六种实现之间的差异，没法当性能数据用；但只有加了 sleep，raw 的
  * 丢更新才会稳定复现（不加的话，10 个线程抢一个缓存行，
  * 大部分自增恰好错开，丢的比例很小且不稳定）。
  *
@@ -304,7 +304,7 @@ static void usage(FILE *out, const char *prog) {
 	    "                    每个任务自增 -b 次，队列上限 -q 个待执行任务\n"
 	    "\n"
 	    "Options:\n"
-	    "  -k KIND        raw|mutex|spin|atomic|asm|all   (default: all)\n"
+	    "  -k KIND        raw|mutex|spin|atomic|asm|adaptive|all  (default: all)\n"
 	    "  -t N           线程数 / 工作线程数             (default: 10)\n"
 	    "  -n COUNT       线程驱动：每线程自增次数        (default: 1000000)\n"
 	    "                 池驱动：任务数\n"
@@ -318,7 +318,7 @@ static void usage(FILE *out, const char *prog) {
 	    "  -h             显示本说明\n"
 	    "\n"
 	    "Example:\n"
-	    "  %s -k all -t 10 -n 1000000      # 五种实现的吞吐对比\n"
+	    "  %s -k all -t 10 -n 1000000      # 六种实现的吞吐对比\n"
 	    "  %s -k raw -t 10 -n 200 -s       # 演示丢更新\n"
 	    "  %s -k atomic -p -t 8 -n 1000 -b 64   # 池驱动，1000 个任务各 64 次\n",
 	    prog, POOL_QUEUE_CAP, prog, prog, prog);
@@ -499,6 +499,17 @@ int main(int argc, char *argv[]) {
 	} else {
 		(void)printf("threads=%d  per-thread=%lld  rounds=%d  sleep=%s\n\n",
 		             threads, per_thread, rounds, sleep_each ? "on (1ms)" : "off");
+	}
+
+	/*
+	 * adaptive 的自旋阈值是编译期常量，两次不同阈值的运行在表格上完全
+	 * 看不出区别。把生效值打进表头，阈值扫描（make bench-spins）才可能
+	 * 分辨"这一行是哪次构建跑出来的"。
+	 */
+	if (run_all || kind == COUNTER_KIND_ADAPTIVE) {
+		(void)printf("adaptive-spins=%d（自旋上限，失败的 trylock 次数；"
+		             "编译期常量 COUNTER_ADAPTIVE_SPINS）\n",
+		             counter_adaptive_spins());
 	}
 
 	(void)printf("%-8s %14s %14s %6s %12s %10s\n",

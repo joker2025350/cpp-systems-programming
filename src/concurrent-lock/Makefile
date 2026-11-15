@@ -7,7 +7,8 @@
 #   make cli        只构建命令行工具 bin/counter
 #   make test       构建并运行单元测试
 #   make check      池驱动的端到端检查（tests/check_pool.sh）
-#   make bench      五种实现的吞吐对比，以及两种驱动方式的对照
+#   make bench      六种实现的吞吐对比，以及两种驱动方式的对照
+#   make bench-spins  adaptive 的自旋阈值扫描（每个阈值单独编译一次）
 #   make demo       两组对照，观察 raw 实现的更新丢失
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make tsan       TSan 重新构建并跑测试（跳过 raw，产物在 bin/tsan/）
@@ -69,7 +70,7 @@ TESTBIN  := $(OUT)/test_counter
 LIB_OBJ  := $(OUT)/counter.o
 CLI_OBJ  := $(OUT)/main.o
 
-.PHONY: all lib cli test check bench demo sanitize sanitize-run tsan tsan-run clean
+.PHONY: all lib cli test check bench bench-spins demo sanitize sanitize-run tsan tsan-run clean
 
 all: lib cli
 
@@ -119,8 +120,28 @@ bench: $(CLI)
 		$(CLI) -k atomic -p -t 8 -n $$n -b $$b -r 3 | grep -E '^(driver|atomic|池统计)'; \
 	done
 	@echo
-	@echo "===== 池驱动：batch=1 时五种实现（任务粒度 = 一次自增）====="
+	@echo "===== 池驱动：batch=1 时六种实现（任务粒度 = 一次自增）====="
 	@$(CLI) -k all -p -t 8 -n 1048576 -b 1 -r 3
+
+# ------------------------------------------------------------------
+# 阈值扫描：COUNTER_ADAPTIVE_SPINS 是编译期常量，每换一个值都要重新编译。
+#
+# 每个阈值用独立的 $(OUT)/spins-N 作为输出目录，理由与 sanitize / tsan 相同
+# （make 只比较时间戳，不比较编译选项）；这里的差别还不止选项——可执行
+# 文件名一样，共用目录时"以为换了阈值、其实还在跑上一份二进制"完全无从
+# 察觉。驱动会把生效阈值打进表头，所以每行都能自查。
+# ------------------------------------------------------------------
+SPIN_SWEEP ?= 1 8 32 64 256 1024
+
+bench-spins: $(CLI)
+	@echo "===== adaptive：自旋阈值扫描（10 线程 × 20 万次，3 轮平均）====="
+	@echo
+	@for n in $(SPIN_SWEEP); do \
+		dir=$(abspath $(OUT))/spins-$$n; \
+		$(MAKE) --no-print-directory OUT=$$dir \
+			CFLAGS='$(CFLAGS) -DCOUNTER_ADAPTIVE_SPINS='$$n cli >/dev/null || exit 1; \
+		$$dir/counter -k adaptive -t 10 -n 200000 -r 3 | grep -E '^adaptive'; \
+	done
 
 demo: $(CLI)
 	@echo "===== 高竞争：10 线程各 100 万次，不加 sleep ====="

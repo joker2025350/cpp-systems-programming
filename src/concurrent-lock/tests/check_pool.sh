@@ -90,7 +90,7 @@ echo
 # ---------------------------------------------------------------- 1. 正确性
 # 8000 次总自增，任务粒度 4，4 个工作线程。
 # asm 在非 x86 上会打印 unsupported，跳过而不是判失败。
-for kind in mutex spin atomic asm; do
+for kind in mutex spin atomic asm adaptive; do
 	capture -p -k "$kind" -t 4 -n 2000 -b 4 -r 1
 	if grep -q "unsupported" "$work/out"; then
 		echo "skip  $kind：当前平台不支持"
@@ -242,6 +242,42 @@ if [ "${1:-}" = "200000" ] && [ "${2:-0}" -ge 0 ] 2>/dev/null && [ "${2:-0}" -le
 	ok "raw 的结果落在 [0, expected] 区间内"
 else
 	bad "raw 的结果越界：${2:-?}"
+fi
+
+# ------------------------------------------------------ 8. 实现清单与阈值
+# 加一个枚举值却忘了把 COUNTER_KIND_COUNT 加一，是这轮唯一"功能测试全绿"
+# 的坏法：test_counter 里的用例大多直接调 counter_create(kind)，绕过
+# COUNT；只有 -k all 的表格行数能证明新实现真的被遍历到了。
+capture -k all -t 2 -n 100 -r 1
+expect_rc 0 "-k all"
+# 只数表格行：$2 必须是数字。文件末尾那句"raw 一行的 final 小于 expected…"
+# 的 $1 也叫 raw，不过滤掉就会数成 7 行。
+rows=$(awk '$1 ~ /^(raw|mutex|spin|atomic|asm|adaptive)$/ && $2 ~ /^[0-9]+$/' "$work/out" \
+       | wc -l | tr -d ' ')
+if [ "$rows" = "6" ]; then
+	ok "-k all 打印了 6 行实现"
+else
+	bad "-k all 应打印 6 行实现，实际 $rows"
+fi
+expect_grep "^adaptive " "-k all 里有 adaptive 行"
+expect_grep "adaptive-spins=" "表头给出了 adaptive 的自旋阈值"
+
+# 阈值必须是正数：0 会让 adaptive 静默退化成 mutex，而两者在功能上不可区分。
+spins=$(sed -n 's/^adaptive-spins=\([0-9][0-9]*\).*/\1/p' "$work/out" | head -1)
+if [ "${spins:-0}" -ge 1 ] 2>/dev/null; then
+	ok "adaptive 阈值是正整数（$spins）"
+else
+	bad "adaptive 阈值应为正整数，实际 ${spins:-?}"
+fi
+
+# -k adaptive 单独跑也要能认出来（-k 的解析走 counter_kind_name，不是硬编码表）
+capture -p -k adaptive -t 2 -n 100 -b 8 -r 1
+expect_rc 0 "-k adaptive 被接受"
+set -- $(row adaptive)
+if [ "${1:-}" = "800" ] && [ "${2:-}" = "800" ] && [ "${3:-}" = "yes" ]; then
+	ok "adaptive 单独指定：expected=800 final=800 match=yes"
+else
+	bad "adaptive 单独指定：期望 800/800/yes，实际 ${1:-?}/${2:-?}/${3:-?}"
 fi
 
 echo

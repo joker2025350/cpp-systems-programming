@@ -2,8 +2,8 @@
  * test_counter.c —— counter 模块的单元测试
  *
  * 重点是三件事：
- *   1. 单线程下五种实现的结果都必须正确（这是基线）
- *   2. 多线程下四种同步实现的结果必须精确等于 线程数 × 每线程次数
+ *   1. 单线程下六种实现的结果都必须正确（这是基线）
+ *   2. 多线程下五种同步实现的结果必须精确等于 线程数 × 每线程次数
  *   3. raw 在同样条件下会丢更新——这里只记录、不断言，
  *      因为它按定义是数据竞争，结果没有任何保证
  *
@@ -173,7 +173,7 @@ static void test_initial_value(void) {
 	}
 }
 
-/* 单线程：五种实现都必须给出正确结果，这是基线 */
+/* 单线程：六种实现都必须给出正确结果，这是基线 */
 static void test_single_thread(void) {
 	for (int k = 0; k < COUNTER_KIND_COUNT; k++) {
 		counter_kind kind = (counter_kind)k;
@@ -300,15 +300,21 @@ static void test_kind_helpers(void) {
 	expect_true("spin 是原子的", counter_kind_is_atomic(COUNTER_KIND_SPIN) != 0);
 	expect_true("atomic 是原子的", counter_kind_is_atomic(COUNTER_KIND_ATOMIC) != 0);
 	expect_true("asm 是原子的", counter_kind_is_atomic(COUNTER_KIND_ASM) != 0);
+	expect_true("adaptive 是原子的",
+	            counter_kind_is_atomic(COUNTER_KIND_ADAPTIVE) != 0);
 
 	expect_true("kind_name(raw) == raw",
 	            strcmp(counter_kind_name(COUNTER_KIND_RAW), "raw") == 0);
 	expect_true("kind_name(atomic) == atomic",
 	            strcmp(counter_kind_name(COUNTER_KIND_ATOMIC), "atomic") == 0);
+	expect_true("kind_name(adaptive) == adaptive",
+	            strcmp(counter_kind_name(COUNTER_KIND_ADAPTIVE), "adaptive") == 0);
 	expect_true("未知 kind 有名字",
 	            counter_kind_name((counter_kind)99) != NULL);
 
 	expect_true("raw 总是可用", counter_kind_supported(COUNTER_KIND_RAW) != 0);
+	expect_true("adaptive 总是可用",
+	            counter_kind_supported(COUNTER_KIND_ADAPTIVE) != 0);
 	expect_true("未知 kind 不可用", counter_kind_supported((counter_kind)99) == 0);
 }
 
@@ -353,7 +359,7 @@ _Static_assert(_Generic(&counter_get, long long (*)(const counter *): 1, default
 static void test_const_get(void) {
 	static const counter_kind kinds[] = {
 		COUNTER_KIND_MUTEX, COUNTER_KIND_SPIN,
-		COUNTER_KIND_ATOMIC, COUNTER_KIND_ASM
+		COUNTER_KIND_ATOMIC, COUNTER_KIND_ASM, COUNTER_KIND_ADAPTIVE
 	};
 
 	for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
@@ -383,6 +389,46 @@ static void test_const_get(void) {
 
 /* ---------------------------------------------------------------- */
 
+/*
+ * adaptive：语义与 mutex 完全相同，差别只在"等锁时先自旋多少次"。
+ *
+ * 这意味着**功能测试抓不到它的实现被写坏**：把自旋上限改成 1、改成 1000、
+ * 甚至直接把 trylock 循环删掉退回 mutex，这里所有断言都照样通过。
+ * 这一点必须如实写在文档里（README 5.6），能区分不同阈值的只有耗时数据。
+ *
+ * 这里能断言的只有两件事：
+ *   1. 阈值读数与编译期常量一致、且为正——两者脱节时读数是 0，
+ *      那样 adaptive 会静默退化成 mutex；
+ *   2. 高竞争下走完"自旋耗尽 → 阻塞"这条路径，结果仍一条不丢。
+ */
+static void test_adaptive(void) {
+	int  spins = counter_adaptive_spins();
+	char label[64];
+
+	expect_true("adaptive 的阈值 >= 1", spins >= 1);
+	expect_int("阈值读数两次相同", counter_adaptive_spins(), spins);
+
+	/*
+	 * 16 个线程抢一把锁：比 test_multi_thread_exact 的 8 线程更容易让
+	 * 等待方走完整个自旋窗口再阻塞，从而覆盖 trylock 失败的那条路径。
+	 */
+	{
+		counter  *c   = NULL;
+		long long got = -1;
+
+		if (counter_create(COUNTER_KIND_ADAPTIVE, 0, &c) != COUNTER_OK) {
+			expect_true("adaptive 创建成功", 0);
+			return;
+		}
+		got = hammer(c, 16, 20000);
+		(void)snprintf(label, sizeof label, "adaptive 16 线程 × 2 万次不丢");
+		expect_int(label, got, 320000);
+		counter_destroy(c);
+	}
+}
+
+/* ---------------------------------------------------------------- */
+
 int main(void) {
 	(void)printf("counter %s 单元测试\n\n", COUNTER_VERSION_STRING);
 
@@ -393,7 +439,7 @@ int main(void) {
 
 	/*
 	 * raw 的用例在 TSan 下必然报 data race——这正是它存在的意义。
-	 * 但 make tsan 的目的是"验证四种同步实现确实没有竞争"，
+	 * 但 make tsan 的目的是"验证五种同步实现确实没有竞争"，
 	 * 所以 TSan 构建时把它关掉；想亲眼看竞争报告，
 	 * 用不定义 COUNTER_TEST_SKIP_RAW 的构建跑一次即可。
 	 */
@@ -404,6 +450,7 @@ int main(void) {
 	test_kind_helpers();
 	test_status_string();
 	test_const_get();
+	test_adaptive();
 
 	(void)printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);
 	return (g_failures == 0) ? 0 : 1;
