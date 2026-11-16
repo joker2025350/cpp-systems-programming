@@ -30,33 +30,110 @@
 struct mc_conn {
 	MYSQL *mysql;
 	char   errbuf[MC_ERRBUF];
+
+	/*
+	 * 最近一次失败的身份：MySQL 错误号与 SQLSTATE。
+	 *
+	 * 与 errbuf 里的文本分开存，是因为文本不稳定：它取决于服务端
+	 * lc_messages 的语言设置（中文环境里会变成另一串字），跨版本也可能
+	 * 改措辞。调用方据以做重试决策的只有号——1213 是死锁（回滚后重试
+	 * 是标准做法），1205 是锁等待超时，2006 是连接已断（重试没有意义）。
+	 * 靠匹配文本判断这三者的区别，一次措辞变化就会让判断静默失效。
+	 */
+	unsigned int errnum;
+	char         sqlstate[6];   /* 5 个字符 + '\0'，例如 "40001" */
 };
 
 /*
  * _Thread_local 是 C11 6.7.1 定义的存储类说明符：每个线程各有一份副本。
  * 理由与 errno 相同——多线程共用一个静态缓冲时，A 线程的建连失败
  * 会被 B 线程的失败覆盖，报出来的原因与实际问题无关。
+ *
+ * 错误号与 SQLSTATE 同理，必须和文本一起按线程分开，否则会出现
+ * "文本取自 A 线程、号取自 B 线程"的错配。
  */
-static _Thread_local char g_last_error[MC_ERRBUF];
+static _Thread_local char         g_last_error[MC_ERRBUF];
+static _Thread_local unsigned int g_last_errnum;
+static _Thread_local char         g_last_sqlstate[6] = "00000";
 
-static void set_error(mc_conn *conn, const char *stage, const char *detail) {
+/* 把错误号与 SQLSTATE 记进 conn，conn 为 NULL 时记进本线程的缓冲。
+ * 与错误文本共用同一个"落在哪里"的判断，三者必须一起更新，
+ * 否则会出现"文本取自 A 线程、号取自 B 线程"的错配。
+ *
+ * state 为 NULL 时写 "00000"（SQL 标准里表示"无异常"）：
+ * 这条路径只出现在"失败与服务器无关"上，那时没有服务端状态码可抄，
+ * 留空串会让调用方以为字段没填。 */
+static void set_errno_state(mc_conn *conn, unsigned int code, const char *state) {
+	if (conn != NULL) {
+		conn->errnum = code;
+		(void)snprintf(conn->sqlstate, sizeof conn->sqlstate, "%s",
+		               (state != NULL) ? state : "00000");
+		return;
+	}
+
+	g_last_errnum = code;
+	(void)snprintf(g_last_sqlstate, sizeof g_last_sqlstate, "%s",
+	               (state != NULL) ? state : "00000");
+}
+
+/*
+ * 所有失败路径的公共出口。
+ *
+ * code / state 传 0 与 NULL，表示这次失败没有服务端参与（参数检查、
+ * 内存不足、文件打不开）——此时把错误号清零而不是留着上一次的值：
+ * "最近一次失败"要么是服务端给的，要么不是，留一个来路不明的旧号
+ * 只会让调用方拿它去做不该做的重试。SQLSTATE 用 SQL 标准里表示
+ * "成功/无异常"的 "00000"，与错误号 0 保持同一含义。
+ */
+static void set_failure(mc_conn *conn, const char *stage, const char *detail,
+                        unsigned int code, const char *state) {
 	char *dst = (conn != NULL) ? conn->errbuf : g_last_error;
 
 	if (detail == NULL || detail[0] == '\0') detail = "unknown error";
 
 	(void)snprintf(dst, MC_ERRBUF, "%s: %s", stage, detail);
+	set_errno_state(conn, code, (code != 0) ? state : NULL);
+}
+
+/* 本地错误：没有服务端参与 */
+static void set_error(mc_conn *conn, const char *stage, const char *detail) {
+	set_failure(conn, stage, detail, 0, NULL);
+}
+
+/*
+ * 失败的来源是 libmysqlclient 时的统一出口：文本、错误号、SQLSTATE
+ * 三者取自同一个 MYSQL 对象，不会出现"文本说死锁、号是 0"的错配。
+ */
+static void set_mysql_error(mc_conn *conn, const char *stage, MYSQL *mysql) {
+	set_failure(conn, stage, mysql_error(mysql),
+	            mysql_errno(mysql), mysql_sqlstate(mysql));
+}
+
+static void set_stmt_error(mc_conn *conn, const char *stage, MYSQL_STMT *stmt) {
+	set_failure(conn, stage, mysql_stmt_error(stmt),
+	            mysql_stmt_errno(stmt), mysql_stmt_sqlstate(stmt));
 }
 
 /* 语句级错误：文本必须在 close 之前取走 */
 static mc_status stmt_error(mc_conn *conn, MYSQL_STMT *stmt,
                             const char *stage, mc_status code) {
-	set_error(conn, stage, mysql_stmt_error(stmt));
+	set_stmt_error(conn, stage, stmt);
 	return code;
 }
 
 const char *mc_error(const mc_conn *conn) {
 	if (conn == NULL) return g_last_error;
 	return conn->errbuf;
+}
+
+unsigned int mc_errno(const mc_conn *conn) {
+	if (conn == NULL) return g_last_errnum;
+	return conn->errnum;
+}
+
+const char *mc_sqlstate(const mc_conn *conn) {
+	if (conn == NULL) return g_last_sqlstate;
+	return conn->sqlstate;
 }
 
 /* ------------------------------------------------------------------
@@ -90,6 +167,10 @@ mc_status mc_open(const mc_options *opt, mc_conn **out) {
 		return MC_ERR_NOMEM;
 	}
 
+	/* calloc 只把 SQLSTATE 清零，而"没有错误"的标准写法是 "00000"。
+	 * 两者混用会让调用方在没出错时读到空串，与"字段不存在"分不清。 */
+	(void)snprintf(conn->sqlstate, sizeof conn->sqlstate, "00000");
+
 	/* mysql_init(NULL) 内部自己分配 MYSQL 结构体，失败返回 NULL */
 	conn->mysql = mysql_init(NULL);
 	if (conn->mysql == NULL) {
@@ -106,7 +187,7 @@ mc_status mc_open(const mc_options *opt, mc_conn **out) {
 	 * 只在文本列上暴露，容易被误判成"数据存进去时就坏了"。
 	 */
 	if (mysql_options(conn->mysql, MYSQL_SET_CHARSET_NAME, "utf8mb4") != 0) {
-		set_error(NULL, "mysql_options(charset)", mysql_error(conn->mysql));
+		set_mysql_error(NULL, "mysql_options(charset)", conn->mysql);
 		mysql_close(conn->mysql);
 		free(conn);
 		return MC_ERR_CONNECT;
@@ -120,7 +201,7 @@ mc_status mc_open(const mc_options *opt, mc_conn **out) {
 		 * 生命周期只需覆盖这次调用——库在 mysql_options 里就把值拷走了。
 		 */
 		if (mysql_options(conn->mysql, MYSQL_OPT_CONNECT_TIMEOUT, &timeout) != 0) {
-			set_error(NULL, "mysql_options(timeout)", mysql_error(conn->mysql));
+			set_mysql_error(NULL, "mysql_options(timeout)", conn->mysql);
 			mysql_close(conn->mysql);
 			free(conn);
 			return MC_ERR_CONNECT;
@@ -131,7 +212,7 @@ mc_status mc_open(const mc_options *opt, mc_conn **out) {
 	                       (opt->password[0] != '\0') ? opt->password : NULL,
 	                       (opt->database[0] != '\0') ? opt->database : NULL,
 	                       opt->port, NULL, 0) == NULL) {
-		set_error(NULL, "connect", mysql_error(conn->mysql));
+		set_mysql_error(NULL, "connect", conn->mysql);
 		mysql_close(conn->mysql);
 		free(conn);
 		return MC_ERR_CONNECT;
@@ -158,7 +239,7 @@ mc_status mc_ping(mc_conn *conn) {
 	 * 会话变量其实都丢了。
 	 */
 	if (mysql_ping(conn->mysql) != 0) {
-		set_error(conn, "ping", mysql_error(conn->mysql));
+		set_mysql_error(conn, "ping", conn->mysql);
 		return MC_ERR_CONNECT;
 	}
 
@@ -181,7 +262,7 @@ mc_status mc_exec(mc_conn *conn, const char *sql, unsigned long long *affected) 
 	 * 含 '\0' 的 SQL 会被截断——需要写二进制请走 mc_blob_write 的参数绑定。
 	 */
 	if (mysql_real_query(conn->mysql, sql, (unsigned long)strlen(sql)) != 0) {
-		set_error(conn, "exec", mysql_error(conn->mysql));
+		set_mysql_error(conn, "exec", conn->mysql);
 		return MC_ERR_QUERY;
 	}
 
@@ -194,7 +275,7 @@ mc_status mc_exec(mc_conn *conn, const char *sql, unsigned long long *affected) 
 		 * 直接转成 unsigned long long 输出会变成一个天文数字。
 		 */
 		if (n == (my_ulonglong)-1) {
-			set_error(conn, "affected_rows", mysql_error(conn->mysql));
+			set_mysql_error(conn, "affected_rows", conn->mysql);
 			return MC_ERR_QUERY;
 		}
 
@@ -246,7 +327,7 @@ mc_status mc_query(mc_conn *conn, const char *sql, mc_rows *out) {
 	mysql = conn->mysql;
 
 	if (mysql_real_query(mysql, sql, (unsigned long)strlen(sql)) != 0) {
-		set_error(conn, "query", mysql_error(mysql));
+		set_mysql_error(conn, "query", mysql);
 		return MC_ERR_QUERY;
 	}
 
@@ -264,7 +345,7 @@ mc_status mc_query(mc_conn *conn, const char *sql, mc_rows *out) {
 			return MC_ERR_RESULT;
 		}
 
-		set_error(conn, "store_result", mysql_error(mysql));
+		set_mysql_error(conn, "store_result", mysql);
 		return MC_ERR_QUERY;
 	}
 
@@ -284,7 +365,7 @@ mc_status mc_query(mc_conn *conn, const char *sql, mc_rows *out) {
 	while ((row = mysql_fetch_row(res)) != NULL) {
 		lens = mysql_fetch_lengths(res);
 		if (lens == NULL) {
-			set_error(conn, "fetch_lengths", mysql_error(mysql));
+			set_mysql_error(conn, "fetch_lengths", mysql);
 			mysql_free_result(res);
 			return MC_ERR_QUERY;
 		}
@@ -366,7 +447,7 @@ mc_status mc_query(mc_conn *conn, const char *sql, mc_rows *out) {
 
 		lens = mysql_fetch_lengths(res);
 		if (lens == NULL) {
-			set_error(conn, "fetch_lengths", mysql_error(mysql));
+			set_mysql_error(conn, "fetch_lengths", mysql);
 			fail_status = MC_ERR_QUERY;
 			goto fail;
 		}
@@ -522,7 +603,7 @@ static mc_status column_names_copy(mc_conn *conn, MYSQL_STMT *stmt, size_t cols,
 
 	meta = mysql_stmt_result_metadata(stmt);
 	if (meta == NULL) {
-		set_error(conn, "result_metadata", mysql_error(conn->mysql));
+		set_mysql_error(conn, "result_metadata", conn->mysql);
 		return MC_ERR_STMT;
 	}
 
@@ -807,7 +888,7 @@ mc_status mc_query_each_ex(mc_conn *conn, const char *sql,
 
 	stmt = mysql_stmt_init(conn->mysql);
 	if (stmt == NULL) {
-		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		set_mysql_error(conn, "stmt_init", conn->mysql);
 		return MC_ERR_STMT;
 	}
 
@@ -853,7 +934,7 @@ out:
 		if (executed) (void)mysql_stmt_free_result(stmt);
 
 		if (mysql_stmt_close(stmt) != 0 && st == MC_OK) {
-			set_error(conn, "stmt_close", mysql_error(conn->mysql));
+			set_mysql_error(conn, "stmt_close", conn->mysql);
 			st = MC_ERR_STMT;
 		}
 	}
@@ -1124,7 +1205,7 @@ mc_status mc_exec_params(mc_conn *conn, const char *sql,
 
 	stmt = mysql_stmt_init(conn->mysql);
 	if (stmt == NULL) {
-		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		set_mysql_error(conn, "stmt_init", conn->mysql);
 		return MC_ERR_STMT;
 	}
 
@@ -1216,7 +1297,7 @@ mc_status mc_exec_params(mc_conn *conn, const char *sql,
 
 		/* 与 mc_exec 同一处哨兵：(my_ulonglong)-1 表示失败 */
 		if (rows == (my_ulonglong)-1) {
-			set_error(conn, "affected_rows", mysql_stmt_error(stmt));
+			set_stmt_error(conn, "affected_rows", stmt);
 			st = MC_ERR_QUERY;
 			goto out;
 		}
@@ -1226,7 +1307,7 @@ mc_status mc_exec_params(mc_conn *conn, const char *sql,
 
 out:
 	if (mysql_stmt_close(stmt) != 0 && st == MC_OK) {
-		set_error(conn, "stmt_close", mysql_error(conn->mysql));
+		set_mysql_error(conn, "stmt_close", conn->mysql);
 		st = MC_ERR_STMT;
 	}
 
@@ -1274,7 +1355,7 @@ mc_status mc_stmt_prepare(mc_conn *conn, const char *sql, mc_stmt **out) {
 
 	st->stmt = mysql_stmt_init(conn->mysql);
 	if (st->stmt == NULL) {
-		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		set_mysql_error(conn, "stmt_init", conn->mysql);
 		free(st);
 		return MC_ERR_STMT;
 	}
@@ -1422,7 +1503,7 @@ mc_status mc_stmt_execute(mc_stmt *st, const mc_param *params, size_t n,
 
 		/* 与 mc_exec 同一处哨兵：(my_ulonglong)-1 表示失败 */
 		if (rows == (my_ulonglong)-1) {
-			set_error(conn, "affected_rows", mysql_stmt_error(st->stmt));
+			set_stmt_error(conn, "affected_rows", st->stmt);
 			s = MC_ERR_QUERY;
 			goto out;
 		}
@@ -1759,7 +1840,7 @@ mc_status mc_blob_read(mc_conn *conn, const char *sql,
 
 	stmt = mysql_stmt_init(conn->mysql);
 	if (stmt == NULL) {
-		set_error(conn, "stmt_init", mysql_error(conn->mysql));
+		set_mysql_error(conn, "stmt_init", conn->mysql);
 		return MC_ERR_STMT;
 	}
 
@@ -1882,7 +1963,7 @@ mc_status mc_blob_read(mc_conn *conn, const char *sql,
 
 out:
 	if (mysql_stmt_close(stmt) != 0 && st == MC_OK) {
-		set_error(conn, "stmt_close", mysql_error(conn->mysql));
+		set_mysql_error(conn, "stmt_close", conn->mysql);
 		st = MC_ERR_STMT;
 	}
 

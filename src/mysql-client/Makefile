@@ -75,6 +75,7 @@ TESTDB   := $(OUT)/test_db
 TESTSTRM := $(OUT)/test_stream
 TESTPARM := $(OUT)/test_params
 TESTSTMT := $(OUT)/test_stmt
+TESTCONC := $(OUT)/test_concurrent
 BENCHBIN := $(OUT)/bench_file
 
 # 库的成员。file.o / options.o / status.o 不引用任何 mysql_* 符号，
@@ -132,6 +133,12 @@ $(TESTPARM): tests/test_params.c $(LIB) | $(OUT)
 $(TESTSTMT): tests/test_stmt.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -o $@
 
+# 并发的测试：用 pthread 让两条连接的阻塞语句真正重叠。
+# -pthread 同时负责链接与定义 _REENTRANT，缺了它在老 glibc 上
+# 会把 pthread_* 声明成返回 int 的隐式函数。
+$(TESTCONC): tests/test_concurrent.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(MYSQL_CFLAGS) $< $(LIB) $(MYSQL_LIBS) -pthread -o $@
+
 test: $(TESTPURE) $(TESTDB)
 	@echo
 	@$(TESTPURE)
@@ -145,7 +152,7 @@ check: $(CLI)
 # 需要一台连得上的数据库。连接参数走环境变量，与驱动层的默认值来源一致：
 #   MC_HOST=127.0.0.1 MC_PORT=3306 MC_USER=root make check-live
 # 不并进 make check：没有数据库的机器上它必然全红，那样的目标没人会跑。
-check-live: $(CLI) $(TESTSTRM) $(TESTPARM) $(TESTSTMT)
+check-live: $(CLI) $(TESTSTRM) $(TESTPARM) $(TESTSTMT) $(TESTCONC)
 	@echo
 	@sh tests/check_live.sh $(CLI)
 	@echo "\n--- 参数绑定：类型往返与失败路径 ---"
@@ -154,6 +161,8 @@ check-live: $(CLI) $(TESTSTRM) $(TESTPARM) $(TESTSTMT)
 	@$(TESTSTRM)
 	@echo "\n--- 语句对象：复用与状态约束 ---"
 	@$(TESTSTMT)
+	@echo "\n--- 并发：多连接、死锁、锁等待超时 ---"
+	@$(TESTCONC)
 
 # 百万行下的峰值内存对照。单独一个目标是因为它要造 100 万行数据、
 # 占用几十秒和几百 MB 磁盘，不适合每次改代码都跑。
@@ -196,7 +205,7 @@ sanitize-live:
 		MYSQL_CFLAGS='$(MYSQL_CFLAGS)' MYSQL_LIBS='$(MYSQL_LIBS)' \
 		sanitize-live-run
 
-sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM) $(TESTPARM) $(TESTSTMT)
+sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM) $(TESTPARM) $(TESTSTMT) $(TESTCONC)
 	@echo "\n--- 真实数据库往返（ASan + UBSan）---"
 	@sh tests/check_live.sh $(CLI)
 	@echo "\n--- 参数绑定（ASan + UBSan）---"
@@ -205,6 +214,8 @@ sanitize-live-run: all $(TESTPURE) $(TESTDB) $(TESTSTRM) $(TESTPARM) $(TESTSTMT)
 	@$(TESTSTRM)
 	@echo "\n--- 语句对象（ASan + UBSan）---"
 	@$(TESTSTMT)
+	@echo "\n--- 并发（ASan + UBSan）---"
+	@$(TESTCONC)
 
 clean:
 	rm -rf $(OUT)
