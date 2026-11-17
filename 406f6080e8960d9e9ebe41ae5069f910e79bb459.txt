@@ -1,0 +1,249 @@
+sha:      406f6080e8960d9e9ebe41ae5069f910e79bb459
+ref:      main
+run:      https://github.com/joker2025350/cpp-systems-programming/actions/runs/44092684591
+compiler: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+result:   success
+
+== 步骤 ==
+默认构建：0 条警告（make 退出码 0）
+==> concurrent-lock
+89 项检查，0 项失败
+==> contact-list
+242 项检查，0 项失败
+466 项检查，0 项失败
+20 项检查，0 项失败
+43 项检查，0 项失败
+==> thread-pool
+检查项 215，失败 0
+==> word-count
+40 项检查，0 项失败
+226 项检查，0 项失败
+==> concurrent-lock
+51 项检查，0 项失败
+==> contact-list
+全部通过（50 项检查）
+==> thread-pool
+检查项 64，失败 0
+==> word-count
+全部一致（2 个文件，6 项比对）
+全部一致（28 项比对）
+全部一致（87 项比对）
+全部通过（72 项比对）
+全部通过（24 项比对）
+全部通过（12 项比对）
+--- 看门狗自检（故意永卡，期望 2 s 内退出码 3）---
+看门狗自检：故意永卡，2 s 后应以退出码 3 结束
+!! 看门狗：2001 ms 没有推进（第 0 轮，阶段：看门狗自检（故意永卡））
+看门狗自检通过（3，2 s 内结束）
+--- 竞态压力：destroy × 屏障等待（ASan）---
+destroy × 屏障等待：300 轮，每轮 32 个等待方，看门狗 30 s
+结果：9600 个等待方里返回非 TPOOL_OK 的有 0 个
+ASan+UBSan：0 条警告（make 退出码 0）
+==> concurrent-lock
+89 项检查，0 项失败
+==> contact-list
+242 项检查，0 项失败
+466 项检查，0 项失败
+20 项检查，0 项失败
+43 项检查，0 项失败
+==> thread-pool
+检查项 215，失败 0
+==> word-count
+40 项检查，0 项失败
+226 项检查，0 项失败
+TSan：0 条警告（make 退出码 0）
+==> concurrent-lock
+88 项检查，0 项失败
+==> thread-pool
+检查项 215，失败 0
+==> word-count
+40 项检查，0 项失败
+226 项检查，0 项失败
+加严警告构建：0 条警告（其中 -Wcast-qual 0 条，同样判定）（make 退出码 0）
+
+== 基准 ==
+
+==> concurrent-lock
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/concurrent-lock'
+
+threads=10  per-thread=1000000  rounds=3  sleep=off
+
+adaptive-spins=1（自旋上限，失败的 trylock 次数；编译期常量 COUNTER_ADAPTIVE_SPINS）
+kind           expected          final  match       avg_ms     Mops/s
+--------------------------------------------------------------------------
+raw            10000000        2381852     NO        54.49     183.52
+mutex          10000000       10000000    yes       337.41      29.64
+spin           10000000       10000000    yes      1239.17       8.07
+atomic         10000000       10000000    yes       180.43      55.42
+asm            10000000       10000000    yes       182.33      54.84
+adaptive       10000000       10000000    yes       391.67      25.53
+
+raw 一行的 final 小于 expected 是正常的：它按定义会丢更新。
+match 为 part 说明多轮里有时对有时错，也是 raw 的典型表现。
+
+===== 池驱动：任务粒度扫描（8 个工作线程，总自增次数固定 2^20）=====
+driver=pool  workers=8  tasks=1048576  batch=0  rounds=3  sleep=off  queue=4096
+atomic                0              0    yes      1010.06       0.00
+池统计：submitted=3145728 completed=3145728 backpressure=0（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=1048576  batch=1  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes       993.21       1.06
+池统计：submitted=3145728 completed=3145728 backpressure=0（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=131072  batch=8  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes       117.69       8.91
+池统计：submitted=393216 completed=393216 backpressure=0（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=16384  batch=64  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes        19.90      52.68
+池统计：submitted=49152 completed=49152 backpressure=336（提交端因队列满阻塞）
+driver=pool  workers=8  tasks=2048  batch=512  rounds=3  sleep=off  queue=4096
+atomic          1048576        1048576    yes        21.13      49.64
+池统计：submitted=6144 completed=6144 backpressure=0（提交端因队列满阻塞）
+
+===== 池驱动：batch=1 时六种实现（任务粒度 = 一次自增）=====
+driver=pool  workers=8  tasks=1048576  batch=1  rounds=3  sleep=off  queue=4096
+
+adaptive-spins=1（自旋上限，失败的 trylock 次数；编译期常量 COUNTER_ADAPTIVE_SPINS）
+kind           expected          final  match       avg_ms     Mops/s
+--------------------------------------------------------------------------
+raw             1048576        1041649     NO      1008.15       1.04
+mutex           1048576        1048576    yes       988.33       1.06
+spin            1048576        1048576    yes      1032.23       1.02
+atomic          1048576        1048576    yes      1021.47       1.03
+asm             1048576        1048576    yes      1036.15       1.01
+adaptive        1048576        1048576    yes      1022.40       1.03
+
+池统计：submitted=18874368 completed=18874368 backpressure=30（提交端因队列满阻塞）
+raw 一行的 final 小于 expected 是正常的：它按定义会丢更新。
+match 为 part 说明多轮里有时对有时错，也是 raw 的典型表现。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/concurrent-lock'
+
+==> contact-list
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/contact-list'
+cc -std=c11 -Wall -Wextra -Wconversion -O2 -g -Iinclude tests/bench_contacts.c bin/libcontacts.a -o bin/bench_contacts
+
+contacts 1.4.0 基准
+种子固定为 0：哈希不做随机化，桶分布与 1.3.0 逐字节相同，数字可与历史记录对照。
+
+       n    build(ms)     find(ms)    order(ms)     save(ms)     load(ms)     loaded
+-----------------------------------------------------------------------------
+    1000          0.3          0.1          0.1          0.1          0.2       1000
+    4000          0.7          0.6          0.2          0.5          0.9       4000
+   16000          2.9          2.4          0.9          1.8          3.5      16000
+   64000         12.5         11.4          4.9         15.7         14.9      64000
+
+       n   buckets     load  maxchain   used/buckets  find(ns)   heap(KiB)  B/entry
+--------------------------------------------------------------------------------------
+    1000      1024     0.98         3            68%        67         170      174
+    4000      4096     0.98         7            57%        69         667      171
+   16000     16384     0.98         6            64%        76        2514      161
+   64000     65536     0.98         7            56%        89       10016      160
+
+收缩（n = 64000，删到 1024 条，再抖动 100000 轮）
+
+  桶数         建完 65536 -> 删完 4096 -> 抖动后 2048
+  装载因子     0.98 -> 0.25 -> 0.50
+  堆占用       10532 KiB -> 212 KiB
+  删除耗时     62976 次 contacts_remove 共 6.0 ms（单次 0.09 µs）
+  抖动         100000 次删一条加一条共 12.5 ms，桶表重分配 1 次（本轮）
+
+find 一列做的是 2n 次查找（n 次命中 + n 次落空）。
+find(ns) 是单次查找平均耗时，包含命中的一次 strcmp。
+order 是 contacts_order 取 n 个指针并 qsort 的总耗时，含调用方的 malloc/free。
+load 是 entries/buckets 的装载因子；超过 1.0 说明扩容分配失败，处于降级状态。
+heap 是 glibc mallinfo2 的 uordblks，即已分配未释放的堆字节数；非 glibc 平台为 0。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/contact-list'
+
+==> thread-pool
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/thread-pool'
+cc -std=c11 -Wall -Wextra -Wconversion -O2 -g -pthread -Iinclude -D_POSIX_C_SOURCE=200809L tests/bench_threadpool.c bin/libthreadpool.a -o bin/bench_threadpool
+
+线程池基准（单位：每任务纳秒，5 轮取最小值）
+========================================================================
+
+[1] 空任务：提交 → 调度 → 执行 → 回收
+  线程数    任务数    ns/任务     任务/秒
+  1              200000        143.6        6962514
+  2              200000        212.8        4699092
+  4              200000        520.0        1922990
+  8              200000       1002.3         997739
+
+[2] 对照：每个任务新建一个线程再 join
+  —             20000      28489.8          35100
+
+[3] 固定工作量：每任务忙等 100 µs，共 1000 个任务
+  线程数 总耗时(ms)    加速比         效率
+  1               100.2         1.00           100%
+  2                50.1         2.00           100%
+  4                25.1         3.99           100%
+  8                25.1         3.99            50%
+
+[4][5] 积压：1 个工作线程，每任务忙等 3 µs，提交 200000 个任务
+  队列         提交数 耗时(ms) 峰值深度   背压   超时 RSS峰值(KiB)
+  无界           200000        9.8     197127        0        0       6920
+  有界(64)       200000      843.9         64   100957        0       2696
+  有界(64,截止)   200000      851.2         64   107929        0       2696
+
+说明：加速比以 1 线程为基准；效率 = 加速比 / 线程数。
+      [4][5] 的三行来自三个独立的子进程（ru_maxrss 是进程级高水位，
+      同一进程内先跑一组再跑另一组，后面的数会包含前面的峰值）。
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/thread-pool'
+
+==> word-count
+make[1]: Entering directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/word-count'
+输入：bin/bench_input.txt，各跑 20 轮
+b256      683 ms
+b1k       664 ms
+b4k       655 ms
+b16k      622 ms
+b64k      628 ms
+
+并行度：8 个文件，合计 39528768 字节，各跑 5 轮
+  seq       474 ms（5 轮合计）
+  -j 1      474 ms（5 轮合计）
+  -j 2      252 ms（5 轮合计）
+  -j 4      172 ms（5 轮合计）
+  -j 8      169 ms（5 轮合计）
+
+对齐读取预算：67108864 字节全字母文件（无可用切点），各跑 3 轮
+  顺序        192 ms
+  -j 2        147 ms  段 1 / 建议切点 7，对齐读 7340032 字节（10% 文件）
+  -j 4        158 ms  段 1 / 建议切点 15，对齐读 15728640 字节（23% 文件）
+  -j 8        158 ms  段 1 / 建议切点 31，对齐读 16252928 字节（24% 文件）
+  -j 16       171 ms  段 1 / 建议切点 63，对齐读 16515072 字节（24% 文件）
+
+对齐读取预算：稀疏分隔符输入（各跑 3 轮，耗时是 3 轮合计）
+余量 = 预算 / 最长扫描；余量大说明除数保守（多读），余量接近 1 说明快到边界
+
+csv4k：行 4 KiB 的长行 CSV / 每行一条 base64
+  67108864 字节，每行 4096 字节，行内无分隔符
+  -j       耗时   段 放弃 预算/切点  对齐读 占比 最长扫描 余量
+  -j 2      79 ms     8     0     1048576      28665    0%      4095   256x
+  -j 4      70 ms    16     0     1048576      61425    0%      4095   256x
+  -j 8      70 ms    32     0      524288     126945    0%      4095   128x
+  -j 16     70 ms    64     0      262144     257985    0%      4095    64x
+
+log64k：行 64 KiB 的单列大字段
+  33554432 字节，每行 65536 字节，行内无分隔符
+  -j       耗时   段 放弃 预算/切点  对齐读 占比 最长扫描 余量
+  -j 2      37 ms     8     0     1048576     458745    1%     65535    16x
+  -j 4      39 ms    16     0      524288     983025    2%     65535     8x
+  -j 8      38 ms    32     0      262144    2031585    6%     65535     4x
+  -j 16     40 ms    32     0      262144    2031585    6%     65535     4x
+
+blob1m：行 1 MiB 的极端形态（行长取奇数，见上）
+  16777216 字节，每行 1048571 字节，行内无分隔符
+  -j       耗时   段 放弃 预算/切点  对齐读 占比 最长扫描 余量
+  -j 2      40 ms     1     7      524288    3670016   21%         0    —
+  -j 4      40 ms     1    15      262144    3932160   23%         0    —
+  -j 8      40 ms     1    15      262144    3932160   23%         0    —
+  -j 16     41 ms     1    15      262144    3932160   23%         0    —
+
+输入留在 bin/bench_sparse/ 下（make clean 会一并删除）
+
+混合负载：1 × 67108864 字节 + 7 × 1048576 字节，共 8 个文件（各跑 3 轮取平均）
+  顺序（不带 -j）           174 ms
+  老路径的地板              157 ms   （-j 1 huge.txt：huge 独占一个线程）
+  -j 8（新）                 59 ms   任务 39 个（huge 32 段 + 7 个整文件）
+  相对地板               2.66×
+  相对顺序               2.94×
+  输出                  与顺序逐字节相同
+make[1]: Leaving directory '/home/runner/work/cpp-systems-programming/cpp-systems-programming/src/word-count'
