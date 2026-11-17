@@ -113,6 +113,39 @@ jobs:
             exit $rc
           fi
 
+      # 为什么这一步不能省：thread-pool 的那条竞态（destroy 与屏障等待并发）
+      # 常规单元测试一次都抓不到 —— 注入去掉 waiters 之后 `make test` 202 项全过，
+      # 只有 300 轮 × 32 个等待方的独立压力检查才把它逼出来。一项检查不进 CI，
+      # 等于没有：它只存在于"记得手动跑"的那几次提交里。
+      #
+      # 两层时间上界，不是重复：
+      #   程序内看门狗（默认 30 s 无推进 → 退出码 3）能把进程结束掉，并打出
+      #   卡在第几轮、卡在哪一阶段；外层 timeout 只兜住"看门狗自身失效"。
+      #   反过来只有外层 timeout 是不够的：它只能杀 make 这个直接子进程，
+      #   孙进程（sh → 压力二进制）会留下来继续持有管道，这一步照样挂到作业上限。
+      - name: 竞态压力（thread-pool）
+        run: |
+          # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，
+          # 恒为 0）。少了这一句，测试失败会被 tee 吞掉，这一步报绿。
+          set -o pipefail
+          rc=0
+          timeout -k 5 300 make stress 2>&1 | tee /tmp/stress.log || rc=$?
+          grep -E '看门狗自检|destroy × 屏障等待|结果：' /tmp/stress.log >> /tmp/ci-summary.txt || true
+          if [ $rc -ne 0 ]; then
+            { echo "!! 竞态压力失败（退出码 $rc；124 = 被外层 timeout 结束），最后 60 行："
+              tail -60 /tmp/stress.log; } >> /tmp/ci-summary.txt
+            exit 1
+          fi
+          # 退出码 0 不代表跑过：0 轮也会返回 0。要求两行输出都在，
+          # 一行证明看门狗自检通过（判据先自证），一行证明真的跑完了。
+          for pat in '看门狗自检通过' '结果：'; do
+            if ! grep -q "$pat" /tmp/stress.log; then
+              { echo "!! 竞态压力没有输出「$pat」，实际日志最后 40 行："
+                tail -40 /tmp/stress.log; } >> /tmp/ci-summary.txt
+              exit 1
+            fi
+          done
+
       - name: ASan + UBSan
         run: |
           # pipefail 必须有：`make | tee 日志` 的退出状态默认取管道最后一段（tee，

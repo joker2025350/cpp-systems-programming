@@ -8,7 +8,7 @@
 #   make test       构建并运行单元测试
 #   make check      命令行端到端检查
 #   make bench      三组基准（空任务 / 每任务建线程 / 固定工作量加速比）
-#   make stress     竞态压力：destroy 与屏障等待并发（ASan，300 轮）
+#   make stress     竞态压力：destroy 与屏障等待并发（ASan，300 轮；先跑看门狗自检）
 #   make sanitize   ASan + UBSan 重新构建并跑测试（产物在 bin/sanitize/）
 #   make tsan       TSan 重新构建并跑测试（产物在 bin/tsan/）
 #   make clean      删除 bin/（含全部变体）
@@ -43,7 +43,7 @@ STRESSBIN := $(OUT)/stress_waiter_destroy
 LIB_OBJ  := $(OUT)/threadpool.o
 CLI_OBJ  := $(OUT)/main.o
 
-.PHONY: all lib cli test check bench sanitize sanitize-run tsan tsan-run clean
+.PHONY: all lib cli test check bench stress stress-run sanitize sanitize-run tsan tsan-run clean
 
 all: lib cli
 
@@ -88,16 +88,39 @@ bench: $(BENCHBIN)
 # 竞态压力检查：destroy 与屏障等待并发。默认就跑在 ASan 下——这段竞态的表现是
 # use-after-free，普通构建里它可能什么都不发生，"没有崩溃"不是证据。
 # 没有并进 test：单轮撞到的概率很低，300 轮才稳定，理由见 tests/stress_waiter_destroy.c。
-STRESS_ROUNDS  ?= 300
-STRESS_WAITERS ?= 32
+#
+# 三种失败形态都要能落到退出码上：
+#   ASan 报错         → 进程中止，非 0
+#   等待方状态码不对   → 退出码 1
+#   卡死（什么都不打印）→ 程序内看门狗 30 s 后 _Exit(3)
+# 最后一条不能靠外层 timeout：timeout 只能杀 make 这个直接子进程，孙进程
+# 会留下来继续持有管道。看门狗在进程内，一定能把进程结束掉。
+STRESS_ROUNDS      ?= 300
+STRESS_WAITERS     ?= 32
+STRESS_WATCHDOG_S  ?= 30
+
+# 看门狗自检：故意永卡，期望 STRESS_SELFTEST_S 秒后以退出码 3 结束。
+# 外层再套一层 timeout 是为了兜住"看门狗自己坏了"——那时进程不会退出，
+# 自检本身就会挂住，而这层是唯一能把它变成失败的东西。
+STRESS_SELFTEST_S  ?= 2
 
 stress:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/stress \
 		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' stress-run
 
 stress-run: $(STRESSBIN)
+	@echo "\n--- 看门狗自检（故意永卡，期望 $(STRESS_SELFTEST_S) s 内退出码 3）---"
+	@out=`timeout $$(( $(STRESS_SELFTEST_S) + 20 )) \
+		$(STRESSBIN) selftest $(STRESS_SELFTEST_S) 2>&1`; rc=$$?; \
+	if [ $$rc -ne 3 ]; then \
+		printf '看门狗自检失败：退出码 %s（期望 3；124 = 被外层 timeout 结束）\n%s\n' \
+			"$$rc" "$$out"; \
+		exit 1; \
+	fi; \
+	printf '%s\n' "$$out"; \
+	echo "看门狗自检通过（$$rc，$(STRESS_SELFTEST_S) s 内结束）"
 	@echo "\n--- 竞态压力：destroy × 屏障等待（ASan）---"
-	@$(STRESSBIN) $(STRESS_ROUNDS) $(STRESS_WAITERS)
+	@$(STRESSBIN) $(STRESS_ROUNDS) $(STRESS_WAITERS) $(STRESS_WATCHDOG_S)
 
 # 变体构建：覆盖 OUT 与 CFLAGS 递归调用自身。
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1

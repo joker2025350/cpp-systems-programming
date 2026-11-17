@@ -10,6 +10,7 @@
 #   make sanitize   全部模块用 ASan + UBSan 重建并跑测试
 #   make tsan       有该目标模块用 TSan 重建并跑测试
 #   make bench      跑全部模块的基准
+#   make stress     有该目标的模块跑竞态压力检查（thread-pool）
 #   make clean      清理全部模块
 #   make list       列出被识别的模块
 #
@@ -22,7 +23,7 @@
 ALL_MODULES := $(patsubst src/%/Makefile,%,$(wildcard src/*/Makefile))
 MODULES     := $(filter-out $(SKIP),$(ALL_MODULES))
 
-.PHONY: all test check sanitize tsan bench clean list
+.PHONY: all test check sanitize tsan bench stress clean list
 
 all:
 	@for m in $(MODULES); do \
@@ -67,6 +68,16 @@ bench:
 		if grep -q '^bench:' src/$$m/Makefile 2>/dev/null; then \
 			printf '\n==> %s\n' "$$m"; \
 			$(MAKE) -C src/$$m bench || exit 1; \
+		fi; \
+	done
+
+# 只转发给写了该目标的模块。竞态压力不是每个模块都有——它要的是"一次运行
+# 撞不到、多轮才稳定"的那类缺陷，写不出构造的模块不该为了对齐而硬凑一个。
+stress:
+	@for m in $(MODULES); do \
+		if grep -q '^stress:' src/$$m/Makefile 2>/dev/null; then \
+			printf '\n==> %s\n' "$$m"; \
+			$(MAKE) -C src/$$m stress || exit 1; \
 		fi; \
 	done
 
