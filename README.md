@@ -15,6 +15,7 @@ build target — not a single-file exercise.
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list plus a hash index that grows and shrinks with the load factor; seeded hashing (`mix64(FNV-1a ^ seed)`, seed 0 keeps the pre-1.4 bucket layout) so a name-to-bucket mapping cannot be built offline; text format that round-trips byte for byte; byte-order sorting over a caller-supplied pointer array; save-failure injection (read-only dir, `RLIMIT_FSIZE`, failing `rename`) | `contacts.h` | 242 checks · 466 allocation-failure injections · 20 save-failure injections · 43 seed checks · 50 end-to-end · ASan/UBSan |
 | [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` (one shared queue of byte-range tasks, submitted longest-first; split points are aligned to separators with an alignment scan budgeted at `min(chunk / 4, 1 MiB)`; the number of split files kept open is bounded by an fd quota derived from `RLIMIT_NOFILE`, and files beyond it fall back to whole-file tasks) | `wordcount.h` | 266 checks · 28 parallel-vs-sequential comparisons · 87 single-file-split comparisons · 72 alignment-budget comparisons · 24 mixed-load scheduling comparisons · 12 fd-quota comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
 | [`dns-client`](src/dns-client) | DNS query over UDP with a hand-written message: 12-byte header, length-prefixed labels, compression-pointer decoding, A and CNAME answers. Currently in admission state — the 2019 course source as one file with `static` functions, no public header, and a defect list that is measured rather than guessed (TTL read from the high half of a 4-byte field, so `dig` says 606 s and this says 0; parser advances on in-message lengths with no bounds check; no receive timeout) | — (not a library yet) | 3 offline checks · ASan/UBSan · one live query cross-checked against `dig @114.114.114.114` |
+| [`http-client`](src/http-client) | HTTP/1.1 GET over TCP with a hand-written request: request line, `Host`, `Connection: close` (so "`recv` returned 0" is the only end-of-response signal it needs), `select` on a single descriptor, non-blocking reads appended to a heap string. Currently in admission state — the 2019 course source as one file with `static` functions, no public header, and a defect list whose two crashes are reproduced rather than reasoned about: a failed `gethostbyname` reaches `inet_addr(NULL)`, and a `recv` returning -1 makes `realloc(result, 0)` return NULL right before `strncat` writes through it | — (not a library yet) | 5 offline checks · ASan/UBSan · one loopback request cross-checked against the server's own log line |
 
 All five modules are libraries: the CLI links against `lib*.a` and never
 recompiles the module sources, so "this module can be linked independently" is
@@ -23,12 +24,13 @@ re-verified on every build. `mysql-client` goes one step further and keeps
 version; `mysql-client/tests/test_pure` links with no MySQL dependency at all and
 runs on machines that have no client library installed.
 
-`dns-client` is the first of four modules being brought in from the numbered source
-directories (`6.` DNS, `7.` HTTP client, `8.` TCP server, `9.` million-connection
-epoll server). It is still a single-file program with `static` functions and no public
-header, so it is deliberately not counted among the five above: splitting it into
-`include/` + `lib*.a` + a thin driver is the first task of its second phase, and half
-of its documented defects cannot be given a test until that split exists.
+`dns-client` and `http-client` are the first two of four modules being brought in
+from the numbered source directories (`6.` DNS, `7.` HTTP client, `8.` TCP server,
+`9.` million-connection epoll server). Both are still single-file programs with
+`static` functions and no public header, so they are deliberately not counted among
+the five above: splitting each into `include/` + `lib*.a` + a thin driver is the
+first task of its second phase, and half of the documented defects cannot be given
+a test until that split exists.
 
 Two modules are wired together with `thread-pool`, and in both cases only the CLI
 driver depends on it — `libwordcount.a` and `libcounter.a` themselves keep zero
@@ -62,7 +64,9 @@ needs neither pthread nor a worker pool:
 │   ├── thread-pool/
 │   ├── mysql-client/
 │   ├── contact-list/
-│   └── word-count/
+│   ├── word-count/
+│   ├── dns-client/       admission state: single file, no public header yet
+│   └── http-client/      admission state: single file, no public header yet
 ├── docs/                 design notes and diagrams
 ├── CHANGELOG.md          day-by-day work log
 ├── Makefile              builds every module that has one

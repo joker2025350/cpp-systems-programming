@@ -12,6 +12,57 @@
 
 ---
 
+## 2026-11-24
+
+### http-client（入库：把课程示例搬进仓库，零警告、能运行、两条崩溃已复现）
+
+两个月计划的第 2 天、四天入库期的第 2 天：`D:\7. http客户端请求\code\httprequest.c`
+进仓库，成为 `src/http-client`。**逻辑与原始示例一致，输出字节完全相同，缺陷一个没修**。
+
+- 目录用 `Makefile` + `src/httprequest.c` + `tests/smoke.sh` + `README.md`，仍然没有
+  `include/`、`lib`、`cli`、`check`、`bench`、`tsan`：源码是单文件程序，三个函数全是
+  `static`。这个"缺"写进了 README 第 2 节，第二阶段（12-05 起）第一件事就是拆成
+  `include/httpclient.h` + `libhttpclient.a` + 薄驱动。
+- 只做了让它在零警告前提下构建所必需的**四处编译层改动**（逐条写在 `src/httprequest.c`
+  文件头）：补 `<sys/select.h>`（原文只包 `<sys/socket.h>`，`-std=c11` 下 `fd_set`
+  是未知类型、`struct timeval` 的 storage size 未知——这是编译错误不是警告）与
+  `<stdint.h>`（只为 `(uint16_t)` 转换）；三个函数改 `static`（否则
+  `-Wmissing-prototypes`）；显式转换五处（`htons((uint16_t)80)`、
+  `(socklen_t)sizeof`、`(size_t)BUFFER_SIZE`、`(int)recv(...)`、`strncat` 的
+  `(size_t)len`）；请求格式串从"行尾反斜杠续行"改成"相邻字符串字面量"（逐字节相同，
+  继续用反斜杠时行尾多一个空格会被悄悄拼进请求）。
+- **一处与 dns-client 相反的结论，是编译一遍确认的**：本模块**不需要**
+  `-D_DEFAULT_SOURCE`。`gethostbyname` / `inet_addr` / `inet_ntoa` 在 glibc 2.35 的
+  头文件里是无条件声明的，`select` / `fd_set` / `struct timeval` 由 `<sys/select.h>`
+  提供；实测"不给宏 / 只给 `_POSIX_C_SOURCE=200809L` / 给 `_DEFAULT_SOURCE`"三种组合
+  在 gcc 11.4.0 上都是零警告。dns-client 那条经验来自 `random`/`srandom`/`bzero`
+  确实藏在 `__USE_MISC` 之后，不能整体照搬。
+- 新增 `tests/smoke.sh`（**5 项**）：二进制能起、无参数时退出码非 0（实测 255）、
+  无参数时无输出、**只给一个参数时同样拒绝且不碰网络**（本程序的判据是 `argc < 3`，
+  少一个参数的边界是它自己的，写成 `argc < 2` 就会拿 `argv[2]` 去 `sprintf`）、
+  重复调用退出码一致。**不验证请求字节与应答处理**，理由见文件头。
+- README 已知局限写了 **15 条**，分"会崩/写坏内存""语义错了但不崩""资源与覆盖面"三组。
+  其中两条**已复现**（用 `/tmp` 临时副本 + 假服务器，仓库源码没改）：
+  ① 域名解析失败 → `host_to_ip` 给 NULL → `inet_addr(NULL)`，ASan 报 SEGV，
+  栈帧落在 `http_create_socket` 第 84 行；② 对端用 `SO_LINGER(1,0)` 发 RST →
+  `recv` 返回 -1 → `realloc(result, strlen + (size_t)(-1) + 1)` 等于 `realloc(result, 0)`
+  → glibc 释放并返回 NULL → `strncat(NULL, buffer, SIZE_MAX)`，UBSan 先报
+  "null pointer passed as argument 1" 再 SEGV。链条两端都是"一行代码看着没事"。
+- 另记三处"读代码得出、未构造触发条件"的：`sprintf` 拼请求无上界（C11 6.5.2.1 是
+  未定义行为）；`select` 的 `timeval` 被 Linux 改写成剩余时间后未重设（`select(2)`
+  BUGS 一节）；`fd_set` 在循环里不重建（POSIX 说返回后内容未指定）。
+- 验证（内网 Ubuntu，Linux 6.8.0-149 / gcc 11.4.0）：默认构建与加严构建（十二个 `-W`）
+  各 **0 警告**；`make test` **5 项 0 失败**；`make sanitize` 0 警告、5 项全过、
+  无 ASan/UBSan 报告；回环上真实请求（`python3 -m http.server`，端口 8080 的临时副本）
+  服务端日志为 `"GET /doc.txt HTTP/1.1" 200 -`，客户端拿到的 `Content-Length: 31`
+  与正文 31 字节一致；整仓 `SKIP=mysql-client`：构建 0 警告、`make test` / `make check`
+  全过、`make sanitize` 无报告，`make list` 里出现 `http-client`。
+- 根 `README` 模块表新增一行，标注"入库态、还不是库"；把上一轮漏掉的 `dns-client`
+  补进 "Layout" 一节，并把"第一个从编号素材目录入库"那段改成"前两个"。
+- 下一步（第二阶段 12-05 ~ 12-12）：拆接口 → 把"拼请求"与"收应答"各暴露成一个函数 →
+  补固定输入用例 → 修 `len < 0` 与 NULL 两条崩溃 → 加 `close` → 修
+  `timeval`/`fd_set`/`F_SETFL` 三处 → 收应答改 `(buf, len, cap)` 消除 O(n²)。
+
 ## 2026-11-23
 
 ### dns-client（入库：把课程示例搬进仓库，先让它零警告、可运行、缺陷有据可查）
