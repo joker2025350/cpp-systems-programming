@@ -109,7 +109,7 @@ gcc 11.4.0 / glibc 2.35 上都是零警告：不给任何宏、只给 `-D_POSIX_
 | 项目 | 结果 |
 |---|---|
 | 默认构建 | 0 条警告（`-std=c11 -Wall -Wextra -Wconversion -O2 -g`） |
-| 加严构建 | 0 条警告（再加 `-Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes`） |
+| 加严构建 | 0 条警告（在默认三项之上再加 `-Wpedantic -Wcast-qual -Wundef -Wvla -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes`，合计十一个 `-W`） |
 | `make test` | **5 项**，0 失败 |
 | `make sanitize` | 0 条警告，5 项全过，无 ASan/UBSan 报告 |
 | 真实请求（回环） | 服务端日志 `"GET /doc.txt HTTP/1.1" 200 -`；客户端拿到的 `Content-Length: 31` 与正文 31 字节一致 |

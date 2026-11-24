@@ -51,8 +51,8 @@
 - 另记三处"读代码得出、未构造触发条件"的：`sprintf` 拼请求无上界（C11 6.5.2.1 是
   未定义行为）；`select` 的 `timeval` 被 Linux 改写成剩余时间后未重设（`select(2)`
   BUGS 一节）；`fd_set` 在循环里不重建（POSIX 说返回后内容未指定）。
-- 验证（内网 Ubuntu，Linux 6.8.0-149 / gcc 11.4.0）：默认构建与加严构建（十二个 `-W`）
-  各 **0 警告**；`make test` **5 项 0 失败**；`make sanitize` 0 警告、5 项全过、
+- 验证（内网 Ubuntu，Linux 6.8.0-149 / gcc 11.4.0）：默认构建与加严构建
+  （合计十一个 `-W`，含 `-Wpedantic`、`-Wcast-qual`）各 **0 警告**；`make test` **5 项 0 失败**；`make sanitize` 0 警告、5 项全过、
   无 ASan/UBSan 报告；回环上真实请求（`python3 -m http.server`，端口 8080 的临时副本）
   服务端日志为 `"GET /doc.txt HTTP/1.1" 200 -`，客户端拿到的 `Content-Length: 31`
   与正文 31 字节一致；整仓 `SKIP=mysql-client`：构建 0 警告、`make test` / `make check`
@@ -62,6 +62,9 @@
 - 下一步（第二阶段 12-05 ~ 12-12）：拆接口 → 把"拼请求"与"收应答"各暴露成一个函数 →
   补固定输入用例 → 修 `len < 0` 与 NULL 两条崩溃 → 加 `close` → 修
   `timeval`/`fd_set`/`F_SETFL` 三处 → 收应答改 `(buf, len, cap)` 消除 O(n²)。
+- CI：run #62 对 `24dbf9f` 是 **success**。加严警告构建 0 条（`-Wcast-qual` 也是 0），
+  TSan 0 条，ASan/UBSan 0 条；`make test` 输出里多了 `http-client` 一行（5 项 0 失败），
+  报告分支 `ci-reports` 的正文落在 `24dbf9f5…txt`。
 
 ## 2026-11-23
 
