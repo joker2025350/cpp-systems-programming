@@ -12,6 +12,73 @@
 
 ---
 
+## 2026-11-25
+
+### tcp-server（入库：把课程示例搬进仓库，零警告、能跑、EPOLLET 丢数据已实测）
+
+两个月计划的第 3 天、四天入库期的第 3 天：`D:\8. TCP服务器\tcp_server.c` 进仓库，
+成为 `src/tcp-server`。**逻辑与原始示例一致，缺陷一个没修**。
+
+- 目录用 `Makefile` + `src/tcp_server.c` + `tests/smoke.sh` + `README.md`，仍然没有
+  `include/`、`lib`、`cli`、`check`、`bench`、`tsan`：源码是单文件程序，accept、
+  `epoll_ctl`、recv、close 全写在 `main` 的同一个 `for` 循环里。这个"缺"写进了
+  README，第二阶段（12-13 起）第一件事就是拆成 `include/tcpserver.h` +
+  `libtcpserver.a` + 薄驱动。
+- 编译层改动三组，逐条写在 `src/tcp_server.c` 文件头：补 `<unistd.h>` 与
+  `<sys/socket.h>`（`close` 原本完全无声明，`-std=c11` 下隐式声明是错误，C11
+  6.5.2.2p6；socket 一族的声明原先是靠 `<arpa/inet.h>` → `<netinet/in.h>` →
+  `<sys/socket.h>` 这条间接包含链碰巧拿到的）；用一个宏 `TCP_SERVER_PTHREAD`
+  （默认 0）同时管住 `client_routine` 的定义与 `main` 里的 pthread 分支——原文把
+  定义留在 `#if 0` 块外、调用关在块内，函数没有调用点，不加 `static` 触发
+  `-Wmissing-prototypes`、加了 `static` 触发 `-Wunused-function`，两条路都过不去；
+  五处显式转换（`htons((uint16_t)port)`、两处 `(socklen_t)sizeof(...)`、两处
+  `(int)recv(..., (size_t)BUFFER_LENGTH, 0)`）。
+- 新增 `tests/smoke.sh`（**5 项**）：二进制能起、缺参数退出码非 0（实测 255）、
+  缺参数输出恰为 `Param Error`、重复调用退出码一致、给端口后进入监听循环
+  （端口 0 让内核分配，`timeout 1` 的 124 表示到点被杀即进程一直活着）。全部与
+  网络无关：不连任何对端、不发任何报文。
+- **核心缺陷是实测出来的，不是推的**：`EPOLLET` 配"每次事件只 `recv` 一次"。
+  `epoll(7)` 的 "Level-triggered and edge-triggered" 一节要求 ET 下循环读到
+  `EAGAIN`；这里只读一次，超出的字节要等**下一次状态变化**才有机会被读。
+  回环上一次写入 16384 字节、之后对端静默 3 秒，服务端只输出 2 行 × 1024 字节，
+  剩余 14336 字节永久留在内核缓冲区；换成 65536 字节，同样是 2 行、剩 63488。
+  之所以是 2 行而不是 1 行，是因为内核把数据按 MSS 分成了两段，每段到达各构成
+  一次"空→非空"的变化——这恰好说明 ET 按状态变化计数，不按数据量计数。
+- 同一条读路径上还有两处：clientfd 从未设 `O_NONBLOCK`（文件包了 `<fcntl.h>`
+  但一次没用），以及 `recv` 返回 -1 时一律当断开（不区分 `EAGAIN`/`EINTR` 与
+  真错误）。三条必须一起修，单修一条会被另一条抵消。
+- 另外两条与"百万并发"这个标题直接矛盾的量：`listen` 的 backlog 是 5（`listen(2)`
+  说明它受 `net.core.somaxconn` 约束，5 意味着握手完成后第 7 个连接就可能被丢）；
+  `epoll_wait` 超时 5 毫秒且没有任何定时任务，实测 2 秒内被调用 **391 次**
+  （约 195 次/秒），空载时 CPU 不是 0 而是一个可算的常数。
+- 一条需要写准确、不能照抄的结论：**缺 `SO_REUSEADDR` 在当前代码路径下还没有
+  造成重启失败**。`TIME_WAIT` 由主动关闭方进入（RFC 9293 §3.5），而本模块只在
+  `recv` 返回 0 或 -1 之后 `close`，那时对端已发过 FIN，服务端永远是**被动关闭方**。
+  实测：客户端 `shutdown(SHUT_WR)` 之后 `ss -tan` 的 `TIME-WAIT` 落在客户端临时
+  端口那一侧（`127.0.0.1:42490 → 127.0.0.1:19281`），杀掉服务端后立刻重启是成功的。
+  第二阶段一旦加上"服务端主动关闭空闲连接"，这条才会变成真问题。
+- `printf("%s", buffer)` 无 NUL 保证这一条，本次入库**没有得到运行时报告，也没有
+  可观察的错误输出**：以正好 1024 字节输入跑 ASan 构建，无报告，输出每行恰好
+  1044 字符（`Recv: ` 6 + 1024 + `, 1024 byte(s)` 14），说明这次栈布局里
+  `buffer[1024]` 恰好是 0。ASan 拦不住它——glibc 的 `vfprintf` 用内部字符扫描而不是
+  libc 的 `strlen`，不经过 ASan 的拦截点。所以这条只给标准依据（C11 7.21.6.1p8
+  要求 `%s` 的参数指向以空字符结尾的数组）与代码路径，不声称已复现。
+
+验证（内网 Ubuntu，Linux 6.8.0-149，gcc 11.4.0）：
+
+- 默认构建 0 警告；加严构建（十二个 `-W`，含 `-Wpedantic`、`-Wcast-qual`）0 警告；
+  三种 feature macro 组合（不给宏 / `_POSIX_C_SOURCE=200809L` / `_DEFAULT_SOURCE`）
+  都是零警告，所以 Makefile 不给宏——与 dns-client 相反，与 http-client 一致
+- `make test` **5 项** 0 失败；`make sanitize` 0 警告、5 项全过、无 ASan/UBSan 报告
+- 整仓 `SKIP=mysql-client`：构建 0 警告、`make test` / `make check` 全过，
+  `make list` 出现 `tcp-server`
+- `git archive HEAD` 导出已提交树复验
+
+根 `README` 模块表新增一行（标注 "not a library yet"），`dns-client` / `http-client`
+那段"前两个"改成"前三个"；Layout 一节补上本目录。根 `Makefile` 自动发现，未改。
+
+---
+
 ## 2026-11-24
 
 ### http-client（入库：把课程示例搬进仓库，零警告、能运行、两条崩溃已复现）
