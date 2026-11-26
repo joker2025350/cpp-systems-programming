@@ -12,6 +12,83 @@
 
 ---
 
+## 2026-11-26
+
+### epoll-server（入库：多端口 epoll 服务端 + 压测客户端，一个模块两个二进制）
+
+两个月计划的第 4 天、四天入库期的最后一天：`D:\9. 百万并发的服务器\` 下的
+`tcp_server.c` 与 `mul_port_client_epoll.c` 进仓库，成为 `src/epoll-server`。
+**逻辑与原始示例一致，缺陷一个没修**。
+
+- 一个模块两个可执行文件，因为源素材就是配套的两个程序：`bin/epoll-server`
+  在 `port..port+99` 上建 100 个监听 fd，`bin/mul-port-client` 在其中轮转
+  `connect`。Makefile 的 `all` 产出两个 bin，`test` / `sanitize` 一起跑。
+- 目录仍是 `Makefile` + `src/*.c` + `tests/smoke.sh` + `README.md`，没有
+  `include/`、`lib`、`cli`、`check`、`bench`、`tsan`。第二阶段（12-20 起）
+  第一件事是拆成 `include/epollserver.h` + `libepollserver.a` + 两个薄驱动。
+- 两个目标给不同的 feature macro，是分别实测的：服务端三种组合（不给宏 /
+  `_POSIX_C_SOURCE=200809L` / `_DEFAULT_SOURCE`）都是零警告；客户端只给
+  `-D_DEFAULT_SOURCE` 才零警告，另外两种组合各有 1 条 `usleep` 隐式声明
+  （`usleep` 藏在 `__USE_MISC` 之后，`-std=c11` 的 `__STRICT_ANSI__` 把它关掉）。
+  新增的头文件三个：服务端 `<unistd.h>`、`<sys/socket.h>`，客户端 `<unistd.h>`、
+  `<sys/time.h>`；都是编译错误而不是警告。
+- 编译层改动里一个不是纯机械的：服务端沿用 `tcp-server` 的做法，用宏
+  `EPOLL_SERVER_PTHREAD`（默认 0）同时管住 `client_routine` 的定义与 `main`
+  里的 pthread 分支（原文定义在 `#if 0` 块外、调用在块内 → 无调用点，`static`
+  与非 `static` 各触发一个警告）；另加 `islistenfd` 加 `static`、内层事件循环
+  的计数 `i` 改名 `k`（与端口循环的 `i` 构成遮蔽，`-Wshadow`）。其余是 11 处
+  显式转换（服务端 7、客户端 4）。
+- 新增 `tests/smoke.sh`（**11 项**）：服务端缺参数退出码非 0（实测 255）、
+  输出恰为 `Param Error`、重复一致、给端口后进入监听循环（`timeout 1` 的 124）、
+  启动输出 100 行、首尾端口为 `BASE` 与 `BASE+99`、端口被占时退出码 2 与
+  `Address already in use`；客户端缺参数退出码为 0（**钉住缺陷**）、用法行、
+  重复一致。全部离线：只在回环/本机内核表上 bind 与 listen，不 accept、不发包。
+- 两个与网络无关的操作性坑，写进 `tests/smoke.sh` 也值得记：**基端口不能从 0
+  开始**——`./bin/epoll-server 0` 第一次 `bind` 拿到内核分配的临时端口，`i=1`
+  就撞 1 号端口，非 root 时立刻 `bind: Permission denied` 退出 2；**数启动输出
+  必须借 pty**——stdout 重定向到文件时全缓冲，`SIGTERM` 杀掉会整块丢掉，
+  `script -q -e -c` 让 stdout 变行缓冲才数得到 100 行，且 pty 会把行尾换成 CRLF。
+- **核心缺陷是实测的**：客户端 `EPOLLOUT` / `EPOLLIN` 两个分支都用 `sockfd`
+  而不是 `events[i].data.fd`。一次 `epoll_wait` 拿到 999 个 `EPOLLOUT` 事件后，
+  999 条 `data from N` 全部从同一个连接发出——服务端只有一个 fd 收到它们，
+  且因为服务端同样是"`EPOLLET` + 每事件只 `recv` 一次"，一次 `recv` 只读到
+  1024 字节（其中含 77 条），其余约 12 KB 滞留。
+- 同一类问题的另一面：`if (EPOLLOUT) ... else if (EPOLLIN)` 而客户端 socket
+  一直可写，水平触发下 `EPOLLOUT` 每次都报，`EPOLLIN` 分支几乎不执行。
+  实测：回声服务器为 2923 个连接各回一行 `pong`，客户端 `RecvBuffer` 打印 **0** 行。
+- `send` 无 `MSG_NOSIGNAL`、不忽略 `SIGPIPE`：对端复位后写入被 SIGPIPE 终止。
+  实测 RST 服务器下第 189 个连接处退出状态 **141**（128+13）。`send` 的返回值
+  也从不检查。
+- 容量类两条：客户端 `usleep(1 ms)` + 阻塞 `connect` 把连接速率钉在 ~900/s
+  （实测 1000 个连接 1.1 s），340000 个连接至少 340 s；每个连接占一个 fd，
+  默认 `RLIMIT_NOFILE=1024` 下第 999 个连接后 `socket: Too many open files`，
+  `ulimit -n 4096` 下约 4000 个后同样失败——而且错误路径 `return 0`，进程以
+  成功状态退出。
+- 服务端：`epoll_wait` 超时 5 ms 无定时任务，实测 2 秒 **386 次**、5 秒 937 次
+  （≈190/秒），20 秒空载消耗 8 个 tick（80 ms，约 0.4% CPU）。`listen` backlog
+  是 5 且 100 个端口都是 5。端口参数不校验：`./bin/epoll-server 70000` 打印
+  `listen on port : 70000`、实际监听 4464..4563（`ss` 计到 100 个）。
+- 一条需要写准确、不能照抄的结论：**`SO_REUSEADDR` 设在了 accept 之后的连接 fd
+  上，对 bind 无效**（`socket(7)`）。当前它还没造成重启失败——`TIME_WAIT` 由主动
+  关闭方进入（RFC 9293 §3.5），服务端只在 `recv` 返回 0/-1 后 `close`，永远是
+  被动关闭方。实测 `TIME-WAIT` 落在客户端端口（`127.0.0.1:52182 → 25037`），
+  杀掉服务端后立刻重启成功。第二阶段加上空闲回收（服务端主动关闭）后才是真问题。
+
+验证（内网 Ubuntu，Linux 6.8.0-149，gcc 11.4.0）：
+
+- 默认构建 0 警告（两个文件）；加严构建（十二个 `-W`，含 `-Wpedantic`、
+  `-Wcast-qual`）0 警告；三种 feature macro 组合按文件分别实测，结论不同
+- `make test` **11 项** 0 失败；`make sanitize` 0 警告、11 项全过、无报告
+- `ss -ltn` 在 `BASE..BASE+99` 范围计到 100 个 LISTEN
+- 整仓 `SKIP=mysql-client`：构建 0 警告、`make test` / `make check` 全过，
+  `make list` 出现 `epoll-server`
+- `git archive HEAD` 导出已提交树复验
+
+根 `README` 模块表新增一行（标注 "not a library yet"），"前三个"改成四个都到齐；
+Layout 一节补上本目录。根 `Makefile` 自动发现，未改。
+
+---
+
 ## 2026-11-25
 
 ### tcp-server（入库：把课程示例搬进仓库，零警告、能跑、EPOLLET 丢数据已实测）
