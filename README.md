@@ -14,26 +14,28 @@ build target — not a single-file exercise.
 | [`mysql-client`](src/mysql-client) | MySQL C API behind an opaque handle: buffered and streaming result sets with column names, a tagged-union parameter binder (`mc_exec_params`, six kinds, long fields go out through `send_long_data`), a reusable statement object (`mc_stmt`: prepare once, execute N times, parameters allowed on the query side too), BLOB round-trip, and error numbers / SQLSTATE so a caller can tell a retryable deadlock (1213) from a lock-wait timeout (1205) without matching message text | `mysqlclient.h` | 122 checks · 41 end-to-end · 96 live checks · 65 parameter-binding checks · 56 streaming checks · 100 statement-object checks · 52 concurrency checks (8 connections, deadlock, lock-wait timeout) · 1M-row memory comparison against MySQL 8.0 · ASan/UBSan |
 | [`contact-list`](src/contact-list) | Contact book on a doubly linked list plus a hash index that grows and shrinks with the load factor; seeded hashing (`mix64(FNV-1a ^ seed)`, seed 0 keeps the pre-1.4 bucket layout) so a name-to-bucket mapping cannot be built offline; text format that round-trips byte for byte; byte-order sorting over a caller-supplied pointer array; save-failure injection (read-only dir, `RLIMIT_FSIZE`, failing `rename`) | `contacts.h` | 242 checks · 466 allocation-failure injections · 20 save-failure injections · 43 seed checks · 50 end-to-end · ASan/UBSan |
 | [`word-count`](src/word-count) | Streaming byte scanner for lines, words, and bytes, with a `-j` parallel driver built on `thread-pool` (one shared queue of byte-range tasks, submitted longest-first; split points are aligned to separators with an alignment scan budgeted at `min(chunk / 4, 1 MiB)`; the number of split files kept open is bounded by an fd quota derived from `RLIMIT_NOFILE`, and files beyond it fall back to whole-file tasks) | `wordcount.h` | 266 checks · 28 parallel-vs-sequential comparisons · 87 single-file-split comparisons · 72 alignment-budget comparisons · 24 mixed-load scheduling comparisons · 12 fd-quota comparisons · cross-checked against `wc` · ASan/UBSan · TSan |
-| [`dns-client`](src/dns-client) | DNS query over UDP with a hand-written message: 12-byte header, length-prefixed labels, compression-pointer decoding, A and CNAME answers. Currently in admission state — the 2019 course source as one file with `static` functions, no public header, and a defect list that is measured rather than guessed (TTL read from the high half of a 4-byte field, so `dig` says 606 s and this says 0; parser advances on in-message lengths with no bounds check; no receive timeout) | — (not a library yet) | 3 offline checks · ASan/UBSan · one live query cross-checked against `dig @114.114.114.114` |
+| [`dns-client`](src/dns-client) | DNS query over UDP with a hand-written message: 12-byte header, length-prefixed labels, compression-pointer decoding, A and CNAME answers. A library since 2026-11-27 — `dnsclient.h` exposes header, question and request construction plus response parsing, the driver is 15 lines, and the 2019 logic is untouched: the defect list stays measured rather than guessed (TTL read from the high half of a 4-byte field, so `dig` says 606 s and this says 0; the parser advances on in-message lengths with no bounds check; no receive timeout; the parser writes to `stdout` from inside the library) | `dnsclient.h` | 22 message-construction checks · 3 CLI checks · ASan/UBSan · one live query cross-checked against `dig @114.114.114.114` |
 | [`http-client`](src/http-client) | HTTP/1.1 GET over TCP with a hand-written request: request line, `Host`, `Connection: close` (so "`recv` returned 0" is the only end-of-response signal it needs), `select` on a single descriptor, non-blocking reads appended to a heap string. Currently in admission state — the 2019 course source as one file with `static` functions, no public header, and a defect list whose two crashes are reproduced rather than reasoned about: a failed `gethostbyname` reaches `inet_addr(NULL)`, and a `recv` returning -1 makes `realloc(result, 0)` return NULL right before `strncat` writes through it | — (not a library yet) | 5 offline checks · ASan/UBSan · one loopback request cross-checked against the server's own log line |
 | [`tcp-server`](src/tcp-server) | TCP server on `epoll` in edge-triggered mode: one `EPOLLIN` registration for the listener, one `EPOLLET` registration per accepted connection, a single-threaded `epoll_wait` loop with a 5 ms timeout, `printf("%s")` on every read. Currently in admission state — the 2019 course source as one file with `static` functions and no public header, and a defect list whose central item is measured rather than argued: `EPOLLET` combined with a single `recv` per event leaves everything past the first 1024 bytes in the kernel buffer forever, so a 16384-byte write produces exactly two 1024-byte reads and 14336 bytes that are never returned; the same loop also calls `epoll_wait` 195 times a second with nothing to do | — (not a library yet) | 5 offline checks · ASan/UBSan · loopback timing: 16384- and 65536-byte writes, 391 `epoll_wait` calls in 2 s |
 | [`epoll-server`](src/epoll-server) | Multi-port `epoll` server plus its load client, as two executables in one module: the server creates 100 listening sockets (`port..port+99`), registers them all level-triggered in one epoll instance, and tells a listener event from a connection event by scanning that array (`islistenfd`); accepted fds are switched to non-blocking and registered edge-triggered, then read once per event. The client cycles the same 100 ports, connects, sends a greeting, and polls its own epoll set once every 1000 connections. Currently in admission state — the 2019 course sources as two single-file programs, and a defect list measured rather than argued: the client's read and write both use the loop's newest `sockfd` instead of `events[i].data.fd`, so 999 writable sockets produced 999 payloads on one connection while an echo server's 2923 replies were read zero times; a peer reset kills it with `SIGPIPE` (exit 141) at connection 189; the server keeps the same edge-triggered loss as `tcp-server` (16384 bytes written, 2048 read) | — (not a library yet) | 11 offline checks · ASan/UBSan · loopback: 100 listening ports, 386 `epoll_wait` calls in 2 s, ~900 connections/s, `ulimit`-bound `EMFILE` at 999 connections |
 
-All five modules are libraries: the CLI links against `lib*.a` and never
+Six of the nine modules are libraries (the five above, plus `dns-client` as of
+2026-11-27): the CLI links against `lib*.a` and never
 recompiles the module sources, so "this module can be linked independently" is
 re-verified on every build. `mysql-client` goes one step further and keeps
 `<mysql.h>` out of its public header, so callers are not tied to a client-library
 version; `mysql-client/tests/test_pure` links with no MySQL dependency at all and
 runs on machines that have no client library installed.
 
-`dns-client`, `http-client`, `tcp-server` and `epoll-server` are all four modules being
-brought in from the numbered source directories (`6.` DNS, `7.` HTTP client, `8.` TCP
-server, `9.` million-connection epoll server). All four are still single-file programs
-with `static` functions and no public header, so they are deliberately not counted among
-the five above: splitting each into `include/` + `lib*.a` + a thin driver is the first
-task of its second phase, and half of the documented defects cannot be given a test
-until that split exists. `epoll-server` is the only one that ships two executables — the
-course source is a server plus its load client, and they are useless apart.
+`http-client`, `tcp-server` and `epoll-server` are the three modules still in admission
+state: the 2019 course sources from the numbered directories (`7.` HTTP client, `8.` TCP
+server, `9.` million-connection epoll server) sit in the tree as single-file programs
+with `static` functions and no public header. `dns-client` was the first of the four to be
+split (2026-11-27: `include/dnsclient.h` + `libdnsclient.a` + a thin driver), and it is
+the pattern for the other three — until the split exists, half of the documented defects
+cannot be given a test at all, because the message bytes never leave the file that holds
+`main`. `epoll-server` is the only one that ships two executables — the course source is
+a server plus its load client, and they are useless apart.
 
 Two modules are wired together with `thread-pool`, and in both cases only the CLI
 driver depends on it — `libwordcount.a` and `libcounter.a` themselves keep zero
@@ -68,7 +70,7 @@ needs neither pthread nor a worker pool:
 │   ├── mysql-client/
 │   ├── contact-list/
 │   ├── word-count/
-│   ├── dns-client/       admission state: single file, no public header yet
+│   ├── dns-client/       library since 11-27; defect list still open
 │   ├── http-client/      admission state: single file, no public header yet
 │   ├── tcp-server/       admission state: single file, no public header yet
 │   └── epoll-server/     admission state: two programs (server + load client)
