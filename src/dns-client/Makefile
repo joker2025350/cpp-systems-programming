@@ -95,11 +95,11 @@ sanitize-run: all $(TESTMSG)
 
 # 现在没有可量的东西：单次查询的墙钟时间几乎全是到 DNS 服务器的 RTT，
 # 程序本身只有一次 malloc 和两次 memcpy，量出来的是网络噪声。有意义的是
-# 批量 + 并发在飞的吞吐，那要先有复用 socket 的结构（README 第 9 节第 12 条）。
+# 批量 + 并发在飞的吞吐，那要先有复用 socket 的结构（README 第 8 节第 12 条）。
 # 留这个目标是为了让根 Makefile 的 make bench 不必按模块写例外。
 bench:
 	@printf 'dns-client：暂无可量的吞吐——单次查询的耗时由 RTT 主导，\n'
-	@printf '  批量并发在飞的结构尚未实现（README 第 9 节第 12 条）。\n'
+	@printf '  批量并发在飞的结构尚未实现（README 第 8 节第 12 条）。\n'
 
 clean:
 	rm -rf $(OUT)
