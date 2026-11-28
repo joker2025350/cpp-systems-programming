@@ -12,6 +12,58 @@
 
 ---
 
+## 2026-11-28
+
+### dns-client（第二阶段第 2 天：解析侧加边界，第 4、5 条关闭）
+
+拆库之后第一次能问"解析一个坏报文会怎样"：以前喂进去的字节由 `recvfrom` 决定，
+现在任何调用方都能拿任意字节调它。这一天的改动只在这一条线上——**游标推进必须与
+真实字节数一致**——不掺 TTL、不掺 `printf`（那两件事有先后依赖，见 README 待办）。
+
+- `dns_parse_response` 加 `size_t len` 形参（`char *` 改为 `const char *`）。理由是
+  函数拿不到缓冲区长度，边界就无从核对；这一步同时是 README 第 8 节第 4 条的入口。
+  驱动改成把 `recvfrom` 的返回值直接传进来，并且**只在 `n > 0` 时调用**——
+  `-1` 转成 `size_t` 是 `SIZE_MAX`，边界检查会把它当成"报文很长"而放过去。
+- 游标从裸指针 `ptr` 改成 `size_t off`，全程对照 `len`；字段读取统一走
+  `read_u16`（`memcpy` 两字节 + 越界返回 -1）。`memcpy` 不是洁癖：原写法
+  `*(unsigned short *)ptr` 在 `ptr` 未按 2 字节对齐时行为未定义（C11 6.3.2.3p7），
+  而缓冲区是 `char` 数组、对齐要求为 1，除偏移 0 外都不保证对齐。
+- `dns_parse_name`（递归）换成 `dns_name_read`（循环），并给压缩指针加了一条
+  协议本来就有的约束：**目标偏移必须严格小于当前位置**。RFC 1035 §4.1.4 说指针
+  指向"报文里先前出现过的"域名，所以回退是协议要求，不只是防环手段；得到的结果是
+  每跳一次 `pos` 严格减小，跳转必然终止（第 5 条关闭）。函数返回值改成"这个名字在
+  记录里占多少字节"——压缩指针算 2，完整写出的名字按 `1 + len` 累加——
+  调用方一句 `off += adv` 就同时解决了"边界"与"游标"两件事。
+- 顺带被带出来的两处，不改就没法改边界：① NAME 之后原来固定 `ptr += 2`，只在
+  NAME 是指针时碰巧正确，现在按实际消耗推进；② 新增的失败路径必须自己释放已经
+  `calloc` 出来的 `domain` / `ip`，否则就是这次改动**新造**的一条泄漏（与第 6 条
+  那条正常路径的泄漏不是同一件事）。
+- `ANCOUNT` 为 0（NXDOMAIN 等）显式返回 0 且 `*domains = NULL`，不再让
+  `calloc(0)` 的返回值决定行为（glibc 给非空指针，别处可能给 NULL）。
+- 新增 `testdata/` 七份固定字节（48 / 74 / 62 / 33 / 40 / 46 / 28 字节），按
+  RFC 1035 §4.1 手工编码：一条 A 记录（压缩指针 NAME）、CNAME + A（第二条的 NAME
+  指向第一条 RDATA 里的域名）、NAME 完整写出、NXDOMAIN、截在 TTL 中间、
+  截在 RDATA 里、指针指向自己。新增 `tests/test_response.c`（**30 项**），
+  钉住文件字节数、条数、域名、地址，失败用例还断言 `*domains` 被置 NULL
+  （调用前指向栈上的假结构，所以"有没有真的清掉"才是被验证的事）。
+- **这批用例的验收证据**：把 `git show HEAD:src/dns-client/src/dnsclient.c` 导出的
+  旧实现用 ASan 编一份，喂同一批字节——`uncompressed-name.bin` 返回 0（漏记录）、
+  `truncated-question.bin` 返回 0（把截断当"无记录"）、`truncated-rdata.bin` 返回 1
+  且地址读成 `93.184.0.0`、`bad-pointer.bin` 直接 stack-overflow 崩溃。
+  其中 `truncated-rdata` 那一份 **ASan 没有报警**：越界读的地址仍落在同一个 512 字节
+  数组内部，不算越界。长度核对与 ASan 是两道独立防线，互相替代不了。
+
+验证（WSL2 上的 Ubuntu 22.04.5，gcc 11.4.0）：
+
+- 默认构建 0 警告；加严构建（十二个 `-W`）0 警告
+- `make test` **22 + 30 项** 0 失败（默认与加严各跑一次）；`make check` **3 项**
+  0 失败；`make sanitize` 0 警告、22 + 30 + 3 项全过、无 ASan/UBSan/LSan 报告
+- 整仓 `SKIP=mysql-client`：构建 0 警告，`make test` / `make check` /
+  `make sanitize` 全过，`make bench` 正常退出
+- `git archive HEAD` 导出已提交树复验：同上
+
+---
+
 ## 2026-11-27
 
 ### dns-client（第二阶段第 1 天：拆 `dnsclient.h` + `libdnsclient.a` + 薄驱动）

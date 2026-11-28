@@ -5,7 +5,7 @@
 #   make            构建静态库与命令行工具（默认）
 #   make lib        只构建静态库 bin/libdnsclient.a
 #   make cli        只构建命令行工具 bin/dns-client
-#   make test       构建并运行报文构造的离线用例（链接 libdnsclient.a）
+#   make test       构建并运行离线用例（报文构造 + 应答解析，链接 libdnsclient.a）
 #   make check      跑命令行行为检查（缺参数、退出码、输出）
 #   make sanitize   ASan + UBSan 重新构建并跑 test 与 check（产物在 bin/sanitize/）
 #   make bench      暂无吞吐可量，打印原因后正常退出
@@ -45,6 +45,7 @@ OUT      ?= bin
 LIB      := $(OUT)/libdnsclient.a
 CLI      := $(OUT)/dns-client
 TESTMSG  := $(OUT)/test_message
+TESTRESP := $(OUT)/test_response
 
 LIB_OBJ  := $(OUT)/dnsclient.o
 CLI_OBJ  := $(OUT)/main.o
@@ -74,9 +75,16 @@ $(CLI): $(CLI_OBJ) $(LIB)
 $(TESTMSG): tests/test_message.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
-test: $(TESTMSG)
+# 解析用例读 testdata/ 下的固定字节。路径按"模块根目录的相对路径"给：
+# 根 Makefile 是 $(MAKE) -C src/<模块名>，cwd 就是这里，两种调用方式一致。
+$(TESTRESP): tests/test_response.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+test: $(TESTMSG) $(TESTRESP)
 	@echo
 	@$(TESTMSG)
+	@echo
+	@$(TESTRESP) testdata
 
 check: $(CLI)
 	@sh tests/smoke.sh $(CLI)
@@ -87,9 +95,11 @@ sanitize:
 	@$(MAKE) --no-print-directory OUT=$(OUT)/sanitize \
 		CFLAGS='$(CFLAGS) $(SAN_FLAGS)' sanitize-run
 
-sanitize-run: all $(TESTMSG)
+sanitize-run: all $(TESTMSG) $(TESTRESP)
 	@echo "\n--- 报文构造用例（ASan + UBSan）---"
 	@$(TESTMSG)
+	@echo "\n--- 应答解析用例（ASan + UBSan）---"
+	@$(TESTRESP) testdata
 	@echo "\n--- 命令行行为（ASan + UBSan）---"
 	@sh tests/smoke.sh $(CLI)
 

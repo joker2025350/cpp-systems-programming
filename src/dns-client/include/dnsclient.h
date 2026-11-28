@@ -8,8 +8,9 @@
  *   连接管理   dns_client_commit（建 socket、发请求、收应答、交给解析）
  *
  * 2026-11-27 从单文件程序拆出。拆分只动了链接属性与文件位置：函数体逐行沿用
- * 2026-11-23 入库的那份（原始素材 D:\6. DNS协议与请求\code\dns.c），
- * 已知缺陷一条没修——它们仍在 README 第 8 节，按第 9 节的顺序逐日处理。
+ * 2026-11-23 入库的那份（原始素材 D:\6. DNS协议与请求\code\dns.c）。
+ * 2026-11-28 起按 README 第 9 节的顺序逐条修：当天只改了解析的接口与游标
+ * （加 len 形参、全程核对边界、压缩指针要求回退），其余缺陷仍原样留在第 8 节。
  *
  * 为什么结构体是可见的、不做成不透明句柄：报文是按字段直接写内存的，
  * 调用方必须先有一块可写的 struct dns_header / struct dns_question。
@@ -24,6 +25,10 @@
 
 #ifndef DNSCLIENT_H
 #define DNSCLIENT_H
+
+/* size_t：dns_parse_response 的长度形参用，也建议调用方拿 recvfrom 的返回值
+ * 直接传进来——两者是同一个类型，不会在中间转换时丢掉"收到了多少"。 */
+#include <stddef.h>
 
 /* 报文头定长（RFC 1035 §4.1.1）：
  * ID(2) + Flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)。 */
@@ -101,21 +106,33 @@ int dns_build_request(struct dns_header *header, struct dns_question *question,
 
 /* 解析一份应答报文，把其中的 A 记录收进 *domains。
  *
- * 返回值：写进 *domains 的记录条数；calloc 失败返回 -1。
+ * buffer 是收到的原始字节，len 是**实际收到的字节数**（`recvfrom` 的第三个
+ * 返回值就是它，类型相同，直接传）。2026-11-28 之前这个函数拿不到长度，
+ * 只能按报文内部的长度字段推进指针，一份被截断或伪造的应答可以让它读到
+ * 缓冲区之外；现在每一步推进都对照 len 核对（README 第 8 节第 4、5 条）。
+ *
+ * 返回值：写进 *domains 的 A 记录条数（可以是 0，见下）；以下情况返回 -1，
+ * 并把 *domains 置 NULL：
+ *   - 参数为 NULL；
+ *   - len < 12（连报文头都不完整）；
+ *   - 报文自称的 QDCOUNT / ANCOUNT 与实际字节数不符（任何一次读取越出 len）；
+ *   - 域名编码非法：label 长度 > 63、名字超过 255 字节、压缩指针指向自己或
+ *     指向后面的位置（RFC 1035 §2.3.4 与 §4.1.4）；
+ *   - 分配 A 记录数组或字符串失败。
+ * 这些情况共用一个 -1，调用方无法区分"报文坏了"与"内存不够"——
+ * 第 8 节第 14 条（错误码不成体系）仍未处理。
+ *
+ * ANCOUNT 为 0（例如 NXDOMAIN）时返回 0 且 *domains 为 NULL，调用方不必
+ * 判空就能 free(NULL)。
+ *
  * *domains 是一个 answers 长度的数组（按 ANCOUNT 分配，按实际 A 记录数使用），
  * 每条的 domain / ip 各自 calloc，数组本身 calloc——两者都要 free。
  *
- * 两条必须先读的前提：
- *   1. 它拿不到 buffer 的长度，只按报文内部的长度字段推进指针
- *      （第 8 节第 4 条）。喂进来的字节数小于报文自称的长度就会读越界，
- *      所以调用方必须先确认真实收到的字节数。
- *   2. 它会把每条 A 记录的域名、地址、TTL 直接 printf 到 stdout。
- *      这段打印在拆分前就在 main 所在的同一个文件里，拆分时跟着解析一起走；
- *      库函数写 stdout 是接口上的缺陷，已列进待办（把打印搬回驱动）。
- *
- * 第 1 条缺陷的另一面：TTL 按 2 字节读且用错了字节序转换函数，
- * 打印出来的 TTL 恒为 0（第 8 节第 1、2 条）。 */
-int dns_parse_response(char *buffer, struct dns_item **domains);
+ * 它仍然会把每条 A 记录的域名、地址、TTL 直接 printf 到 stdout：库函数写
+ * stdout 是接口上的缺陷（第 13 条），已列进待办（把打印搬回驱动）。
+ * TTL 仍按 2 字节读且用错了字节序转换函数，打印出来恒为 0（第 1、2 条）。
+ */
+int dns_parse_response(const char *buffer, size_t len, struct dns_item **domains);
 
 /* 向 DNS_SERVER_IP:DNS_SERVER_PORT 发一次 A 记录查询，收到应答后交给
  * dns_parse_response。
